@@ -1,0 +1,16 @@
+[package]
+name = "agenttrust"
+version = "0.1.0"
+edition = "2021"
+
+# ZERO external dependencies, deliberately — same rule the original Ikenga engine follows.
+# HTTP/1.1, JSON encode/decode and everything else here is hand-rolled std-only Rust, so this
+# builds and runs anywhere with a Rust toolchain and no network access to crates.io.
+[dependencies]
+
+[[bin]]
+name = "agenttrust"
+path = "main.rs"
+
+[profile.release]
+opt-level = 2
