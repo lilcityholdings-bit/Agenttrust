@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agenttrust admin</title>
+<style>
+  :root {
+    --bg: #f6f6f3; --panel: #ffffff; --ink: #1b1d1f; --muted: #62666b; --line: #dcdcd6;
+    --accent: #3b5bdb; --accent-ink: #ffffff; --warn-bg: #fff4d6; --warn-ink: #6b4e00;
+    --bad: #b42318; --good: #1f7a4d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121416; --panel: #1b1e21; --ink: #e8e9ea; --muted: #9aa0a6; --line: #2e3237;
+      --accent: #7c9cff; --accent-ink: #0d1020; --warn-bg: #3a3014; --warn-ink: #f4d58d;
+      --bad: #ff8a80; --good: #7fd6a4;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 20px 16px 48px;
+  }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: .95rem; }
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  h2 { font-size: 1.05rem; margin: 0 0 10px; }
+  label { display: block; font-size: .9rem; color: var(--muted); margin-bottom: 6px; }
+  input {
+    width: 100%; font: inherit; padding: 11px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  button {
+    font: inherit; font-weight: 600; padding: 11px 16px; border-radius: 8px; border: 0;
+    background: var(--accent); color: var(--accent-ink); cursor: pointer; margin-top: 10px;
+  }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  button.small { padding: 6px 10px; margin: 0; font-size: .85rem; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .key {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem;
+    word-break: break-all; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px; margin: 10px 0 0;
+  }
+  .warn { background: var(--warn-bg); color: var(--warn-ink); border-radius: 8px; padding: 10px; margin-top: 10px; font-size: .9rem; }
+  .err { color: var(--bad); margin-top: 10px; font-size: .9rem; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: 8px 4px; border-bottom: 1px solid var(--line); }
+  td:first-child { word-break: break-word; }
+  td.num, th.num, td:last-child { white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .on { color: var(--good); } .off { color: var(--bad); }
+  .empty { color: var(--muted); font-size: .9rem; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>agenttrust admin</h1>
+  <p class="sub">Create API keys for paying customers and see what they use.</p>
+
+  <section>
+    <h2>Admin secret</h2>
+    <label for="secret">The ADMIN_SECRET from your Railway variables</label>
+    <input id="secret" type="password" autocomplete="off" spellcheck="false">
+  </section>
+
+  <section>
+    <h2>New customer</h2>
+    <label for="name">Customer name</label>
+    <input id="name" type="text" placeholder="e.g. Bot Arena" autocomplete="off">
+    <button id="create">Create API key</button>
+    <div id="created" hidden>
+      <div class="key" id="newkey"></div>
+      <div class="row"><button class="secondary small" id="copy" style="margin-top:8px">Copy key</button></div>
+      <div class="warn">This key is shown once. Send it to the customer now — it can't be recovered, only revoked and replaced.</div>
+    </div>
+    <div class="err" id="create-err" hidden></div>
+  </section>
+
+  <section>
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">Customers</h2>
+      <button class="secondary small" id="refresh">Refresh</button>
+    </div>
+    <div class="err" id="list-err" hidden></div>
+    <p class="empty" id="empty">Enter your admin secret and tap Refresh.</p>
+    <div class="table-wrap" id="table-wrap" hidden>
+      <table>
+        <thead><tr><th>Name</th><th>Status</th><th class="num">Deals</th><th class="num">Disputes</th><th></th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var secretBox = $("secret");
+  try { secretBox.value = sessionStorage.getItem("at_admin") || ""; } catch (e) {}
+  secretBox.addEventListener("input", function () {
+    try { sessionStorage.setItem("at_admin", secretBox.value); } catch (e) {}
+  });
+
+  function call(method, path, body) {
+    var opts = { method: method, headers: { "X-Admin-Secret": secretBox.value.trim() } };
+    if (body) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(path, opts).then(function (r) {
+      return r.json().then(function (data) {
+        if (!r.ok) throw new Error(data.error || ("request failed (" + r.status + ")"));
+        return data;
+      });
+    });
+  }
+
+  function showErr(el, msg) { el.textContent = msg; el.hidden = !msg; }
+
+  $("create").addEventListener("click", function () {
+    showErr($("create-err"), "");
+    $("created").hidden = true;
+    var name = $("name").value.trim();
+    if (!name) { showErr($("create-err"), "Enter a customer name first."); return; }
+    call("POST", "/v1/customers", { name: name }).then(function (d) {
+      $("newkey").textContent = d.api_key;
+      $("created").hidden = false;
+      $("name").value = "";
+      load();
+    }).catch(function (e) { showErr($("create-err"), e.message); });
+  });
+
+  $("copy").addEventListener("click", function () {
+    var text = $("newkey").textContent;
+    var btn = $("copy");
+    (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+      .then(function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy key"; }, 1500); })
+      .catch(function () { btn.textContent = "Select and copy manually"; });
+  });
+
+  function cell(text, cls) {
+    var td = document.createElement("td");
+    td.textContent = text;
+    if (cls) td.className = cls;
+    return td;
+  }
+
+  function load() {
+    showErr($("list-err"), "");
+    call("GET", "/v1/customers").then(function (list) {
+      var rows = $("rows");
+      rows.textContent = "";
+      $("empty").textContent = "No customers yet.";
+      $("empty").hidden = list.length > 0;
+      $("table-wrap").hidden = list.length === 0;
+      list.forEach(function (c) {
+        var tr = document.createElement("tr");
+        tr.appendChild(cell(c.name));
+        tr.appendChild(cell(c.active ? "active" : "revoked", c.active ? "on" : "off"));
+        tr.appendChild(cell(String(c.agreements_created), "num"));
+        tr.appendChild(cell(String(c.disputes_escalated), "num"));
+        var td = document.createElement("td");
+        if (c.active) {
+          var b = document.createElement("button");
+          b.className = "secondary small";
+          b.textContent = "Revoke";
+          b.addEventListener("click", function () {
+            if (!confirm("Revoke " + c.name + "'s key? Their requests will start failing immediately.")) return;
+            call("POST", "/v1/customers/" + encodeURIComponent(c.customer_id) + "/revoke", {})
+              .then(load).catch(function (e) { showErr($("list-err"), e.message); });
+          });
+          td.appendChild(b);
+        }
+        tr.appendChild(td);
+        rows.appendChild(tr);
+      });
+    }).catch(function (e) {
+      $("table-wrap").hidden = true;
+      $("empty").hidden = true;
+      showErr($("list-err"), e.message);
+    });
+  }
+
+  $("refresh").addEventListener("click", load);
+  if (secretBox.value) load();
+})();
+</script>
+</body>
+</html>

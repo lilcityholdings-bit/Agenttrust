@@ -14,6 +14,8 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub query: HashMap<String, String>,
+    /// Header names lowercased; values as sent.
+    pub headers: HashMap<String, String>,
     pub body: String,
 }
 
@@ -26,16 +28,35 @@ impl Request {
     pub fn q(&self, key: &str) -> Option<&str> {
         self.query.get(key).map(|s| s.as_str())
     }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(&name.to_ascii_lowercase()).map(|s| s.as_str())
+    }
+
+    /// The caller's API key, from `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
+    pub fn api_key(&self) -> Option<&str> {
+        if let Some(auth) = self.header("authorization") {
+            if let Some(key) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
+                return Some(key.trim());
+            }
+        }
+        self.header("x-api-key").map(|s| s.trim())
+    }
 }
 
 pub struct Response {
     pub status: u16,
+    pub content_type: &'static str,
     pub body: String,
 }
 
 impl Response {
     pub fn json(status: u16, body: String) -> Response {
-        Response { status, body }
+        Response { status, content_type: "application/json", body }
+    }
+
+    pub fn html(body: String) -> Response {
+        Response { status: 200, content_type: "text/html; charset=utf-8", body }
     }
 }
 
@@ -43,7 +64,10 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         201 => "Created",
+        204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
@@ -92,6 +116,7 @@ fn parse_request(stream: &mut TcpStream) -> Option<Request> {
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
 
+    let mut headers = HashMap::new();
     let mut content_length = 0usize;
     loop {
         let mut header = String::new();
@@ -103,9 +128,12 @@ fn parse_request(stream: &mut TcpStream) -> Option<Request> {
             break;
         }
         if let Some((name, value)) = trimmed.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse().unwrap_or(0);
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if name == "content-length" {
+                content_length = value.parse().unwrap_or(0);
             }
+            headers.insert(name, value);
         }
     }
 
@@ -128,8 +156,12 @@ fn parse_request(stream: &mut TcpStream) -> Option<Request> {
         query.insert(decode(k), decode(v));
     }
 
-    Some(Request { method, path: decode(&path), query, body })
+    Some(Request { method, path: decode(&path), query, headers, body })
 }
+
+const CORS: &str = "Access-Control-Allow-Origin: *\r\n\
+Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+Access-Control-Allow-Headers: Authorization, Content-Type, X-Api-Key, X-Admin-Secret\r\n";
 
 pub fn serve<F>(addr: &str, handler: F) -> std::io::Result<()>
 where
@@ -143,13 +175,19 @@ where
         let handler = Arc::clone(&handler);
         std::thread::spawn(move || {
             let response = match parse_request(&mut stream) {
+                // Browsers send a preflight before any cross-origin request carrying an
+                // Authorization or X-Api-Key header; answer it here, before routing or auth.
+                Some(req) if req.method == "OPTIONS" => {
+                    Response { status: 204, content_type: "text/plain", body: String::new() }
+                }
                 Some(req) => handler(req),
                 None => Response::json(400, "{\"error\":\"malformed request\"}".into()),
             };
             let payload = format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n{CORS}\r\n{}",
                 response.status,
                 reason(response.status),
+                response.content_type,
                 response.body.as_bytes().len(),
                 response.body
             );
@@ -164,10 +202,34 @@ where
 mod tests {
     use super::*;
 
+    fn req_with(headers: &[(&str, &str)]) -> Request {
+        Request {
+            method: "GET".into(),
+            path: "/".into(),
+            query: HashMap::new(),
+            headers: headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.to_string())).collect(),
+            body: String::new(),
+        }
+    }
+
     #[test]
     fn percent_and_plus_decoding() {
         assert_eq!(decode("agent%5Fa"), "agent_a");
         assert_eq!(decode("a+b"), "a b");
         assert_eq!(decode("plain"), "plain");
+    }
+
+    #[test]
+    fn the_api_key_comes_from_either_header() {
+        assert_eq!(req_with(&[("Authorization", "Bearer at_live_x")]).api_key(), Some("at_live_x"));
+        assert_eq!(req_with(&[("X-Api-Key", "at_live_y")]).api_key(), Some("at_live_y"));
+        assert_eq!(req_with(&[]).api_key(), None);
+        assert_eq!(req_with(&[("Authorization", "Basic abc")]).api_key(), None);
+    }
+
+    #[test]
+    fn unauthorized_is_not_reported_as_a_server_error() {
+        assert_eq!(reason(401), "Unauthorized");
+        assert_eq!(reason(403), "Forbidden");
     }
 }
