@@ -1,4 +1,4 @@
-//! Deterministic hashing and a seeded PRNG, both hand-rolled to keep the zero-dependency rule.
+//! Deterministic hashing and a seeded PRNG, both hand-rolled rather than pulled in as a framework.
 //!
 //! Two different hashes live here on purpose, for two different jobs:
 //!
@@ -48,9 +48,27 @@ const H0: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
+/// SHA-224's initial state (FIPS 180-4 §5.3.2). Same compression function as SHA-256.
+const H0_224: [u32; 8] = [
+    0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4,
+];
+
 /// SHA-256 over `bytes`, returning the 32-byte digest.
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut h = H0;
+    sha2_core(bytes, H0)
+}
+
+/// SHA-224 over `bytes` — SHA-256 with a different starting state, truncated to 28 bytes. ICP
+/// derives a self-authenticating principal from SHA-224 of the public key (see verify.rs).
+pub fn sha224(bytes: &[u8]) -> [u8; 28] {
+    let full = sha2_core(bytes, H0_224);
+    let mut out = [0u8; 28];
+    out.copy_from_slice(&full[..28]);
+    out
+}
+
+fn sha2_core(bytes: &[u8], init: [u32; 8]) -> [u8; 32] {
+    let mut h = init;
 
     // Padding: a 1 bit, zeros, then the original bit length as a big-endian u64, so the total
     // length is a multiple of 64 bytes.
@@ -237,5 +255,12 @@ mod tests {
     fn sha256_is_deterministic_and_avalanches() {
         assert_eq!(sha256_hex(b"same input"), sha256_hex(b"same input"));
         assert_ne!(sha256_hex(b"same input"), sha256_hex(b"same inpuT"));
+    }
+
+    #[test]
+    fn sha224_of_abc() {
+        // FIPS 180-4 example: SHA-224("abc").
+        let hex: String = sha224(b"abc").iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7");
     }
 }

@@ -152,13 +152,28 @@ impl IdentityBinding {
         }
     }
 
-    /// Whether some party other than this venue vouched for who this is.
-    ///
-    /// Not a score multiplier — it is reported alongside the score so the consumer can apply
-    /// their own policy, because how much an external binding is worth depends entirely on what
-    /// the consumer is about to risk.
-    pub fn externally_verified(&self) -> bool {
-        !matches!(self, IdentityBinding::Local(_))
+    /// Builds a binding from the `protocol` + `id` pair the API speaks. A binding says nothing
+    /// about whether the identity was *proven* — that lives on the registration (store.rs).
+    pub fn from_protocol(protocol: &str, id: &str) -> IdentityBinding {
+        match protocol {
+            "web_bot_auth" => IdentityBinding::WebBotAuthKey(id.to_string()),
+            "did" => IdentityBinding::Did(id.strip_prefix("did:").unwrap_or(id).to_string()),
+            "local" => IdentityBinding::Local(id.to_string()),
+            protocol => IdentityBinding::CommerceProtocol {
+                protocol: protocol.to_lowercase(),
+                agent_id: id.to_string(),
+            },
+        }
+    }
+
+    /// The inverse of [`Self::from_protocol`].
+    pub fn protocol_and_id(&self) -> (String, String) {
+        match self {
+            IdentityBinding::WebBotAuthKey(t) => ("web_bot_auth".into(), t.clone()),
+            IdentityBinding::Did(d) => ("did".into(), format!("did:{d}")),
+            IdentityBinding::Local(a) => ("local".into(), a.clone()),
+            IdentityBinding::CommerceProtocol { protocol, agent_id } => (protocol.to_lowercase(), agent_id.clone()),
+        }
     }
 }
 
@@ -267,6 +282,10 @@ impl DomainScores {
         Some(scores)
     }
 
+    pub fn domains(&self) -> impl Iterator<Item = (&Domain, &Reputation)> {
+        self.by_domain.iter()
+    }
+
     /// Folds in one attestation at the reporting source's weight.
     pub fn record(&mut self, att: &Attestation, source_standing: i32) {
         let weight = source_weight(source_standing);
@@ -315,6 +334,18 @@ impl TrustNetwork {
             .entry(key)
             .or_insert_with(|| DomainScores::new(att.subject.clone()));
         entry.record(att, standing);
+    }
+
+    /// Moves whatever history sits under `from` onto `to`, if `to` has none of its own. Used
+    /// once, to migrate old snapshots that filed scores under a claimed identity.
+    pub fn rekey(&mut self, from: &IdentityBinding, to: &IdentityBinding) {
+        if self.agents.contains_key(&to.key()) {
+            return;
+        }
+        if let Some(mut scores) = self.agents.remove(&from.key()) {
+            scores.identity = to.clone();
+            self.agents.insert(to.key(), scores);
+        }
     }
 
     pub fn lookup(&self, identity: &IdentityBinding) -> Option<&DomainScores> {
@@ -426,14 +457,12 @@ mod tests {
     }
 
     #[test]
-    fn an_externally_bound_identity_is_distinguishable_from_a_local_one() {
-        assert!(IdentityBinding::WebBotAuthKey("t".into()).externally_verified());
-        assert!(IdentityBinding::CommerceProtocol {
-            protocol: "UCP".into(),
-            agent_id: "a1".into()
+    fn protocol_pairs_round_trip_through_bindings() {
+        for (p, id) in [("icp", "2vxsx-fae"), ("did", "did:key:z6Mkx"), ("web_bot_auth", "bot.example.com"), ("local", "a1")] {
+            let b = IdentityBinding::from_protocol(p, id);
+            assert_eq!(b.protocol_and_id(), (p.to_string(), id.to_string()));
+            assert_eq!(IdentityBinding::from_snapshot_json(&b.to_snapshot_json()), Some(b));
         }
-        .externally_verified());
-        assert!(!IdentityBinding::Local("a1".into()).externally_verified());
         assert_eq!(IdentityBinding::WebBotAuthKey("t".into()).key(), "wba:t");
     }
 

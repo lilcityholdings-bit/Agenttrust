@@ -1,12 +1,18 @@
 [package]
 name = "agenttrust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
-# ZERO external dependencies, deliberately — same rule the original Ikenga engine follows.
-# HTTP/1.1, JSON encode/decode and everything else here is hand-rolled std-only Rust, so this
-# builds and runs anywhere with a Rust toolchain and no network access to crates.io.
+# Everything that can reasonably be hand-rolled is: HTTP/1.1 server, JSON, SHA-256/224, the
+# audit chain. The four crates below are the exceptions, and each is one that should never be
+# hand-rolled — signature verification and TLS. They exist only so identity *proofs* (ICP
+# principals, Ethereum/ERC-8004 wallets, did:key, Web Bot Auth keys) can be checked for real
+# instead of taken on the agent's word. See src/verify.rs.
 [dependencies]
+ed25519-dalek = "2"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+sha3 = "0.10"
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [profile.release]
 opt-level = 2

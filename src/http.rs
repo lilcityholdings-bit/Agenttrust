@@ -1,4 +1,4 @@
-//! A small HTTP/1.1 server, hand-rolled to keep the zero-dependency rule.
+//! A small HTTP/1.1 server, hand-rolled rather than pulled in as a framework.
 //!
 //! Thread-per-connection, which is the right shape for a service whose requests are short and
 //! whose state is behind one mutex anyway. It is not an async runtime and does not pretend to
@@ -71,6 +71,8 @@ fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        422 => "Unprocessable Content",
+        429 => "Too Many Requests",
         _ => "Internal Server Error",
     }
 }

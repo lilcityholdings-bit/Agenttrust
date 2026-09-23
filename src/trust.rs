@@ -200,18 +200,18 @@ impl Reputation {
         })
     }
 
-    /// A human- (or agent-) readable band. The API surface elsewhere should publish `score` as
-    /// the primary fact and `tier` as a convenience label over it -- never the reverse, since a
-    /// label with no visible number underneath is exactly the kind of unverifiable claim this
-    /// whole module exists to avoid.
-    pub fn tier(&self) -> &'static str {
-        match self.score {
-            s if s < 150 => "new",
-            s if s < 400 => "developing",
-            s if s < 650 => "established",
-            s if s < 850 => "trusted",
-            _ => "elite",
-        }
+}
+
+/// A human- (or agent-) readable band over a score. The API publishes `score` as the primary
+/// fact and the tier as a convenience label over it -- never the reverse, since a label with no
+/// visible number underneath is exactly the kind of unverifiable claim this module avoids.
+pub fn tier_for(score: i32) -> &'static str {
+    match score {
+        s if s < 150 => "new",
+        s if s < 400 => "developing",
+        s if s < 650 => "established",
+        s if s < 850 => "trusted",
+        _ => "elite",
     }
 }
 
@@ -311,7 +311,7 @@ mod tests {
     fn fresh_agents_start_at_the_floor_not_the_middle() {
         let r = Reputation::fresh("new_bot".into());
         assert_eq!(r.score, STARTING_SCORE);
-        assert_eq!(r.tier(), "new");
+        assert_eq!(tier_for(r.score), "new");
     }
 
     #[test]

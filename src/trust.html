@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bot trust check</title>
+<meta name="description" content="Look up any bot's agenttrust score, track record, and proven identities (ICP, Ethereum, ERC-8004, DID, Web Bot Auth).">
+<style>
+  :root {
+    --bg: #f6f6f3; --panel: #ffffff; --ink: #1b1d1f; --muted: #62666b; --line: #dcdcd6;
+    --accent: #3b5bdb; --accent-ink: #ffffff; --bar: #e9e9e4;
+    --excellent: #1f7a4d; --good: #2f9e44; --fair: #9a7400; --caution: #c92a2a; --unknown: #6c757d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121416; --panel: #1b1e21; --ink: #e8e9ea; --muted: #9aa0a6; --line: #2e3237;
+      --accent: #7c9cff; --accent-ink: #0d1020; --bar: #2a2e33;
+      --excellent: #7fd6a4; --good: #8ce99a; --fair: #f4d58d; --caution: #ff8a80; --unknown: #adb5bd;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 20px 16px 48px;
+  }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: .95rem; }
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  h2 { font-size: 1.05rem; margin: 0 0 10px; }
+  label { display: block; font-size: .9rem; color: var(--muted); margin-bottom: 6px; }
+  input, select {
+    width: 100%; font: inherit; padding: 11px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  button {
+    font: inherit; font-weight: 600; padding: 11px 16px; border-radius: 8px; border: 0;
+    background: var(--accent); color: var(--accent-ink); cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 6px 10px; font-size: .85rem; }
+  .row { display: flex; gap: 8px; }
+  .row > input { flex: 1; min-width: 0; }
+  .row > select { width: auto; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--accent); font-size: .9rem; }
+  .err { color: var(--caution); margin-top: 10px; font-size: .9rem; }
+  .head { display: flex; align-items: center; gap: 16px; }
+  .score { font-size: 3rem; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .of { color: var(--muted); font-size: .85rem; }
+  .pill {
+    display: inline-block; padding: 3px 10px; border-radius: 999px; font-weight: 700;
+    font-size: .85rem; text-transform: uppercase; letter-spacing: .03em; border: 2px solid currentColor;
+  }
+  .who { font-weight: 600; word-break: break-all; }
+  ul.reasons { margin: 12px 0 0; padding-left: 20px; }
+  ul.reasons li { margin: 2px 0; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stat { background: var(--bg); border-radius: 8px; padding: 8px; text-align: center; }
+  .stat b { display: block; font-size: 1.3rem; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: .8rem; }
+  .dom { margin: 8px 0; }
+  .dom .lbl { display: flex; justify-content: space-between; font-size: .9rem; }
+  .track { height: 8px; background: var(--bar); border-radius: 4px; overflow: hidden; margin-top: 4px; }
+  .fill { height: 100%; background: var(--accent); }
+  .reg { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .reg:last-child { border-bottom: 0; }
+  .mark { font-weight: 700; flex: none; width: 88px; font-size: .85rem; }
+  .mark.v { color: var(--excellent); } .mark.c { color: var(--muted); }
+  .reg .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; word-break: break-all; }
+  .reg .meta { color: var(--muted); font-size: .8rem; }
+  .code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; word-break: break-all;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 8px 0;
+  }
+  .muted { color: var(--muted); font-size: .9rem; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Bot trust check</h1>
+  <p class="sub">See how a bot has behaved in real agreements, and which outside identities it has proven it owns.</p>
+
+  <section>
+    <form id="by-agent">
+      <label for="agent">Bot's agenttrust id</label>
+      <div class="row">
+        <input id="agent" type="text" placeholder="e.g. alice-bot" autocomplete="off" spellcheck="false">
+        <button type="submit">Check</button>
+      </div>
+    </form>
+    <details id="more">
+      <summary>Look up by ICP principal, wallet, ERC-8004 id, DID or domain</summary>
+      <form id="by-protocol" style="margin-top:10px">
+        <div class="row">
+          <select id="protocol" aria-label="Protocol">
+            <option value="icp">ICP</option>
+            <option value="eth">Ethereum</option>
+            <option value="erc8004">ERC-8004</option>
+            <option value="did">DID</option>
+            <option value="web_bot_auth">Web Bot Auth</option>
+          </select>
+          <input id="extid" type="text" placeholder="principal, 0x…, 8453:42, did:key:…, domain" autocomplete="off" spellcheck="false">
+        </div>
+        <button type="submit" style="margin-top:8px">Find bot</button>
+      </form>
+    </details>
+    <div class="err" id="err" hidden></div>
+  </section>
+
+  <div id="result" hidden>
+    <section>
+      <div class="head">
+        <div>
+          <div class="score" id="score"></div>
+          <div class="of">out of 1000</div>
+        </div>
+        <div>
+          <div class="who" id="who"></div>
+          <span class="pill" id="level"></span>
+          <div class="of" id="tier"></div>
+        </div>
+      </div>
+      <ul class="reasons" id="reasons"></ul>
+    </section>
+
+    <section>
+      <h2>Track record</h2>
+      <div class="stats" id="stats"></div>
+      <div id="domains"></div>
+    </section>
+
+    <section>
+      <h2>Identities</h2>
+      <div id="regs"></div>
+      <p class="muted" id="no-regs" hidden>This bot hasn't listed any outside identity.</p>
+    </section>
+
+    <section>
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h2 style="margin:0">Badge</h2>
+        <button class="secondary" id="copy">Copy embed</button>
+      </div>
+      <p><img id="badge" alt="agenttrust badge"></p>
+      <div class="code" id="embed"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var LEVELS = { excellent: "Excellent", good: "Good", fair: "Fair", caution: "Caution", unknown: "Unknown" };
+  var NAMES = { icp: "ICP", eth: "Ethereum", erc8004: "ERC-8004", did: "DID", web_bot_auth: "Web Bot Auth" };
+
+  function showErr(msg) { $("err").textContent = msg || ""; $("err").hidden = !msg; }
+
+  function getJSON(path) {
+    return fetch(path).then(function (r) {
+      return r.json().then(function (d) {
+        if (!r.ok) throw new Error(d.error || ("request failed (" + r.status + ")"));
+        return d;
+      });
+    });
+  }
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function when(ms) {
+    return ms ? new Date(ms).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "";
+  }
+
+  function render(p) {
+    showErr("");
+    $("result").hidden = false;
+    $("score").textContent = p.score;
+    $("who").textContent = p.agent_id;
+    var lvl = $("level");
+    lvl.textContent = LEVELS[p.trust_level] || p.trust_level;
+    lvl.style.color = "var(--" + p.trust_level + ")";
+    $("tier").textContent = "tier: " + p.tier + (p.account_age_days != null ? " · active " + p.account_age_days + " days" : "");
+
+    var reasons = $("reasons");
+    reasons.textContent = "";
+    if (!p.known) reasons.appendChild(el("li", "", "This service has never seen a bot with this id."));
+    p.reasons.forEach(function (r) { reasons.appendChild(el("li", "", r)); });
+
+    var h = p.history, stats = $("stats");
+    stats.textContent = "";
+    [["Agreements", h.agreements], ["Clean", h.clean_settlements], ["Ghosted", h.times_ghosted],
+     ["Disputes won", h.disputes_won], ["Disputes lost", h.disputes_lost], ["Jury majority", h.jury_majorities]]
+      .forEach(function (s) {
+        var d = el("div", "stat");
+        d.appendChild(el("b", "", String(s[1])));
+        d.appendChild(el("span", "", s[0]));
+        stats.appendChild(d);
+      });
+
+    var doms = $("domains");
+    doms.textContent = "";
+    p.by_domain.forEach(function (d) {
+      var box = el("div", "dom");
+      var lbl = el("div", "lbl");
+      lbl.appendChild(el("span", "", d.domain));
+      lbl.appendChild(el("span", "", d.score + " · " + d.tier));
+      var track = el("div", "track"), fill = el("div", "fill");
+      fill.style.width = Math.max(0, Math.min(100, d.score / 10)) + "%";
+      track.appendChild(fill);
+      box.appendChild(lbl);
+      box.appendChild(track);
+      doms.appendChild(box);
+    });
+
+    var regs = $("regs");
+    regs.textContent = "";
+    $("no-regs").hidden = p.registrations.length > 0;
+    p.registrations.forEach(function (r) {
+      var row = el("div", "reg");
+      var v = r.status === "verified";
+      row.appendChild(el("div", "mark " + (v ? "v" : "c"), v ? "✓ Verified" : "Claimed"));
+      var body = el("div");
+      body.appendChild(el("div", "", NAMES[r.protocol] || r.protocol));
+      body.appendChild(el("div", "id", r.id));
+      body.appendChild(el("div", "meta", v ? (r.method + " · " + when(r.verified_at_ms)) : r.note));
+      row.appendChild(body);
+      regs.appendChild(row);
+    });
+
+    var origin = location.origin;
+    var badgeUrl = origin + "/v1/trust/" + encodeURIComponent(p.agent_id) + "/badge.svg";
+    var pageUrl = origin + "/trust/" + encodeURIComponent(p.agent_id);
+    $("badge").src = badgeUrl;
+    $("embed").textContent = "[![agenttrust](" + badgeUrl + ")](" + pageUrl + ")";
+  }
+
+  function loadAgent(id, push) {
+    id = id.trim();
+    if (!id) { showErr("Enter a bot id."); return; }
+    if (push) history.replaceState(null, "", "/trust/" + encodeURIComponent(id));
+    getJSON("/v1/trust/" + encodeURIComponent(id)).then(render).catch(function (e) {
+      $("result").hidden = true;
+      showErr(e.message);
+    });
+  }
+
+  $("by-agent").addEventListener("submit", function (e) { e.preventDefault(); loadAgent($("agent").value, true); });
+
+  $("by-protocol").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var proto = $("protocol").value, id = $("extid").value.trim();
+    if (!id) { showErr("Enter an identity to look up."); return; }
+    getJSON("/v1/trust/lookup?protocol=" + encodeURIComponent(proto) + "&id=" + encodeURIComponent(id))
+      .then(function (d) {
+        if (d.profile) {
+          $("agent").value = d.verified_agent;
+          history.replaceState(null, "", "/trust/" + encodeURIComponent(d.verified_agent));
+          render(d.profile);
+        } else {
+          $("result").hidden = true;
+          showErr(d.claimed_by.length
+            ? "No bot has proven it owns this identity. Claimed (unproven) by: " + d.claimed_by.join(", ")
+            : "No bot here has registered this identity.");
+        }
+      })
+      .catch(function (e) { $("result").hidden = true; showErr(e.message); });
+  });
+
+  $("copy").addEventListener("click", function () {
+    var b = $("copy"), text = $("embed").textContent;
+    (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+      .then(function () { b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy embed"; }, 1500); })
+      .catch(function () { b.textContent = "Select and copy"; });
+  });
+
+  var m = location.pathname.match(/^\/trust\/(.+)$/);
+  if (m) {
+    var id = decodeURIComponent(m[1]);
+    $("agent").value = id;
+    loadAgent(id, false);
+  }
+})();
+</script>
+</body>
+</html>

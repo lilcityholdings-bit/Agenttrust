@@ -322,6 +322,90 @@ pub struct Payout {
     pub at_ms: i64,
 }
 
+/// Most outside identities one agent can list — enough for every protocol it could sensibly
+/// hold, few enough that a profile can't be stuffed with thousands of junk claims.
+pub const MAX_REGISTRATIONS: usize = 16;
+
+/// How a registration was proven.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Verification {
+    pub method: String,
+    /// The timestamp inside the signed challenge — newer proofs win a contested identity.
+    pub proof_ts_ms: i64,
+    pub at_ms: i64,
+}
+
+/// One outside identity an agent has listed — see `Engine::registrations`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Registration {
+    pub protocol: String,
+    pub external_id: String,
+    pub claimed_at_ms: i64,
+    /// `None` = claimed only.
+    pub verified: Option<Verification>,
+}
+
+impl Registration {
+    pub fn to_json(&self) -> Json {
+        let mut fields = vec![
+            ("protocol", Json::str(self.protocol.clone())),
+            ("id", Json::str(self.external_id.clone())),
+            ("status", Json::str(if self.verified.is_some() { "verified" } else { "claimed" })),
+            ("claimed_at_ms", Json::num(self.claimed_at_ms as f64)),
+        ];
+        match &self.verified {
+            Some(v) => {
+                fields.push(("verified_at_ms", Json::num(v.at_ms as f64)));
+                fields.push(("method", Json::str(v.method.clone())));
+            }
+            None => fields.push((
+                "note",
+                Json::str(if crate::verify::is_verifiable(&self.protocol) {
+                    "stated by the agent, not yet proven with a signature"
+                } else {
+                    "stated by the agent; this protocol cannot be proven here yet"
+                }),
+            )),
+        }
+        Json::obj(fields)
+    }
+
+    fn to_snapshot_json(&self, agent_id: &str) -> Json {
+        let mut fields = vec![
+            ("agent_id", Json::str(agent_id.to_string())),
+            ("protocol", Json::str(self.protocol.clone())),
+            ("id", Json::str(self.external_id.clone())),
+            ("claimed_at_ms", Json::num(self.claimed_at_ms as f64)),
+        ];
+        if let Some(v) = &self.verified {
+            fields.push(("method", Json::str(v.method.clone())));
+            fields.push(("proof_ts_ms", Json::num(v.proof_ts_ms as f64)));
+            fields.push(("verified_at_ms", Json::num(v.at_ms as f64)));
+        }
+        Json::obj(fields)
+    }
+
+    fn from_snapshot_json(j: &Json) -> Option<(String, Registration)> {
+        let verified = match j.get("method").and_then(|v| v.as_str()) {
+            Some(m) => Some(Verification {
+                method: m.to_string(),
+                proof_ts_ms: j.get("proof_ts_ms")?.as_f()? as i64,
+                at_ms: j.get("verified_at_ms")?.as_f()? as i64,
+            }),
+            None => None,
+        };
+        Some((
+            j.get("agent_id")?.as_str()?.to_string(),
+            Registration {
+                protocol: j.get("protocol")?.as_str()?.to_string(),
+                external_id: j.get("id")?.as_str()?.to_string(),
+                claimed_at_ms: j.get("claimed_at_ms").and_then(|v| v.as_f()).unwrap_or(0.0) as i64,
+                verified,
+            },
+        ))
+    }
+}
+
 pub struct Engine {
     customers: HashMap<String, Customer>,
     /// Which customer's key opened each agreement, so an escalated dispute bills the right one.
@@ -338,10 +422,17 @@ pub struct Engine {
     arbitrations: HashMap<String, ArbiterCase>,
     /// Settled agreements per agent — the eligibility bar for jury service.
     settled_count: HashMap<String, usize>,
-    /// How each agent is identified. Defaults to a venue-local id; an agent that presents an
-    /// external identity (a Web Bot Auth key, a commerce-protocol agent id) is bound to that
-    /// instead, which is what makes its score portable and expensive to abandon.
-    identities: HashMap<String, IdentityBinding>,
+    /// Outside identities each agent has registered — an ICP principal, a wallet, an ERC-8004
+    /// agent NFT, a DID, a Web Bot Auth domain — each either merely *claimed* or *verified* by a
+    /// signature (see verify.rs). They are shown beside the score and never used to key it: a
+    /// score filed under a claimed identity could be taken over by anyone else claiming the same
+    /// one, and a bot with a bad record could escape it by claiming a fresh one.
+    registrations: HashMap<String, Vec<Registration>>,
+    /// Which agent holds each verified identity, by `IdentityBinding::key`. One identity, one
+    /// agent: a newer proof moves it rather than sharing it. Rebuilt from `registrations`.
+    verified_owner: HashMap<String, String>,
+    /// When each agent first did anything scored or registered — account age for the profile.
+    first_seen: HashMap<String, i64>,
     /// SHA-256 of the secret each agent/source id has claimed, by trust-on-first-use: the first
     /// authenticated call for an id sets its secret, and every call after that must match. This
     /// is what closes "any caller can claim to be any agent_id" — see [`Engine::authenticate`].
@@ -393,7 +484,9 @@ impl Engine {
             juries: HashMap::new(),
             arbitrations: HashMap::new(),
             settled_count: HashMap::new(),
-            identities: HashMap::new(),
+            registrations: HashMap::new(),
+            verified_owner: HashMap::new(),
+            first_seen: HashMap::new(),
             agent_secrets: HashMap::new(),
             admin_secret_hash: sha256_hex(admin_secret.as_bytes()),
             network,
@@ -622,24 +715,134 @@ impl Engine {
 
     // ---- identity -------------------------------------------------------------------------
 
-    pub fn bind_identity(&mut self, agent_id: &str, binding: IdentityBinding, now_ms: i64) {
-        self.identities.insert(agent_id.to_string(), binding.clone());
+    fn touch(&mut self, agent_id: &str, now_ms: i64) {
+        self.first_seen.entry(agent_id.to_string()).or_insert(now_ms);
+    }
+
+    /// Records that an agent *says* it holds an outside identity. Costs nothing and proves
+    /// nothing, so it is shown as "claimed" and moves no score. `external_id` must already be
+    /// normalized (verify::normalize).
+    pub fn claim_registration(&mut self, agent_id: &str, protocol: &str, external_id: &str, now_ms: i64) {
+        self.touch(agent_id, now_ms);
+        let regs = self.registrations.entry(agent_id.to_string()).or_default();
+        if regs.iter().any(|r| r.protocol == protocol && r.external_id == external_id) {
+            return;
+        }
+        if regs.len() >= MAX_REGISTRATIONS {
+            regs.retain(|r| r.verified.is_some() || r.protocol != protocol);
+        }
+        regs.push(Registration {
+            protocol: protocol.to_string(),
+            external_id: external_id.to_string(),
+            claimed_at_ms: now_ms,
+            verified: None,
+        });
         self.append(
             now_ms,
-            "identity_bound",
+            "identity_claimed",
             Json::obj(vec![
                 ("agent_id", Json::str(agent_id.to_string())),
-                ("identity", Json::str(binding.key())),
-                ("externally_verified", Json::Bool(binding.externally_verified())),
+                ("protocol", Json::str(protocol.to_string())),
+                ("id", Json::str(external_id.to_string())),
             ]),
         );
     }
 
+    /// Records a proof that already passed verify::verify. If another agent holds the identity
+    /// on an older proof, it moves here; if the other agent's proof is newer, this one is stale
+    /// and refused — which is what stops an old signature from taking an identity back.
+    pub fn record_verified(
+        &mut self,
+        agent_id: &str,
+        protocol: &str,
+        external_id: &str,
+        method: &str,
+        proof_ts_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), &'static str> {
+        let key = IdentityBinding::from_protocol(protocol, external_id).key();
+        if let Some(owner) = self.verified_owner.get(&key).cloned() {
+            if owner != agent_id {
+                let theirs = self.registration(&owner, protocol, external_id).and_then(|r| r.verified.as_ref());
+                if theirs.map(|v| v.proof_ts_ms >= proof_ts_ms).unwrap_or(false) {
+                    return Err("another agent verified this identity with a newer proof");
+                }
+                if let Some(r) = self
+                    .registrations
+                    .get_mut(&owner)
+                    .and_then(|rs| rs.iter_mut().find(|r| r.protocol == protocol && r.external_id == external_id))
+                {
+                    r.verified = None;
+                }
+            }
+        }
+        self.claim_registration(agent_id, protocol, external_id, now_ms);
+        let reg = self
+            .registrations
+            .get_mut(agent_id)
+            .and_then(|rs| rs.iter_mut().find(|r| r.protocol == protocol && r.external_id == external_id))
+            .expect("just claimed");
+        reg.verified = Some(Verification { method: method.to_string(), proof_ts_ms, at_ms: now_ms });
+        self.verified_owner.insert(key, agent_id.to_string());
+        self.append(
+            now_ms,
+            "identity_verified",
+            Json::obj(vec![
+                ("agent_id", Json::str(agent_id.to_string())),
+                ("protocol", Json::str(protocol.to_string())),
+                ("id", Json::str(external_id.to_string())),
+                ("method", Json::str(method.to_string())),
+            ]),
+        );
+        Ok(())
+    }
+
+    fn registration(&self, agent_id: &str, protocol: &str, external_id: &str) -> Option<&Registration> {
+        self.registrations
+            .get(agent_id)?
+            .iter()
+            .find(|r| r.protocol == protocol && r.external_id == external_id)
+    }
+
+    pub fn registrations_of(&self, agent_id: &str) -> &[Registration] {
+        self.registrations.get(agent_id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// The agent holding a verified identity, if any.
+    pub fn verified_owner_of(&self, protocol: &str, external_id: &str) -> Option<&str> {
+        self.verified_owner
+            .get(&IdentityBinding::from_protocol(protocol, external_id).key())
+            .map(|s| s.as_str())
+    }
+
+    /// Agents that have claimed (verified or not) an identity.
+    pub fn claimants_of(&self, protocol: &str, external_id: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .registrations
+            .iter()
+            .filter(|(_, rs)| rs.iter().any(|r| r.protocol == protocol && r.external_id == external_id))
+            .map(|(a, _)| a.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The key an agent's score is filed under: always its own account on this service. Outside
+    /// identities are listed on the profile instead — see the `registrations` field doc.
     pub fn identity_of(&self, agent_id: &str) -> IdentityBinding {
-        self.identities
-            .get(agent_id)
-            .cloned()
-            .unwrap_or_else(|| IdentityBinding::Local(agent_id.to_string()))
+        IdentityBinding::Local(agent_id.to_string())
+    }
+
+    /// Where an outside report about `subject` lands: on the agent that has *verified* that
+    /// identity if there is one, otherwise on the identity itself, unattached to any agent.
+    pub fn resolve_subject(&self, subject: IdentityBinding) -> IdentityBinding {
+        if matches!(subject, IdentityBinding::Local(_)) {
+            return subject;
+        }
+        match self.verified_owner.get(&subject.key()) {
+            Some(agent) => IdentityBinding::Local(agent.clone()),
+            None => subject,
+        }
     }
 
     pub fn register_source(&mut self, source: &str, standing: i32, now_ms: i64) {
@@ -1253,6 +1456,7 @@ impl Engine {
         now_ms: i64,
     ) {
         for (agent_id, event) in events {
+            self.touch(&agent_id, now_ms);
             let subject = self.identity_of(&agent_id);
             let att = Attestation {
                 source: "local".to_string(),
@@ -1286,6 +1490,10 @@ impl Engine {
     /// Accepts a report from an outside app. Weighted by that source's standing — an unknown
     /// source moves nothing, which is the whole defence against a second app lying into the
     /// network (see attest.rs).
+    pub fn source_standing(&self, source: &str) -> i32 {
+        self.network.source_standing(source)
+    }
+
     pub fn ingest_external(&mut self, att: &Attestation, now_ms: i64) {
         self.network.ingest(att);
         let score = self.network.lookup(&att.subject).map(|s| s.in_domain(att.domain)).unwrap_or(0);
@@ -1325,7 +1533,7 @@ impl Engine {
         Json::obj(vec![
             ("agent_id", Json::str(agent_id.to_string())),
             ("identity", Json::str(identity.key())),
-            ("externally_verified", Json::Bool(identity.externally_verified())),
+            ("verified_protocols", self.verified_protocols_json(agent_id)),
             (
                 "overall",
                 Json::num(scores.map(|s| s.overall()).unwrap_or(crate::trust::STARTING_SCORE) as f64),
@@ -1342,15 +1550,144 @@ impl Engine {
         ])
     }
 
-    pub fn trusted_json(&self, domain: Domain, floor: i32) -> Json {
+fn verified_protocols_json(&self, agent_id: &str) -> Json {
+        let mut names: Vec<&str> = self
+            .registrations_of(agent_id)
+            .iter()
+            .filter(|r| r.verified.is_some())
+            .map(|r| r.protocol.as_str())
+            .collect();
+        names.sort();
+        names.dedup();
+        Json::Array(names.into_iter().map(Json::str).collect())
+    }
+
+    /// The public trust profile: the score, what it is made of, which outside identities are
+    /// proven versus merely claimed, and a plain-language verdict with the reasons for it.
+    ///
+    /// The verdict is a convenience over the numbers, never a replacement for them — every
+    /// rule behind it is in this function and every input is in the same response. It reads the
+    /// record (how many deals, how often silent, disputes lost) rather than score bands, because
+    /// the score climbs slowly on purpose (+2 per clean deal against -60 for going silent) and a
+    /// verdict pegged to it would call a bot with 100 flawless deals merely "fair".
+    pub fn trust_profile_json(&self, agent_id: &str, now_ms: i64) -> Json {
+        let scores = self.network.lookup(&self.identity_of(agent_id));
+        let score = scores.map(|s| s.overall()).unwrap_or(crate::trust::STARTING_SCORE);
+        let (mut clean, mut won, mut lost, mut ghosted, mut majorities) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        let mut by_domain = Vec::new();
+        if let Some(sc) = scores {
+            let mut domains: Vec<_> = sc.domains().collect();
+            domains.sort_by_key(|(d, _)| domain_label(**d));
+            for (d, r) in domains {
+                clean += r.clean_settlements;
+                won += r.disputes_won;
+                lost += r.disputes_lost;
+                ghosted += r.times_ghosted;
+                majorities += r.jury_majorities;
+                by_domain.push(Json::obj(vec![
+                    ("domain", Json::str(domain_label(*d))),
+                    ("score", Json::num(r.score as f64)),
+                    ("tier", Json::str(crate::trust::tier_for(r.score))),
+                    ("clean_settlements", Json::num(r.clean_settlements as f64)),
+                    ("disputes_won", Json::num(r.disputes_won as f64)),
+                    ("disputes_lost", Json::num(r.disputes_lost as f64)),
+                    ("times_ghosted", Json::num(r.times_ghosted as f64)),
+                ]));
+            }
+        }
+        let regs = self.registrations_of(agent_id);
+        let verified: Vec<&Registration> = regs.iter().filter(|r| r.verified.is_some()).collect();
+        let deals = clean + won + lost + ghosted;
+        let first_seen = self.first_seen.get(agent_id).copied();
+        let known = first_seen.is_some() || !regs.is_empty() || self.agent_secrets.contains_key(agent_id);
+        let age_days = first_seen.map(|t| ((now_ms - t).max(0) / 86_400_000) as f64);
+
+        let mut reasons: Vec<String> = Vec::new();
+        let ghost_rate = if deals > 0 { ghosted as f64 / deals as f64 } else { 0.0 };
+        let disputes = won + lost;
+        let level = if !known || deals == 0 {
+            reasons.push("no settled agreements yet — there is no track record to judge".into());
+            "unknown"
+        } else if ghost_rate >= 0.10 || score < crate::trust::STARTING_SCORE || (disputes >= 3 && lost * 2 > disputes)
+        {
+            if ghost_rate >= 0.10 {
+                reasons.push(format!("went silent on {ghosted} of {deals} agreements"));
+            }
+            if disputes >= 3 && lost * 2 > disputes {
+                reasons.push(format!("lost {lost} of {disputes} disputes"));
+            }
+            if score < crate::trust::STARTING_SCORE {
+                reasons.push("score has fallen below where every new agent starts".into());
+            }
+            "caution"
+        } else if deals >= 50 && !verified.is_empty() && ghost_rate < 0.02 {
+            reasons.push(format!("{deals} agreements, went silent on {:.0}% of them, proven identity", ghost_rate * 100.0));
+            "excellent"
+        } else if deals >= 10 && ghost_rate < 0.05 {
+            reasons.push(format!("{deals} agreements with a clean record"));
+            "good"
+        } else {
+            reasons.push(format!("some history ({deals} agreements) but not yet a strong record"));
+            "fair"
+        };
+        if known && verified.is_empty() {
+            reasons.push("no proven outside identity — this account is cheap to abandon and re-create".into());
+        }
+        if ghosted == 0 && deals > 0 {
+            reasons.push("has never gone silent on an agreement".into());
+        }
+
+        Json::obj(vec![
+            ("agent_id", Json::str(agent_id.to_string())),
+            ("known", Json::Bool(known)),
+            ("trust_level", Json::str(level)),
+            ("reasons", Json::Array(reasons.into_iter().map(Json::str).collect())),
+            ("score", Json::num(score as f64)),
+            ("score_range", Json::str("0-1000; every new agent starts at 100")),
+            ("tier", Json::str(crate::trust::tier_for(score))),
+            (
+                "history",
+                Json::obj(vec![
+                    ("agreements", Json::num(deals as f64)),
+                    ("clean_settlements", Json::num(clean as f64)),
+                    ("disputes_won", Json::num(won as f64)),
+                    ("disputes_lost", Json::num(lost as f64)),
+                    ("times_ghosted", Json::num(ghosted as f64)),
+                    ("jury_majorities", Json::num(majorities as f64)),
+                    (
+                        "jury_eligible",
+                        Json::Bool(*self.settled_count.get(agent_id).unwrap_or(&0) >= MIN_JUROR_SETTLED),
+                    ),
+                ]),
+            ),
+            ("by_domain", Json::Array(by_domain)),
+            ("first_seen_ms", first_seen.map(|t| Json::num(t as f64)).unwrap_or(Json::Null)),
+            ("account_age_days", age_days.map(Json::num).unwrap_or(Json::Null)),
+            ("verified_protocols", self.verified_protocols_json(agent_id)),
+            ("registrations", Json::Array(regs.iter().map(|r| r.to_json()).collect())),
+            ("profile_page", Json::str(format!("/trust/{agent_id}"))),
+            ("badge", Json::str(format!("/v1/trust/{agent_id}/badge.svg"))),
+            ("audit_head", Json::str(self.audit_head())),
+        ])
+    }
+
+        pub fn trusted_json(&self, domain: Domain, floor: i32) -> Json {
         Json::Array(
             self.network
                 .trusted_in(domain, floor)
                 .iter()
                 .map(|a| {
+                    let agent = match &a.identity {
+                        IdentityBinding::Local(id) => Some(id.as_str()),
+                        _ => None,
+                    };
                     Json::obj(vec![
                         ("identity", Json::str(a.identity.key())),
-                        ("externally_verified", Json::Bool(a.identity.externally_verified())),
+                        ("agent_id", agent.map(|id| Json::str(id)).unwrap_or(Json::Null)),
+                        (
+                            "verified_protocols",
+                            agent.map(|id| self.verified_protocols_json(id)).unwrap_or(Json::Array(vec![])),
+                        ),
                         ("score", Json::num(a.in_domain(domain) as f64)),
                     ])
                 })
@@ -1451,15 +1788,21 @@ impl Engine {
                 ),
             ),
             (
-                "identities",
+                "registrations",
                 Json::Array(
-                    self.identities
+                    self.registrations
                         .iter()
-                        .map(|(agent, binding)| {
-                            Json::obj(vec![
-                                ("agent_id", Json::str(agent.clone())),
-                                ("binding", binding.to_snapshot_json()),
-                            ])
+                        .flat_map(|(agent, regs)| regs.iter().map(move |r| r.to_snapshot_json(agent)))
+                        .collect(),
+                ),
+            ),
+            (
+                "first_seen",
+                Json::Array(
+                    self.first_seen
+                        .iter()
+                        .map(|(agent, at)| {
+                            Json::obj(vec![("agent_id", Json::str(agent.clone())), ("at_ms", Json::num(*at as f64))])
                         })
                         .collect(),
                 ),
@@ -1588,6 +1931,10 @@ impl Engine {
                 engine.settled_count.insert(agent.to_string(), count);
             }
         }
+        // Snapshots from before registrations existed stored one "identity binding" per agent,
+        // and filed the agent's score under it. Those become claimed registrations, and the
+        // score moves back onto the agent's own account (see `migrate_scores` below).
+        let mut legacy_bindings: Vec<(String, IdentityBinding)> = Vec::new();
         if let Some(Json::Array(items)) = j.get("identities") {
             for item in items {
                 let agent = item.get("agent_id").and_then(|v| v.as_str()).ok_or("bad identity entry")?;
@@ -1595,7 +1942,27 @@ impl Engine {
                     item.get("binding").ok_or("bad identity entry")?,
                 )
                 .ok_or("bad identity binding")?;
-                engine.identities.insert(agent.to_string(), binding);
+                legacy_bindings.push((agent.to_string(), binding));
+            }
+        }
+        if let Some(Json::Array(items)) = j.get("registrations") {
+            for item in items {
+                let (agent, reg) = Registration::from_snapshot_json(item).ok_or("bad registration")?;
+                if reg.verified.is_some() {
+                    engine
+                        .verified_owner
+                        .insert(IdentityBinding::from_protocol(&reg.protocol, &reg.external_id).key(), agent.clone());
+                }
+                engine.registrations.entry(agent).or_default().push(reg);
+            }
+        }
+        if let Some(Json::Array(items)) = j.get("first_seen") {
+            for item in items {
+                if let (Some(a), Some(t)) =
+                    (item.get("agent_id").and_then(|v| v.as_str()), item.get("at_ms").and_then(|v| v.as_f()))
+                {
+                    engine.first_seen.insert(a.to_string(), t as i64);
+                }
             }
         }
         if let Some(Json::Array(items)) = j.get("agent_secrets") {
@@ -1634,6 +2001,19 @@ impl Engine {
         engine.next_customer_id =
             j.get("next_customer_id").and_then(|v| v.as_f()).map(|n| n as u64).unwrap_or(1);
         engine.network = TrustNetwork::from_snapshot_json(j.get("network").ok_or("missing network")?);
+        for (agent, binding) in legacy_bindings {
+            if let IdentityBinding::Local(_) = binding {
+                continue;
+            }
+            engine.network.rekey(&binding, &IdentityBinding::Local(agent.clone()));
+            let (protocol, id) = binding.protocol_and_id();
+            engine.registrations.entry(agent).or_default().push(Registration {
+                protocol,
+                external_id: id,
+                claimed_at_ms: 0,
+                verified: None,
+            });
+        }
         if let Some(Json::Array(items)) = j.get("audit") {
             for item in items {
                 let entry = AuditEntry::from_json(item).ok_or("a malformed audit entry in the snapshot")?;
@@ -2063,5 +2443,138 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn ghost(e: &mut Engine, agent: &str, n: usize) {
+        for i in 0..n {
+            let other = format!("{agent}_victim_{i}");
+            let id = e
+                .create_agreement(vec![other.clone(), agent.to_string()], 2, 10.0, "USDC".into(), Domain::Commerce, None, 0)
+                .unwrap();
+            e.report(&id, &other, 0, None, 10).unwrap();
+        }
+        e.sweep(REPORT_WINDOW_MS + 1);
+    }
+
+    fn score(e: &Engine, agent: &str) -> f64 {
+        e.trust_profile_json(agent, 0).get("score").unwrap().as_f().unwrap()
+    }
+
+    #[test]
+    fn claiming_someone_elses_identity_does_not_take_their_score() {
+        let mut e = Engine::new();
+        season(&mut e, "alice", 10, 0);
+        e.claim_registration("alice", "icp", "2vxsx-fae", 1);
+        e.claim_registration("mallory", "icp", "2vxsx-fae", 2);
+        assert!(score(&e, "alice") > crate::trust::STARTING_SCORE as f64);
+        assert_eq!(score(&e, "mallory"), crate::trust::STARTING_SCORE as f64);
+        assert_eq!(e.claimants_of("icp", "2vxsx-fae"), vec!["alice".to_string(), "mallory".to_string()]);
+        assert_eq!(e.verified_owner_of("icp", "2vxsx-fae"), None);
+    }
+
+    #[test]
+    fn claiming_a_fresh_identity_does_not_wash_away_a_bad_record() {
+        let mut e = Engine::new();
+        ghost(&mut e, "flaky", 3);
+        let before = score(&e, "flaky");
+        assert!(before < crate::trust::STARTING_SCORE as f64);
+        e.claim_registration("flaky", "did", "did:key:z6MkFresh", 100);
+        assert_eq!(score(&e, "flaky"), before);
+        assert_eq!(e.trust_profile_json("flaky", 0).get("trust_level").unwrap().as_str(), Some("caution"));
+    }
+
+    #[test]
+    fn a_verified_identity_has_one_owner_and_the_newer_proof_wins() {
+        let mut e = Engine::new();
+        e.record_verified("a", "eth", "0xabc", "sig", 1_000, 1_000).unwrap();
+        assert_eq!(e.verified_owner_of("eth", "0xabc"), Some("a"));
+        // The key holder signs for b later: the identity moves, and a drops back to claimed.
+        e.record_verified("b", "eth", "0xabc", "sig", 2_000, 2_000).unwrap();
+        assert_eq!(e.verified_owner_of("eth", "0xabc"), Some("b"));
+        assert!(e.registrations_of("a")[0].verified.is_none());
+        // a replaying its old (older) proof cannot take it back.
+        assert!(e.record_verified("a", "eth", "0xabc", "sig", 1_000, 3_000).is_err());
+        assert_eq!(e.verified_owner_of("eth", "0xabc"), Some("b"));
+    }
+
+    #[test]
+    fn outside_reports_land_on_the_prover_never_the_claimant() {
+        let mut e = Engine::new();
+        e.register_source("partner", MAX_SCORE, 0);
+        e.claim_registration("mallory", "web_bot_auth", "bot.example.com", 0);
+        let wba = IdentityBinding::from_protocol("web_bot_auth", "bot.example.com");
+        assert_eq!(e.resolve_subject(wba.clone()), wba);
+        e.record_verified("honest", "web_bot_auth", "bot.example.com", "sig", 1, 1).unwrap();
+        assert_eq!(e.resolve_subject(wba.clone()), IdentityBinding::Local("honest".into()));
+        let att = Attestation {
+            source: "partner".into(),
+            subject: e.resolve_subject(wba),
+            event: crate::trust::ScoreEvent::ClearedCleanly,
+            domain: Domain::Service,
+            at_ms: 2,
+            signature: None,
+        };
+        e.ingest_external(&att, 2);
+        assert!(score(&e, "honest") > crate::trust::STARTING_SCORE as f64);
+        assert_eq!(score(&e, "mallory"), crate::trust::STARTING_SCORE as f64);
+    }
+
+    #[test]
+    fn registrations_survive_a_snapshot_and_old_snapshots_migrate() {
+        let mut e = Engine::new();
+        season(&mut e, "alice", 6, 0);
+        e.record_verified("alice", "icp", "2vxsx-fae", "ed25519", 5, 5).unwrap();
+        e.claim_registration("alice", "ucp", "u-1", 6);
+        let restored = Engine::from_snapshot(&e.to_snapshot()).unwrap();
+        assert_eq!(restored.verified_owner_of("icp", "2vxsx-fae"), Some("alice"));
+        assert_eq!(restored.registrations_of("alice").len(), 2);
+        assert_eq!(score(&restored, "alice"), score(&e, "alice"));
+
+        // An old-format snapshot: one "identities" binding per agent, and the agent's score filed
+        // under that claimed identity instead of under the agent.
+        let mut moved = e.network.lookup(&IdentityBinding::Local("alice".into())).cloned().unwrap();
+        moved.identity = IdentityBinding::Did("web:alice.example".into());
+        let mut snap2 = e.to_snapshot();
+        if let Json::Object(m) = &mut snap2 {
+            m.remove("registrations");
+            m.insert(
+                "identities".into(),
+                Json::Array(vec![Json::obj(vec![
+                    ("agent_id", Json::str("alice")),
+                    ("binding", Json::str("did:web:alice.example")),
+                ])]),
+            );
+            m.insert(
+                "network".into(),
+                Json::obj(vec![("agents", Json::Array(vec![moved.to_snapshot_json()])), ("sources", Json::Array(vec![]))]),
+            );
+        }
+        let migrated = Engine::from_snapshot(&snap2).unwrap();
+        assert_eq!(score(&migrated, "alice"), score(&e, "alice"));
+        let regs = migrated.registrations_of("alice");
+        assert_eq!(regs.len(), 1);
+        assert_eq!((regs[0].protocol.as_str(), regs[0].external_id.as_str()), ("did", "did:web:alice.example"));
+        assert!(regs[0].verified.is_none(), "a legacy binding was only ever claimed");
+    }
+
+    #[test]
+    fn the_trust_level_follows_the_published_rules() {
+        let mut e = Engine::new();
+        assert_eq!(e.trust_profile_json("nobody", 0).get("trust_level").unwrap().as_str(), Some("unknown"));
+        assert_eq!(e.trust_profile_json("nobody", 0).get("known"), Some(&Json::Bool(false)));
+        season(&mut e, "steady", 6, 0);
+        let p = e.trust_profile_json("steady", 0);
+        assert_eq!(p.get("known"), Some(&Json::Bool(true)));
+        assert_eq!(p.get("history").unwrap().get("agreements").unwrap().as_f(), Some(6.0));
+        assert_eq!(p.get("trust_level").unwrap().as_str(), Some("fair"));
+        let reasons = format!("{:?}", p.get("reasons"));
+        assert!(reasons.contains("no proven outside identity"));
+        season(&mut e, "steady", 6, 0);
+        assert_eq!(e.trust_profile_json("steady", 0).get("trust_level").unwrap().as_str(), Some("good"));
+        // Fifty clean deals is still only "good" until the bot proves an outside identity.
+        season(&mut e, "steady", 40, 0);
+        assert_eq!(e.trust_profile_json("steady", 0).get("trust_level").unwrap().as_str(), Some("good"));
+        e.record_verified("steady", "eth", "0xabc", "sig", 1, 1).unwrap();
+        assert_eq!(e.trust_profile_json("steady", 0).get("trust_level").unwrap().as_str(), Some("excellent"));
     }
 }

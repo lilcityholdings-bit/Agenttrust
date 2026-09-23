@@ -21,6 +21,7 @@ mod json;
 mod jury;
 mod store;
 mod trust;
+mod verify;
 
 use std::io::Write as _;
 use std::sync::Mutex;
@@ -33,6 +34,9 @@ use store::{domain_from, Engine, ReportResult};
 
 /// The operator's admin page, compiled into the binary so the deploy stays a single file.
 const ADMIN_PAGE: &str = include_str!("admin.html");
+
+/// The public trust-profile page (`/trust/{agent_id}`), also compiled in.
+const TRUST_PAGE: &str = include_str!("trust.html");
 
 /// Where the state snapshot lives. Overridable so a real deployment can point it at a mounted
 /// volume; Railway's filesystem is ephemeral across deploys but persists across restarts of the
@@ -162,10 +166,119 @@ fn admin_secret_of<'a>(req: &'a Request, body: &'a Json) -> Option<&'a str> {
 /// Endpoints anyone may call with no key: the health check, the operator's own admin page
 /// (which authenticates with the admin secret instead), and the public audit feed — being
 /// independently checkable by strangers is the whole trust claim, so it is never paywalled.
+///
+/// Trust lookups and identity registration are public too: a score only one paying customer can
+/// read is not a reputation, and an identity check nobody can afford to run is not a check.
 fn is_public(method: &str, segments: &[&str]) -> bool {
     matches!(
         (method, segments),
-        ("GET", []) | ("GET", ["health"]) | ("GET", ["admin"]) | ("GET", ["v1", "audit"]) | ("GET", ["v1", "audit", "verify"])
+        ("GET", [])
+            | ("GET", ["health"])
+            | ("GET", ["admin"])
+            | ("GET", ["v1", "audit"])
+            | ("GET", ["v1", "audit", "verify"])
+            | ("GET", ["trust", ..])
+            | ("GET", ["v1", "trust", ..])
+            | ("GET", ["v1", "registrations", "challenge"])
+            | ("POST", ["v1", "agents", _, "registrations"])
+            | ("POST", ["v1", "agents", _, "identity"])
+    )
+}
+
+/// A global ceiling on proofs that make outbound calls (a chain RPC, a domain fetch), so this
+/// server can't be used to hammer someone else's.
+fn outbound_allowed(now: i64) -> bool {
+    static WINDOW: Mutex<(i64, u32)> = Mutex::new((0, 0));
+    let mut w = WINDOW.lock().unwrap();
+    if now - w.0 > 60_000 {
+        *w = (now, 0);
+    }
+    w.1 += 1;
+    w.1 <= 120
+}
+
+fn how_to_sign(protocol: &str) -> &'static str {
+    match protocol {
+        "icp" => "Sign the message bytes with the principal's own key (Ed25519, or secp256k1 over SHA-256). Send signature (hex/base64) and public_key (DER or raw).",
+        "eth" => "personal_sign the message with that wallet (EIP-191). Send the 65-byte signature as hex.",
+        "erc8004" => "personal_sign the message (EIP-191) with the wallet that owns the ERC-8004 agent NFT, or its registered agent wallet. Send the 65-byte signature as hex.",
+        "did" => "Sign the message bytes with the Ed25519 key in the did:key. Send the 64-byte signature as hex or base64.",
+        "web_bot_auth" => "Sign the message bytes with an Ed25519 key published at https://<domain>/.well-known/http-message-signatures-directory. Send signature and public_key (32 bytes, hex/base64).",
+        _ => "This protocol can be claimed but not verified yet.",
+    }
+}
+
+/// `POST /v1/agents/{id}/registrations/verify`. Kept out of `route`'s single lock because a proof
+/// can need a chain RPC or an HTTPS fetch, and the engine must not sit locked during either.
+fn verify_registration(engine: &Mutex<Engine>, agent_id: &str, body: &Json, now: i64) -> Response {
+    let (Some(protocol), Some(id)) = (
+        body.get("protocol").and_then(|v| v.as_str()),
+        body.get("id").and_then(|v| v.as_str()),
+    ) else {
+        return err(400, "protocol and id are required");
+    };
+    if !verify::is_verifiable(protocol) {
+        return err(400, "that protocol can be claimed but not verified yet — supported: icp, eth, erc8004, did, web_bot_auth");
+    }
+    let external_id = match verify::normalize(protocol, id) {
+        Ok(x) => x,
+        Err(e) => return err(400, &e),
+    };
+    let Some(timestamp_ms) = body.get("timestamp_ms").and_then(|v| v.as_f()).map(|f| f as i64) else {
+        return err(400, "timestamp_ms is required — the same one inside the message you signed");
+    };
+    let Some(signature) = body.get("signature").and_then(|v| v.as_str()) else {
+        return err(400, "signature is required");
+    };
+    if let Err(e) = engine.lock().unwrap().authenticate(agent_id, body.get("secret").and_then(|v| v.as_str())) {
+        return err(401, e);
+    }
+    if matches!(protocol, "erc8004" | "web_bot_auth") && !outbound_allowed(now) {
+        return err(429, "too many verifications right now — try again in a minute");
+    }
+    let proof = verify::Proof {
+        agent_id,
+        protocol,
+        external_id: &external_id,
+        timestamp_ms,
+        signature,
+        public_key: body.get("public_key").and_then(|v| v.as_str()),
+    };
+    let method = match verify::verify(&proof, now, &verify::LiveNet) {
+        Ok(m) => m,
+        Err(e) => return err(422, &format!("proof rejected: {e}")),
+    };
+    let mut engine = engine.lock().unwrap();
+    match engine.record_verified(agent_id, protocol, &external_id, &method, timestamp_ms, now) {
+        Ok(()) => ok(Json::obj(vec![
+            ("agent_id", Json::str(agent_id)),
+            ("protocol", Json::str(protocol)),
+            ("id", Json::str(external_id)),
+            ("status", Json::str("verified")),
+            ("method", Json::str(method)),
+            ("audit_head", Json::str(engine.audit_head())),
+        ])),
+        Err(e) => err(409, e),
+    }
+}
+
+/// A shields-style SVG badge. Only numbers and fixed words go into it — never the agent id — so
+/// nothing a caller controls ends up inside markup.
+fn badge_svg(score: i64, level: &str, verified: bool) -> String {
+    let color = match level {
+        "excellent" => "#1f7a4d",
+        "good" => "#2f9e44",
+        "fair" => "#b08800",
+        "caution" => "#c92a2a",
+        _ => "#6c757d",
+    };
+    let right = format!("{score} · {level}{}", if verified { " ✓" } else { "" });
+    let lw = 74;
+    let rw = 12 + right.chars().count() as i64 * 7;
+    let w = lw + rw;
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="20" role="img" aria-label="agenttrust: {right}"><title>agenttrust: {right}</title><rect width="{lw}" height="20" rx="3" fill="#343a40"/><rect x="{lw}" width="{rw}" height="20" rx="3" fill="{color}"/><rect x="{lw}" width="4" height="20" fill="{color}"/><g fill="#fff" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11"><text x="8" y="14">agenttrust</text><text x="{tx}" y="14">{right}</text></g></svg>"##,
+        tx = lw + 6
     )
 }
 
@@ -188,6 +301,9 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         Err(r) => return r,
     };
     let now = clock(&req, &body, cfg);
+    if let ("POST", ["v1", "agents", agent_id, "registrations", "verify"]) = (req.method.as_str(), segments.as_slice()) {
+        return verify_registration(engine, agent_id, &body, now);
+    }
     let mut engine = engine.lock().unwrap();
 
     // The paywall. Checked once, here, before any handler runs, so no endpoint can forget it.
@@ -209,6 +325,59 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
 
     match (req.method.as_str(), segments.as_slice()) {
         ("GET", ["admin"]) => Response::html(ADMIN_PAGE.to_string()),
+        ("GET", ["trust"]) | ("GET", ["trust", _]) => Response::html(TRUST_PAGE.to_string()),
+
+        // ---- public trust profiles --------------------------------------------------------
+        ("GET", ["v1", "trust", "lookup"]) => {
+            let (Some(protocol), Some(id)) = (req.q("protocol"), req.q("id")) else {
+                return err(400, "protocol and id are required, e.g. ?protocol=icp&id=<principal>");
+            };
+            let external_id = match verify::normalize(protocol, id) {
+                Ok(x) => x,
+                Err(e) => return err(400, &e),
+            };
+            let owner = engine.verified_owner_of(protocol, &external_id).map(|s| s.to_string());
+            ok(Json::obj(vec![
+                ("protocol", Json::str(protocol)),
+                ("id", Json::str(external_id.clone())),
+                ("verified_agent", owner.clone().map(Json::str).unwrap_or(Json::Null)),
+                (
+                    "claimed_by",
+                    Json::Array(engine.claimants_of(protocol, &external_id).into_iter().map(Json::str).collect()),
+                ),
+                ("profile", owner.map(|a| engine.trust_profile_json(&a, now)).unwrap_or(Json::Null)),
+            ]))
+        }
+
+        ("GET", ["v1", "trust", agent_id]) => ok(engine.trust_profile_json(agent_id, now)),
+
+        ("GET", ["v1", "trust", agent_id, "badge.svg"]) => {
+            let p = engine.trust_profile_json(agent_id, now);
+            let score = p.get("score").and_then(|v| v.as_f()).unwrap_or(0.0) as i64;
+            let level = p.get("trust_level").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let verified = matches!(p.get("verified_protocols"), Some(Json::Array(a)) if !a.is_empty());
+            Response { status: 200, content_type: "image/svg+xml", body: badge_svg(score, level, verified) }
+        }
+
+        ("GET", ["v1", "registrations", "challenge"]) => {
+            let (Some(agent_id), Some(protocol), Some(id)) = (req.q("agent_id"), req.q("protocol"), req.q("id")) else {
+                return err(400, "agent_id, protocol and id are required");
+            };
+            let external_id = match verify::normalize(protocol, id) {
+                Ok(x) => x,
+                Err(e) => return err(400, &e),
+            };
+            ok(Json::obj(vec![
+                ("message", Json::str(verify::challenge(agent_id, protocol, &external_id, now))),
+                ("timestamp_ms", Json::num(now as f64)),
+                ("agent_id", Json::str(agent_id)),
+                ("protocol", Json::str(protocol)),
+                ("id", Json::str(external_id)),
+                ("how_to_sign", Json::str(how_to_sign(protocol))),
+                ("submit_to", Json::str(format!("POST /v1/agents/{agent_id}/registrations/verify"))),
+                ("expires_in_ms", Json::num(verify::PROOF_WINDOW_MS as f64)),
+            ]))
+        }
 
         // ---- customers (operator only) ------------------------------------------------
         ("POST", ["v1", "customers"]) => {
@@ -276,7 +445,13 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                         "POST /v1/arbitration/{id}/decide",
                         "POST /v1/sweep",
                         "GET  /v1/agents/{agent_id}",
-                        "POST /v1/agents/{agent_id}/identity",
+                        "GET  /v1/trust/{agent_id}            (public trust profile)",
+                        "GET  /v1/trust/{agent_id}/badge.svg  (embeddable badge)",
+                        "GET  /v1/trust/lookup?protocol=icp&id=...",
+                        "POST /v1/agents/{agent_id}/registrations",
+                        "GET  /v1/registrations/challenge?agent_id=&protocol=&id=",
+                        "POST /v1/agents/{agent_id}/registrations/verify",
+                        "GET  /trust/{agent_id}               (profile page for people)",
                         "GET  /v1/trusted?domain=commerce&floor=400",
                         "POST /v1/sources",
                         "POST /v1/attestations",
@@ -534,30 +709,45 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         // ---- reputation ---------------------------------------------------------------
         ("GET", ["v1", "agents", agent_id]) => ok(engine.reputation_json(agent_id)),
 
-        ("POST", ["v1", "agents", agent_id, "identity"]) => {
+        // `identity` is the original name, kept so existing callers keep working; it now records
+        // a *claim*, exactly like `registrations`.
+        ("POST", ["v1", "agents", agent_id, "registrations"]) | ("POST", ["v1", "agents", agent_id, "identity"]) => {
             let secret = body.get("secret").and_then(|v| v.as_str());
+            let protocol = body.get("protocol").or_else(|| body.get("kind")).and_then(|v| v.as_str());
+            let id = body.get("id").or_else(|| body.get("value")).and_then(|v| v.as_str());
+            let (Some(protocol), Some(id)) = (protocol, id) else {
+                return err(400, "protocol and id are required, e.g. {\"protocol\":\"icp\",\"id\":\"<principal>\"}");
+            };
+            let protocol = protocol.to_ascii_lowercase();
+            if protocol == "local" {
+                return err(400, "local is this service's own account — register an outside identity instead");
+            }
+            let external_id = match verify::normalize(&protocol, id) {
+                Ok(x) => x,
+                Err(e) => return err(400, &e),
+            };
             if let Err(e) = engine.authenticate(agent_id, secret) {
                 return err(401, e);
             }
-            let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("local");
-            let Some(value) = body.get("value").and_then(|v| v.as_str()) else {
-                return err(400, "value is required (the key thumbprint, agent id or DID)");
-            };
-            let binding = match kind {
-                "web_bot_auth" => IdentityBinding::WebBotAuthKey(value.to_string()),
-                "did" => IdentityBinding::Did(value.to_string()),
-                "local" => IdentityBinding::Local(value.to_string()),
-                protocol => IdentityBinding::CommerceProtocol {
-                    protocol: protocol.to_string(),
-                    agent_id: value.to_string(),
-                },
-            };
-            let agent_id = agent_id.to_string();
-            engine.bind_identity(&agent_id, binding.clone(), now);
+            engine.claim_registration(agent_id, &protocol, &external_id, now);
+            let verified = engine.verified_owner_of(&protocol, &external_id) == Some(*agent_id);
             ok(Json::obj(vec![
-                ("agent_id", Json::str(agent_id)),
-                ("identity", Json::str(binding.key())),
-                ("externally_verified", Json::Bool(binding.externally_verified())),
+                ("agent_id", Json::str(*agent_id)),
+                ("protocol", Json::str(protocol.clone())),
+                ("id", Json::str(external_id.clone())),
+                ("status", Json::str(if verified { "verified" } else { "claimed" })),
+                (
+                    "next",
+                    Json::str(if verified {
+                        "already verified".to_string()
+                    } else if verify::is_verifiable(&protocol) {
+                        format!(
+                            "prove it: GET /v1/registrations/challenge?agent_id={agent_id}&protocol={protocol}&id={external_id}, sign the message, then POST /v1/agents/{agent_id}/registrations/verify"
+                        )
+                    } else {
+                        "this protocol can't be proven here yet, so it will show as claimed".to_string()
+                    }),
+                ),
             ]))
         }
 
@@ -626,16 +816,18 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 );
             };
             let domain = domain_from(body.get("domain").and_then(|v| v.as_str()).unwrap_or("other"));
-            let kind = body.get("subject_kind").and_then(|v| v.as_str()).unwrap_or("local");
-            let subject_binding = match kind {
-                "web_bot_auth" => IdentityBinding::WebBotAuthKey(subject.to_string()),
-                "did" => IdentityBinding::Did(subject.to_string()),
-                "local" => IdentityBinding::Local(subject.to_string()),
-                protocol => IdentityBinding::CommerceProtocol {
-                    protocol: protocol.to_string(),
-                    agent_id: subject.to_string(),
-                },
+            let kind = body.get("subject_kind").and_then(|v| v.as_str()).unwrap_or("local").to_ascii_lowercase();
+            let subject = if kind == "local" {
+                subject.to_string()
+            } else {
+                match verify::normalize(&kind, subject) {
+                    Ok(x) => x,
+                    Err(e) => return err(400, &e),
+                }
             };
+            // A report about an outside identity lands on whichever agent has *proven* it holds
+            // that identity — never on one that merely claimed it.
+            let subject_binding = engine.resolve_subject(IdentityBinding::from_protocol(&kind, &subject));
             let att = Attestation {
                 source: source.to_string(),
                 subject: subject_binding.clone(),
@@ -648,7 +840,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             ok(Json::obj(vec![
                 ("accepted", Json::Bool(true)),
                 ("subject", Json::str(subject_binding.key())),
-                ("source_standing", Json::num(0.0)),
+                ("source_standing", Json::num(engine.source_standing(source) as f64)),
                 ("audit_head", Json::str(engine.audit_head())),
                 (
                     "note",
@@ -884,5 +1076,73 @@ mod settlement_tests {
         let agreement = json::parse(&route(&e, req("GET", &format!("/v1/agreements/{id}"), key, ""), PROD).body).unwrap();
         let payout = agreement.get("settlement").and_then(|s| s.get("payout")).unwrap();
         assert_eq!(payout.get("reference").unwrap().as_str(), Some("0xfeed"));
+    }
+
+    fn get_q(path: &str, q: &[(&str, &str)]) -> Request {
+        let mut r = req("GET", path, "", "");
+        r.query = q.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        r
+    }
+
+    fn body_json(r: &Response) -> Json {
+        json::parse(&r.body).unwrap()
+    }
+
+    #[test]
+    fn a_bot_proves_its_wallet_and_anyone_can_see_it_without_a_key() {
+        use k256::ecdsa::SigningKey;
+        use sha3::{Digest, Keccak256};
+        let e = Mutex::new(Engine::new());
+        let sk = SigningKey::from_slice(&[42u8; 32]).unwrap();
+        let point = sk.verifying_key().to_encoded_point(false);
+        let addr: String = Keccak256::digest(&point.as_bytes()[1..])[12..].iter().map(|b| format!("{b:02x}")).collect();
+        let addr = format!("0x{addr}");
+
+        // Claim, with no API key: registration is public, but locked to the agent's secret.
+        let claim = format!(r#"{{"secret":"s3","protocol":"eth","id":"{}"}}"#, addr.to_uppercase().replace("0X", "0x"));
+        let r = route(&e, req("POST", "/v1/agents/walletbot/registrations", "", &claim), PROD);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(body_json(&r).get("status").unwrap().as_str(), Some("claimed"));
+
+        // Challenge → sign → verify.
+        let r = route(&e, get_q("/v1/registrations/challenge", &[("agent_id", "walletbot"), ("protocol", "eth"), ("id", &addr)]), PROD);
+        let ch = body_json(&r);
+        let msg = ch.get("message").unwrap().as_str().unwrap().to_string();
+        let ts = ch.get("timestamp_ms").unwrap().as_f().unwrap() as i64;
+        let mut prefixed = format!("\x19Ethereum Signed Message:\n{}", msg.len()).into_bytes();
+        prefixed.extend_from_slice(msg.as_bytes());
+        let digest: [u8; 32] = Keccak256::digest(&prefixed).into();
+        let (sig, rid) = sk.sign_prehash_recoverable(&digest).unwrap();
+        let mut sig_bytes = sig.to_bytes().to_vec();
+        sig_bytes.push(27 + rid.to_byte());
+        let sig_hex: String = sig_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let proof = |secret: &str| {
+            format!(r#"{{"secret":"{secret}","protocol":"eth","id":"{addr}","timestamp_ms":{ts},"signature":"0x{sig_hex}"}}"#)
+        };
+        assert_eq!(route(&e, req("POST", "/v1/agents/walletbot/registrations/verify", "", &proof("wrong")), PROD).status, 401);
+        // The same signature presented for a different agent is refused.
+        let r = route(&e, req("POST", "/v1/agents/thief/registrations/verify", "", &proof("t")), PROD);
+        assert_eq!(r.status, 422, "{}", r.body);
+        let r = route(&e, req("POST", "/v1/agents/walletbot/registrations/verify", "", &proof("s3")), PROD);
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        // Public profile, lookup and badge — no API key anywhere.
+        let p = body_json(&route(&e, req("GET", "/v1/trust/walletbot", "", ""), PROD));
+        assert_eq!(p.get("verified_protocols"), Some(&Json::Array(vec![Json::str("eth")])));
+        let l = body_json(&route(&e, get_q("/v1/trust/lookup", &[("protocol", "eth"), ("id", &addr)]), PROD));
+        assert_eq!(l.get("verified_agent").unwrap().as_str(), Some("walletbot"));
+        let b = route(&e, req("GET", "/v1/trust/walletbot/badge.svg", "", ""), PROD);
+        assert_eq!(b.content_type, "image/svg+xml");
+        assert!(b.body.contains("✓"));
+        assert_eq!(route(&e, req("GET", "/trust/walletbot", "", ""), PROD).status, 200);
+        // The settlement API itself stays paid.
+        assert_eq!(route(&e, req("GET", "/v1/agents/walletbot", "", ""), PROD).status, 401);
+    }
+
+    #[test]
+    fn the_badge_never_contains_caller_text() {
+        let e = Mutex::new(Engine::new());
+        let b = route(&e, req("GET", "/v1/trust/%3Cscript%3E/badge.svg", "", ""), PROD);
+        assert!(!b.body.contains("script"));
     }
 }

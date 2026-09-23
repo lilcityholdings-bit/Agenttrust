@@ -1,4 +1,4 @@
-//! Just enough JSON to speak to agents, hand-rolled so this crate keeps its zero-dependency rule.
+//! Just enough JSON to speak to agents, hand-rolled so the only crates are the crypto ones (see Cargo.toml).
 //!
 //! Encoding is exact; decoding accepts the subset an agent actually sends (objects, arrays,
 //! strings, numbers, booleans, null) and refuses anything it cannot represent rather than

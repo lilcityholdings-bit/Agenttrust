@@ -1,6 +1,7 @@
 # agenttrust
 
-Dispute settlement and portable reputation for bots. One service, zero dependencies, one binary.
+Dispute settlement and a public trust score for bots. One service, one binary. The only crates
+are for signature checks and TLS (see `verify.rs`); everything else is hand-rolled std Rust.
 
 Two halves that need each other: a **jury** that settles disagreements between two agents, and a
 **reputation score** that is nothing more than a replayable fold over the settlements that jury
@@ -16,10 +17,71 @@ checks before signing is a courthouse in a field.
 | `jury.rs` | Silence loses, disagreement goes to a drawn jury, ties void, money is never minted. Panel is drawn by **sortition** from the whole eligible pool with a published seed, so the draw is reproducible by anyone. |
 | `store.rs` | The engine: agreements, reports, juries, **arbitration** (the cold-start path — see below), authentication, reputation, the hash-chained audit feed, and full-state persistence. |
 | `trust.rs` | Score as a pure fold over settlement events. Ghosting -60, clean settlement +2, disputed win +8, disputed loss -25, majority juror +3, minority juror 0. |
-| `attest.rs` | Cross-app layer: identity binding (Web Bot Auth / UCP / AP2 / TAP / DID), source weighting, per-domain scores, trusted-list query. |
-| `json.rs`, `http.rs`, `hash.rs` | Hand-rolled JSON, HTTP/1.1, SHA-256 and a seeded PRNG. No crates. |
+| `attest.rs` | Cross-app layer: identity bindings, source weighting, per-domain scores, trusted-list query. |
+| `verify.rs` | Checks that a bot really controls the outside identity it lists: ICP principal, Ethereum wallet, ERC-8004 agent NFT, did:key, Web Bot Auth domain. |
+| `trust.html` | The public trust-check page at `/trust`, compiled into the binary. |
+| `json.rs`, `http.rs`, `hash.rs` | Hand-rolled JSON, HTTP/1.1, SHA-256/224 and a seeded PRNG. |
 
-64 unit tests. `cargo test` runs them.
+81 unit tests. `cargo test` runs them.
+
+## The trust score
+
+Anyone, person or bot, can check a bot for free with no API key:
+
+- **Page:** `/trust/<bot id>`. It shows the score, a plain verdict, the track record, and which
+  identities are proven. You can also look a bot up by its ICP principal, wallet, ERC-8004 id,
+  DID or domain.
+- **JSON:** `GET /v1/trust/<bot id>` returns the same data for bots to read before they deal.
+- **Badge:** `GET /v1/trust/<bot id>/badge.svg` is an image a bot's owner can put on their site
+  or README.
+
+**The score (0–1000)** comes only from what the bot actually did in agreements settled here, or
+reported by registered partner apps. Every new bot starts at 100. A clean deal adds 2, going
+silent costs 60, winning a dispute adds 8 and losing one costs 25.
+
+**The verdict** is `unknown`, `caution`, `fair`, `good` or `excellent`, and the response lists
+the reasons:
+
+| Verdict | Rule |
+|---|---|
+| unknown | no agreements yet |
+| caution | went silent on ≥10% of deals, lost most of ≥3 disputes, or fell below 100 |
+| good | ≥10 deals, went silent on <5% |
+| excellent | ≥50 deals, went silent on <2%, and at least one proven identity |
+| fair | everything else |
+
+**Identities: claimed vs verified.** A bot can *list* any identity it likes, and it shows as
+"claimed". It shows as "verified" only after the bot signs a challenge with that identity's key
+and the signature checks out:
+
+| protocol | id | how it's proven |
+|---|---|---|
+| `icp` | Internet Computer principal | signature by the Ed25519/secp256k1 key the principal is derived from |
+| `eth` | `0x…` wallet | EIP-191 `personal_sign` |
+| `erc8004` | `8453:42` or `eip155:<chain>:<registry>:<agentId>` | EIP-191 signature from the NFT's owner or agent wallet, checked **on-chain** |
+| `did` | `did:key:z6Mk…` | Ed25519 signature by the key in the DID |
+| `web_bot_auth` | the bot's domain | Ed25519 signature by a key in the domain's `/.well-known/http-message-signatures-directory` |
+
+Other protocols (UCP, AP2, TAP, did:web, Internet Identity logins) can be claimed but not
+verified yet, and they always show as claimed.
+
+Identities never carry a score with them. The score belongs to the bot's own account here, so
+claiming someone else's identity gets you nothing, and listing a fresh one doesn't erase a bad
+record. Each verified identity belongs to one bot at a time. A newer proof moves it to another
+bot; an old proof can't take it back.
+
+```sh
+# 1. list it (use the same secret as the bot's other calls)
+curl -XPOST $URL/v1/agents/mybot/registrations -d '{"secret":"...","protocol":"eth","id":"0xYourWallet"}'
+# 2. get the exact text to sign (valid for 10 minutes)
+curl "$URL/v1/registrations/challenge?agent_id=mybot&protocol=eth&id=0xYourWallet"
+# 3. sign the "message" with that wallet, then send the signature back
+curl -XPOST $URL/v1/agents/mybot/registrations/verify \
+  -d '{"secret":"...","protocol":"eth","id":"0xYourWallet","timestamp_ms":<from step 2>,"signature":"0x..."}'
+```
+
+ERC-8004 checks read the chain through public RPC nodes (Ethereum, Base, Polygon, Arbitrum,
+Optimism, BNB, Avalanche, Sepolia, Base Sepolia). Set `RPC_URL_<chainId>` to use your own.
 
 ## Run it
 
@@ -120,7 +182,13 @@ GET  /v1/arbitration
 POST /v1/arbitration/{id}/decide        {"agent_id":"carol","outcome":0,"secret":"..."}
 POST /v1/sweep                          advances report deadlines, closed juries, and undecided arbitration windows
 GET  /v1/agents/{agent_id}              the score, per domain
-POST /v1/agents/{agent_id}/identity     {"kind":"web_bot_auth","value":"<key thumbprint>","secret":"..."}
+GET  /v1/trust/{agent_id}               public trust profile (no key needed)
+GET  /v1/trust/{agent_id}/badge.svg     embeddable badge (no key needed)
+GET  /v1/trust/lookup?protocol=icp&id=… which bot has proven this identity (no key needed)
+POST /v1/agents/{agent_id}/registrations          {"protocol":"icp","id":"<principal>","secret":"..."} (no key needed)
+GET  /v1/registrations/challenge?agent_id=&protocol=&id=                          (no key needed)
+POST /v1/agents/{agent_id}/registrations/verify   {"protocol","id","timestamp_ms","signature","public_key"?,"secret"} (no key needed)
+GET  /trust/{agent_id}                  the trust-check page for people
 GET  /v1/trusted?domain=commerce&floor=400
 POST /v1/sources                        {"source":"some_app","standing":700,"admin_secret":"..."}
 POST /v1/attestations                   {"source":"some_app","secret":"...","subject":"...","event":"..."}
@@ -241,6 +309,12 @@ Said plainly, because a service that overstates itself is worse than one that do
   any event. It does not defend against a compromised secret, a man-in-the-middle on a connection
   that isn't actually HTTPS, or a host that logs request bodies. Real request signing (Web Bot
   Auth-style) is the next step up, not implemented here.
+- **Trust lookups have no rate limit** other than a global cap of 120 outbound proof checks a
+  minute (chain RPC and domain fetches). They are free on purpose for now; they are the natural
+  thing to meter with x402 later.
+- **An ERC-8004 verification reflects the chain at the moment of proof.** If the NFT is sold
+  later, the profile still shows the old owner's proof until someone proves again. Rechecking
+  on a schedule is a later step.
 - **Per-source contribution caps** aren't implemented — see the note at the top of `attest.rs` for
   why, and what's in place instead.
 - **Arbitration has no bond or fee**, on purpose for now — see "Why there's a second dispute
