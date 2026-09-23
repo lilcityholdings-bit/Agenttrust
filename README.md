@@ -19,7 +19,7 @@ checks before signing is a courthouse in a field.
 | `attest.rs` | Cross-app layer: identity binding (Web Bot Auth / UCP / AP2 / TAP / DID), source weighting, per-domain scores, trusted-list query. |
 | `json.rs`, `http.rs`, `hash.rs` | Hand-rolled JSON, HTTP/1.1, SHA-256 and a seeded PRNG. No crates. |
 
-60 unit tests. `cargo test` runs them.
+64 unit tests. `cargo test` runs them.
 
 ## Run it
 
@@ -59,6 +59,30 @@ customer* — a platform or developer — and covers every agent that customer r
 
 `/v1/audit` and `/v1/audit/verify` stay public on purpose: anyone being able to check the record
 without paying is the whole point of it.
+
+## Who holds the money
+
+**Not this service.** The platform that opens an agreement (Bot Arena, a marketplace) already
+holds its users' balances, and it moves the money itself. This service is the referee and the
+record-keeper:
+
+1. Every agreement carries a `settlement` instruction (`GET /v1/agreements/{id}`):
+   - `pay_out`: the agreement resolved; pay according to `outcome`. `upheld_parties` lists whose
+     claim won.
+   - `return_stakes`: it voided (nobody answered, or a jury/arbiter couldn't decide); hand
+     everyone's stake back.
+   - `wait`: not resolved yet.
+2. `GET /v1/payouts/pending` lists every resolved agreement the calling platform still owes a
+   payout on.
+3. After moving the money, the platform confirms with
+   `POST /v1/agreements/{id}/payout {"reference":"<tx hash or ledger id>"}`. Only the platform
+   that opened the agreement can confirm, only once, and the confirmation goes into the public
+   audit chain.
+
+That last step is what keeps this honest without holding funds: a platform that ignores
+verdicts accumulates unpaid ones in public, and the admin page flags it. Holding stakes in a
+smart contract that pays out on a signed verdict (escrow or bonds) is the planned next step for
+agreements where that isn't enough. It isn't built yet.
 
 ## Authentication (agents)
 
@@ -103,6 +127,8 @@ POST /v1/attestations                   {"source":"some_app","secret":"...","sub
 GET  /v1/audit?since=0                  the public feed (no key needed)
 GET  /v1/audit/verify                   recompute the chain, catch tampering (no key needed)
 GET  /v1/usage                          your own usage, with your API key
+GET  /v1/payouts/pending                resolved agreements you still owe a payout on
+POST /v1/agreements/{id}/payout         {"reference":"0x..."} — confirm you moved the money
 
 # operator only — admin secret as X-Admin-Secret header (or "admin_secret" in the body):
 GET  /admin                             the admin page

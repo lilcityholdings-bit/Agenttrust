@@ -314,10 +314,22 @@ impl Customer {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Payout {
+    /// The platform's own reference for the transfer — a transaction hash, a ledger id.
+    pub reference: String,
+    pub confirmed_by: String,
+    pub at_ms: i64,
+}
+
 pub struct Engine {
     customers: HashMap<String, Customer>,
     /// Which customer's key opened each agreement, so an escalated dispute bills the right one.
     agreement_customer: HashMap<String, String>,
+    /// The platform's confirmation that it moved the money a verdict called for. This service
+    /// never holds stakes — the platform that owns the agreement does, and pays out itself — so
+    /// this record is what makes "the verdict was actually honored" checkable.
+    payouts: HashMap<String, Payout>,
     next_customer_id: u64,
     agreements: HashMap<String, Agreement>,
     reports: HashMap<String, HashMap<String, usize>>,
@@ -373,6 +385,7 @@ impl Engine {
         Engine {
             customers: HashMap::new(),
             agreement_customer: HashMap::new(),
+            payouts: HashMap::new(),
             next_customer_id: 1,
             agreements: HashMap::new(),
             reports: HashMap::new(),
@@ -495,6 +508,116 @@ impl Engine {
                 c.disputes_escalated += 1;
             }
         }
+    }
+
+    // ---- settlement (the platform moves the money, this service records that it did) ------
+
+    /// The parties whose own report matched the final outcome — the side(s) a payout goes to.
+    /// Both parties when they agreed; the reporting side after a default; whoever the jury or
+    /// arbiter sided with after a dispute.
+    fn upheld_parties(&self, agreement_id: &str, outcome: usize) -> Vec<String> {
+        let Some(a) = self.agreements.get(agreement_id) else { return Vec::new() };
+        let reports = self.reports.get(agreement_id);
+        a.parties
+            .iter()
+            .filter(|p| reports.and_then(|r| r.get(*p)) == Some(&outcome))
+            .cloned()
+            .collect()
+    }
+
+    /// A machine-readable instruction for the platform holding the stake: what to do with the
+    /// money, and whether it has confirmed doing it.
+    pub fn settlement_json(&self, agreement_id: &str) -> Json {
+        let Some(a) = self.agreements.get(agreement_id) else { return Json::Null };
+        let (instruction, outcome, upheld) = match (a.status, a.resolved_outcome) {
+            (Status::Settled, Some(o)) => ("pay_out", Json::num(o as f64), self.upheld_parties(agreement_id, o)),
+            (Status::Voided, _) => ("return_stakes", Json::Null, Vec::new()),
+            _ => ("wait", Json::Null, Vec::new()),
+        };
+        Json::obj(vec![
+            ("agreement_id", Json::str(a.id.clone())),
+            ("instruction", Json::str(instruction)),
+            ("outcome", outcome),
+            ("upheld_parties", Json::Array(upheld.into_iter().map(Json::str).collect())),
+            ("stake", Json::num(a.stake)),
+            ("asset", Json::str(a.asset.clone())),
+            (
+                "payout",
+                match self.payouts.get(agreement_id) {
+                    Some(p) => Json::obj(vec![
+                        ("reference", Json::str(p.reference.clone())),
+                        ("confirmed_at_ms", Json::num(p.at_ms as f64)),
+                    ]),
+                    None => Json::Null,
+                },
+            ),
+        ])
+    }
+
+    /// Resolved agreements this customer owns whose payout it has not yet confirmed — settled
+    /// ones (pay the winner) and voided ones (return the stakes) alike.
+    pub fn pending_payouts(&self, customer_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .agreement_customer
+            .iter()
+            .filter(|(agr, cus)| {
+                cus.as_str() == customer_id
+                    && !self.payouts.contains_key(*agr)
+                    && self
+                        .agreements
+                        .get(*agr)
+                        .map(|a| matches!(a.status, Status::Settled | Status::Voided))
+                        .unwrap_or(false)
+            })
+            .map(|(agr, _)| agr.clone())
+            .collect();
+        ids.sort_by_key(|id| self.agreements.get(id).map(|a| a.created_at_ms).unwrap_or(0));
+        ids
+    }
+
+    /// The platform that owns an agreement confirms it moved the money. Only the owning
+    /// customer may confirm, only once, and only after the agreement has resolved.
+    pub fn confirm_payout(
+        &mut self,
+        agreement_id: &str,
+        customer_id: &str,
+        reference: &str,
+        now_ms: i64,
+    ) -> Result<(), &'static str> {
+        let a = self.agreements.get(agreement_id).ok_or("no such agreement")?;
+        if !matches!(a.status, Status::Settled | Status::Voided) {
+            return Err("this agreement has not resolved yet — there is nothing to pay out");
+        }
+        if self.agreement_customer.get(agreement_id).map(|c| c.as_str()) != Some(customer_id) {
+            return Err("only the customer that opened this agreement can confirm its payout");
+        }
+        if self.payouts.contains_key(agreement_id) {
+            return Err("the payout for this agreement was already confirmed");
+        }
+        self.payouts.insert(
+            agreement_id.to_string(),
+            Payout { reference: reference.to_string(), confirmed_by: customer_id.to_string(), at_ms: now_ms },
+        );
+        self.append(
+            now_ms,
+            "payout_confirmed",
+            Json::obj(vec![
+                ("agreement_id", Json::str(agreement_id.to_string())),
+                ("customer_id", Json::str(customer_id.to_string())),
+                ("reference", Json::str(reference.to_string())),
+            ]),
+        );
+        Ok(())
+    }
+
+    /// A customer's summary for the admin page, including how many verdicts it has not yet
+    /// confirmed paying out — the number that shows whether a platform is honoring verdicts.
+    pub fn customer_json(&self, c: &Customer) -> Json {
+        let mut j = c.to_json();
+        if let Json::Object(m) = &mut j {
+            m.insert("payouts_pending".into(), Json::num(self.pending_payouts(&c.id).len() as f64));
+        }
+        j
     }
 
     // ---- identity -------------------------------------------------------------------------
@@ -1374,6 +1497,22 @@ impl Engine {
                         .collect(),
                 ),
             ),
+            (
+                "payouts",
+                Json::Array(
+                    self.payouts
+                        .iter()
+                        .map(|(agr, p)| {
+                            Json::obj(vec![
+                                ("agreement_id", Json::str(agr.clone())),
+                                ("reference", Json::str(p.reference.clone())),
+                                ("confirmed_by", Json::str(p.confirmed_by.clone())),
+                                ("at_ms", Json::num(p.at_ms as f64)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
             ("next_customer_id", Json::num(self.next_customer_id as f64)),
             ("network", self.network.to_snapshot_json()),
             ("audit", Json::Array(self.audit.iter().map(|e| e.to_json()).collect())),
@@ -1479,6 +1618,17 @@ impl Engine {
                 let agr = item.get("agreement_id").and_then(|v| v.as_str()).ok_or("bad agreement_customer")?;
                 let cus = item.get("customer_id").and_then(|v| v.as_str()).ok_or("bad agreement_customer")?;
                 engine.agreement_customer.insert(agr.to_string(), cus.to_string());
+            }
+        }
+        if let Some(Json::Array(items)) = j.get("payouts") {
+            for item in items {
+                let s = |k: &str| item.get(k).and_then(|v| v.as_str()).map(|v| v.to_string());
+                let (Some(agr), Some(reference), Some(by)) = (s("agreement_id"), s("reference"), s("confirmed_by"))
+                else {
+                    return Err("a malformed payout in the snapshot".into());
+                };
+                let at_ms = item.get("at_ms").and_then(|v| v.as_f()).unwrap_or(0.0) as i64;
+                engine.payouts.insert(agr, Payout { reference, confirmed_by: by, at_ms });
             }
         }
         engine.next_customer_id =
@@ -1791,6 +1941,66 @@ mod tests {
         assert_eq!(c.disputes_escalated, 1);
     }
 
+    // ---- settlement: the platform holds the money and confirms paying out -----------------
+
+    fn owned_agreement(e: &mut Engine, cus: &str, arbiter: Option<&str>) -> String {
+        let id = e
+            .create_agreement(
+                vec!["alice".into(), "bob".into()],
+                2,
+                100.0,
+                "USDC".into(),
+                Domain::Commerce,
+                arbiter.map(|s| s.to_string()),
+                0,
+            )
+            .unwrap();
+        e.tag_agreement(&id, cus);
+        id
+    }
+
+    #[test]
+    fn a_verdict_tells_the_platform_exactly_who_to_pay() {
+        let mut e = Engine::new();
+        let cus = e.create_customer("Arena", "k", 0);
+        let id = owned_agreement(&mut e, &cus, Some("carol"));
+        assert_eq!(e.settlement_json(&id).get("instruction").unwrap().as_str(), Some("wait"));
+        e.report(&id, "alice", 0, None, 1).unwrap();
+        e.report(&id, "bob", 1, None, 2).unwrap();
+        e.decide_arbitration(&id, "carol", 1, 3).unwrap();
+        let s = e.settlement_json(&id);
+        assert_eq!(s.get("instruction").unwrap().as_str(), Some("pay_out"));
+        assert_eq!(s.get("upheld_parties").unwrap(), &Json::Array(vec![Json::str("bob")]));
+    }
+
+    #[test]
+    fn a_voided_agreement_says_return_the_stakes() {
+        let mut e = Engine::new();
+        let cus = e.create_customer("Arena", "k", 0);
+        let id = owned_agreement(&mut e, &cus, None);
+        e.sweep(REPORT_WINDOW_MS + 1); // nobody reported
+        assert_eq!(e.settlement_json(&id).get("instruction").unwrap().as_str(), Some("return_stakes"));
+        assert_eq!(e.pending_payouts(&cus), vec![id], "a void still needs the stakes handed back");
+    }
+
+    #[test]
+    fn only_the_owning_platform_confirms_a_payout_once_after_resolution() {
+        let mut e = Engine::new();
+        let cus = e.create_customer("Arena", "k", 0);
+        let other = e.create_customer("Someone else", "k2", 0);
+        let id = owned_agreement(&mut e, &cus, None);
+        assert!(e.confirm_payout(&id, &cus, "tx1", 1).is_err(), "nothing to pay out yet");
+        e.report(&id, "alice", 1, None, 1).unwrap();
+        e.report(&id, "bob", 1, None, 2).unwrap();
+        assert_eq!(e.pending_payouts(&cus), vec![id.clone()]);
+        assert!(e.confirm_payout(&id, &other, "tx1", 3).is_err(), "not their agreement");
+        e.confirm_payout(&id, &cus, "0xabc", 3).unwrap();
+        assert!(e.confirm_payout(&id, &cus, "0xabc", 4).is_err(), "confirmed once only");
+        assert!(e.pending_payouts(&cus).is_empty());
+        let payout = e.settlement_json(&id).get("payout").cloned().unwrap();
+        assert_eq!(payout.get("reference").unwrap().as_str(), Some("0xabc"));
+    }
+
     #[test]
     fn everything_survives_a_snapshot_round_trip() {
         let mut e = Engine::with_admin_secret("adm");
@@ -1805,6 +2015,13 @@ mod tests {
         e.tag_agreement(&id, &cus);
         e.report(&id, "alice", 0, Some("receipt".into()), 11).unwrap();
         e.report(&id, "bob", 1, None, 12).unwrap();
+        let paid = e
+            .create_agreement(vec!["x".into(), "y".into()], 2, 5.0, "USDC".into(), Domain::Other, None, 13)
+            .unwrap();
+        e.tag_agreement(&paid, &cus);
+        e.report(&paid, "x", 0, None, 14).unwrap();
+        e.report(&paid, "y", 0, None, 15).unwrap();
+        e.confirm_payout(&paid, &cus, "0xpaid", 16).unwrap();
 
         let text = e.to_snapshot().to_string();
         let mut restored = Engine::from_snapshot(&crate::json::parse(&text).unwrap()).unwrap();
@@ -1816,6 +2033,7 @@ mod tests {
         assert!(restored.customer_for_key("k").is_some());
         assert_eq!(restored.customer(&cus).unwrap().disputes_escalated, 1);
         assert_eq!(restored.jury(&id).unwrap().panel, e.jury(&id).unwrap().panel);
+        assert_eq!(restored.settlement_json(&paid), e.settlement_json(&paid), "payout confirmations survive");
     }
 
     #[test]

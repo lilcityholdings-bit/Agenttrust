@@ -165,7 +165,15 @@
       $("table-wrap").hidden = list.length === 0;
       list.forEach(function (c) {
         var tr = document.createElement("tr");
-        tr.appendChild(cell(c.name));
+        var nameCell = cell(c.name);
+        if (c.payouts_pending > 0) {
+          var flag = document.createElement("div");
+          flag.className = "off";
+          flag.style.fontSize = ".8rem";
+          flag.textContent = c.payouts_pending + " unpaid verdict" + (c.payouts_pending === 1 ? "" : "s");
+          nameCell.appendChild(flag);
+        }
+        tr.appendChild(nameCell);
         tr.appendChild(cell(c.active ? "active" : "revoked", c.active ? "on" : "off"));
         tr.appendChild(cell(String(c.agreements_created), "num"));
         tr.appendChild(cell(String(c.disputes_escalated), "num"));

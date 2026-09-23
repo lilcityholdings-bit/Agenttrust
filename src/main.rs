@@ -238,7 +238,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             if let Err(e) = engine.check_admin(admin_secret_of(&req, &body)) {
                 return err(401, e);
             }
-            ok(Json::Array(engine.customers().iter().map(|c| c.to_json()).collect()))
+            ok(Json::Array(engine.customers().iter().map(|c| engine.customer_json(c)).collect()))
         }
 
         ("POST", ["v1", "customers", id, "revoke"]) => {
@@ -253,7 +253,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
 
         // ---- a customer's own usage -----------------------------------------------------
         ("GET", ["v1", "usage"]) => match customer_id.as_deref().and_then(|id| engine.customer(id)) {
-            Some(c) => ok(c.to_json()),
+            Some(c) => ok(engine.customer_json(c)),
             None => err(401, "usage is per customer — call this with your API key"),
         },
         ("GET", ["health"]) | ("GET", []) => ok(Json::obj(vec![
@@ -283,6 +283,8 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                         "GET  /v1/audit?since=0",
                         "GET  /v1/audit/verify",
                         "GET  /v1/usage",
+                        "GET  /v1/payouts/pending",
+                        "POST /v1/agreements/{id}/payout",
                         "GET  /admin",
                     ]
                     .iter()
@@ -357,9 +359,35 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     },
                 ),
                 ("report_deadline_ms", Json::num(a.report_deadline_ms as f64)),
+                ("settlement", engine.settlement_json(id)),
             ])),
             None => err(404, "no such agreement"),
         },
+
+        // ---- settlement: the platform holding the stake moves the money and confirms it --
+        ("GET", ["v1", "payouts", "pending"]) => match &customer_id {
+            Some(cid) => ok(Json::Array(
+                engine.pending_payouts(cid).iter().map(|id| engine.settlement_json(id)).collect(),
+            )),
+            None => err(401, "payouts are per customer — call this with your API key"),
+        },
+
+        ("POST", ["v1", "agreements", id, "payout"]) => {
+            let Some(cid) = customer_id.clone() else {
+                return err(401, "confirming a payout needs the API key of the customer that opened the agreement");
+            };
+            let Some(reference) = body.get("reference").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty())
+            else {
+                return err(400, "reference is required — your transaction hash or ledger id for the transfer");
+            };
+            match engine.confirm_payout(id, &cid, reference.trim(), now) {
+                Ok(()) => ok(Json::obj(vec![
+                    ("settlement", engine.settlement_json(id)),
+                    ("audit_head", Json::str(engine.audit_head())),
+                ])),
+                Err(e) => err(409, e),
+            }
+        }
 
         ("POST", ["v1", "agreements", id, "report"]) => {
             let Some(agent_id) = body.get("agent_id").and_then(|v| v.as_str()) else {
@@ -809,5 +837,52 @@ mod tests {
         let r = route(&e, req("POST", &format!("/v1/agreements/{id}/report"), &h, far), PROD);
         let result = json::parse(&r.body).unwrap();
         assert_eq!(result.get("result").unwrap().as_str(), Some("waiting"), "bob still gets his window: {}", r.body);
+    }
+}
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const PROD: Config = Config { require_api_key: true, allow_clock_override: false };
+
+    fn req(method: &str, path: &str, key: &str, body: &str) -> Request {
+        let mut headers = HashMap::new();
+        if !key.is_empty() {
+            headers.insert("x-api-key".to_string(), key.to_string());
+        }
+        Request { method: method.into(), path: path.into(), query: HashMap::new(), headers, body: body.into() }
+    }
+
+    #[test]
+    fn a_platform_sees_what_it_owes_and_confirms_paying_it() {
+        let e = Mutex::new(Engine::with_admin_secret("adm"));
+        let (key, other) = {
+            let mut g = e.lock().unwrap();
+            g.create_customer("Arena", "k_arena", 0);
+            g.create_customer("Other", "k_other", 0);
+            ("k_arena", "k_other")
+        };
+        let r = route(&e, req("POST", "/v1/agreements", key, r#"{"parties":["a","b"],"stake":40,"secret":"sa"}"#), PROD);
+        let id = json::parse(&r.body).unwrap().get("agreement_id").unwrap().as_str().unwrap().to_string();
+        route(&e, req("POST", &format!("/v1/agreements/{id}/report"), key, r#"{"agent_id":"a","outcome":1,"secret":"sa"}"#), PROD);
+        route(&e, req("POST", &format!("/v1/agreements/{id}/report"), key, r#"{"agent_id":"b","outcome":1,"secret":"sb"}"#), PROD);
+
+        let pending = json::parse(&route(&e, req("GET", "/v1/payouts/pending", key, ""), PROD).body).unwrap();
+        let Json::Array(items) = &pending else { panic!("{pending:?}") };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].get("instruction").unwrap().as_str(), Some("pay_out"));
+
+        let pay = format!("/v1/agreements/{id}/payout");
+        assert_eq!(route(&e, req("POST", &pay, other, r#"{"reference":"x"}"#), PROD).status, 409, "not theirs");
+        assert_eq!(route(&e, req("POST", &pay, key, r#"{}"#), PROD).status, 400, "reference required");
+        assert_eq!(route(&e, req("POST", &pay, key, r#"{"reference":"0xfeed"}"#), PROD).status, 200);
+
+        let pending = json::parse(&route(&e, req("GET", "/v1/payouts/pending", key, ""), PROD).body).unwrap();
+        assert_eq!(pending, Json::Array(vec![]));
+        let agreement = json::parse(&route(&e, req("GET", &format!("/v1/agreements/{id}"), key, ""), PROD).body).unwrap();
+        let payout = agreement.get("settlement").and_then(|s| s.get("payout")).unwrap();
+        assert_eq!(payout.get("reference").unwrap().as_str(), Some("0xfeed"));
     }
 }
