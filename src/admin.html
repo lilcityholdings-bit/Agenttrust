@@ -50,14 +50,19 @@
   }
   .warn { background: var(--warn-bg); color: var(--warn-ink); border-radius: 8px; padding: 10px; margin-top: 10px; font-size: .9rem; }
   .err { color: var(--bad); margin-top: 10px; font-size: .9rem; }
-  .table-wrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
-  th, td { text-align: left; padding: 8px 4px; border-bottom: 1px solid var(--line); }
-  td:first-child { word-break: break-word; }
-  td.num, th.num, td:last-child { white-space: nowrap; }
-  th { color: var(--muted); font-weight: 600; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .on { color: var(--good); } .off { color: var(--bad); }
+  .card { border-top: 1px solid var(--line); padding: 12px 0; }
+  .card:first-of-type { border-top: 0; }
+  .card .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .card .nm { font-weight: 600; word-break: break-word; }
+  .money { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 8px 0; }
+  .money div { background: var(--bg); border-radius: 8px; padding: 6px 8px; }
+  .money b { display: block; font-variant-numeric: tabular-nums; }
+  .money span { color: var(--muted); font-size: .78rem; }
+  .meta { color: var(--muted); font-size: .85rem; }
+  .flag { color: var(--bad); font-size: .85rem; font-weight: 600; }
+  .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  button.danger { background: transparent; color: var(--bad); border: 1px solid var(--line); }
   .empty { color: var(--muted); font-size: .9rem; }
   [hidden] { display: none !important; }
 </style>
@@ -65,7 +70,7 @@
 <body>
 <main>
   <h1>agenttrust admin</h1>
-  <p class="sub">Create API keys for paying customers and see what they use.</p>
+  <p class="sub">Create API keys for platforms, see what each one owes, and record payments.</p>
 
   <section>
     <h2>Admin secret</h2>
@@ -78,6 +83,7 @@
     <label for="name">Customer name</label>
     <input id="name" type="text" placeholder="e.g. Bot Arena" autocomplete="off">
     <button id="create">Create API key</button>
+    <p class="meta" id="plan"></p>
     <div id="created" hidden>
       <div class="key" id="newkey"></div>
       <div class="row"><button class="secondary small" id="copy" style="margin-top:8px">Copy key</button></div>
@@ -93,12 +99,7 @@
     </div>
     <div class="err" id="list-err" hidden></div>
     <p class="empty" id="empty">Enter your admin secret and tap Refresh.</p>
-    <div class="table-wrap" id="table-wrap" hidden>
-      <table>
-        <thead><tr><th>Name</th><th>Status</th><th class="num">Deals</th><th class="num">Disputes</th><th></th></tr></thead>
-        <tbody id="rows"></tbody>
-      </table>
-    </div>
+    <div id="rows"></div>
   </section>
 </main>
 
@@ -148,11 +149,70 @@
       .catch(function () { btn.textContent = "Select and copy manually"; });
   });
 
-  function cell(text, cls) {
-    var td = document.createElement("td");
-    td.textContent = text;
-    if (cls) td.className = cls;
-    return td;
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function dollars(n) { return "$" + Number(n || 0).toFixed(2); }
+
+  function act(label, cls, fn) {
+    var b = el("button", "small " + cls, label);
+    b.addEventListener("click", fn);
+    return b;
+  }
+
+  function fail(e) { showErr($("list-err"), e.message); }
+
+  function renderCustomer(c) {
+    var card = el("div", "card");
+    var top = el("div", "top");
+    top.appendChild(el("span", "nm", c.name));
+    top.appendChild(el("span", c.purged ? "off" : (c.active ? "on" : "off"), c.purged ? "purged" : (c.active ? "active" : "revoked")));
+    card.appendChild(top);
+
+    var money = el("div", "money");
+    [["This month", dollars(c.this_month_usd)], ["Owed", dollars(c.balance_usd)], ["Deals / disputes", c.agreements_created + " / " + c.disputes_escalated]]
+      .forEach(function (m) {
+        var d = el("div");
+        d.appendChild(el("b", "", m[1]));
+        d.appendChild(el("span", "", m[0]));
+        money.appendChild(d);
+      });
+    card.appendChild(money);
+
+    if (c.overdue) card.appendChild(el("div", "flag", "Overdue: an earlier month is unpaid"));
+    if (c.payouts_pending > 0) {
+      card.appendChild(el("div", "flag", c.payouts_pending + " unpaid verdict" + (c.payouts_pending === 1 ? "" : "s") + " (they owe bots money)"));
+    }
+
+    var actions = el("div", "actions");
+    actions.appendChild(act("Record payment", "secondary", function () {
+      var amt = prompt("Amount received from " + c.name + " (USD):", c.balance_usd > 0 ? String(c.balance_usd) : "");
+      if (!amt) return;
+      var ref = prompt("Payment reference (Stripe payment id or USDC transaction hash):");
+      if (!ref) return;
+      call("POST", "/v1/customers/" + encodeURIComponent(c.customer_id) + "/payments", { amount_usd: Number(amt), reference: ref })
+        .then(load).catch(fail);
+    }));
+    if (c.active) {
+      actions.appendChild(act("Revoke", "secondary", function () {
+        if (!confirm("Revoke " + c.name + "'s key? Their requests start failing immediately. Their bots' history is kept.")) return;
+        call("POST", "/v1/customers/" + encodeURIComponent(c.customer_id) + "/revoke", {}).then(load).catch(fail);
+      }));
+    }
+    if (!c.purged) {
+      actions.appendChild(act("Purge for cheating", "danger", function () {
+        var typed = prompt("Only for a platform caught farming scores. This revokes " + c.name +
+          "'s key and takes back every point it ever gave any bot. Type PURGE to confirm.");
+        if (typed !== "PURGE") return;
+        call("POST", "/v1/customers/" + encodeURIComponent(c.customer_id) + "/revoke", { purge: true }).then(load).catch(fail);
+      }));
+    }
+    card.appendChild(actions);
+    return card;
   }
 
   function load() {
@@ -162,42 +222,19 @@
       rows.textContent = "";
       $("empty").textContent = "No customers yet.";
       $("empty").hidden = list.length > 0;
-      $("table-wrap").hidden = list.length === 0;
-      list.forEach(function (c) {
-        var tr = document.createElement("tr");
-        var nameCell = cell(c.name);
-        if (c.payouts_pending > 0) {
-          var flag = document.createElement("div");
-          flag.className = "off";
-          flag.style.fontSize = ".8rem";
-          flag.textContent = c.payouts_pending + " unpaid verdict" + (c.payouts_pending === 1 ? "" : "s");
-          nameCell.appendChild(flag);
-        }
-        tr.appendChild(nameCell);
-        tr.appendChild(cell(c.active ? "active" : "revoked", c.active ? "on" : "off"));
-        tr.appendChild(cell(String(c.agreements_created), "num"));
-        tr.appendChild(cell(String(c.disputes_escalated), "num"));
-        var td = document.createElement("td");
-        if (c.active) {
-          var b = document.createElement("button");
-          b.className = "secondary small";
-          b.textContent = "Revoke";
-          b.addEventListener("click", function () {
-            if (!confirm("Revoke " + c.name + "'s key? Their requests will start failing immediately.")) return;
-            call("POST", "/v1/customers/" + encodeURIComponent(c.customer_id) + "/revoke", {})
-              .then(load).catch(function (e) { showErr($("list-err"), e.message); });
-          });
-          td.appendChild(b);
-        }
-        tr.appendChild(td);
-        rows.appendChild(tr);
-      });
+      list.forEach(function (c) { rows.appendChild(renderCustomer(c)); });
     }).catch(function (e) {
-      $("table-wrap").hidden = true;
+      $("rows").textContent = "";
       $("empty").hidden = true;
       showErr($("list-err"), e.message);
     });
   }
+
+  fetch("/v1/pricing").then(function (r) { return r.json(); }).then(function (p) {
+    $("plan").textContent = "Plan: " + dollars(p.monthly_usd) + "/month, includes " + p.included_agreements +
+      " agreements and " + p.included_lookups + " lookups; then " + dollars(p.agreement_usd) + " per agreement, " +
+      dollars(p.dispute_usd) + " per dispute.";
+  }).catch(function () {});
 
   $("refresh").addEventListener("click", load);
   if (secretBox.value) load();

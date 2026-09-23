@@ -7,9 +7,10 @@
 //! its own history. Editing the past means re-hashing every entry after it, which is visible to
 //! anyone who kept an older head.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::attest::{Attestation, Domain, IdentityBinding, TrustNetwork};
+use crate::billing::{self, Payment, Pricing, Usage, UsageByMonth};
 use crate::hash::{hex64, sha256_hex};
 use crate::json::Json;
 use crate::jury::{Claim, Jury, Verdict, DISPUTE_FEE_BPS, MIN_JUROR_SETTLED};
@@ -20,6 +21,31 @@ pub const REPORT_WINDOW_MS: i64 = 6 * 60 * 60 * 1000;
 
 /// How long a named arbiter has to decide before the case voids like an unresolved jury does.
 pub const ARBITRATION_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+// ---- anti-farming ----------------------------------------------------------------------------
+//
+// The cheapest way to fake a good record is to trade with yourself: run two bots, have them
+// "settle" deal after deal, and collect the points. Three rules make that stop paying, and all
+// three apply only to *gains* — a loss or a ghosting always counts in full, because nobody games
+// a system by making themselves look worse.
+//
+// 1. The same two bots earn points from each other at most once per `PAIR_COOLDOWN_MS`. The
+//    deals still settle and still appear in the history; they just don't score.
+// 2. One platform (paying customer) can hand any one bot at most `PLATFORM_CAP` points in total.
+//    Past that, a bot can only climb by being trusted somewhere else too.
+// 3. The trust verdicts count *distinct* partners and *distinct* platforms, not raw deals (see
+//    `trust_profile_json`). A ring of sock puppets all run through one platform tops out at
+//    "fair" no matter how many deals it fakes.
+//
+// Rule 2 is what makes the rest hold: sock puppets are free, but platforms are operator-issued
+// keys with a monthly price (billing.rs), and a platform caught farming can be revoked with its
+// points taken back (`purge_platform`).
+
+/// How often the same pair of bots can earn points from each other.
+pub const PAIR_COOLDOWN_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// The most positive points one platform can give any one bot, across every domain.
+pub const PLATFORM_CAP: i32 = 150;
 
 /// What happened when one side of an agreement reported.
 #[derive(Debug, Clone, PartialEq)]
@@ -275,6 +301,14 @@ pub struct Customer {
     /// a jury or an arbiter — that is the unit of work this service actually does.
     pub agreements_created: u64,
     pub disputes_escalated: u64,
+    /// Metered usage by month ("YYYY-MM"), what the monthly bill is computed from.
+    pub usage: UsageByMonth,
+    /// Payments the operator has recorded against this customer's bills.
+    pub payments: Vec<Payment>,
+    /// When the key was turned off; billing stops after that month.
+    pub revoked_at_ms: Option<i64>,
+    /// Revoked for farming: every point it handed out was taken back.
+    pub purged: bool,
 }
 
 impl Customer {
@@ -286,6 +320,7 @@ impl Customer {
             ("created_at_ms", Json::num(self.created_at_ms as f64)),
             ("agreements_created", Json::num(self.agreements_created as f64)),
             ("disputes_escalated", Json::num(self.disputes_escalated as f64)),
+            ("purged", Json::Bool(self.purged)),
         ])
     }
 
@@ -298,6 +333,38 @@ impl Customer {
             ("active", Json::Bool(self.active)),
             ("agreements_created", Json::num(self.agreements_created as f64)),
             ("disputes_escalated", Json::num(self.disputes_escalated as f64)),
+            (
+                "usage",
+                Json::Array(
+                    self.usage
+                        .iter()
+                        .map(|(m, u)| {
+                            let mut j = u.to_json();
+                            if let Json::Object(o) = &mut j {
+                                o.insert("month".into(), Json::str(m.clone()));
+                            }
+                            j
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "payments",
+                Json::Array(
+                    self.payments
+                        .iter()
+                        .map(|p| {
+                            Json::obj(vec![
+                                ("mills", Json::num(p.mills as f64)),
+                                ("reference", Json::str(p.reference.clone())),
+                                ("at_ms", Json::num(p.at_ms as f64)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("revoked_at_ms", self.revoked_at_ms.map(|t| Json::num(t as f64)).unwrap_or(Json::Null)),
+            ("purged", Json::Bool(self.purged)),
         ])
     }
 
@@ -310,6 +377,28 @@ impl Customer {
             active: matches!(j.get("active"), Some(Json::Bool(true))),
             agreements_created: j.get("agreements_created")?.as_f()? as u64,
             disputes_escalated: j.get("disputes_escalated")?.as_f()? as u64,
+            usage: match j.get("usage") {
+                Some(Json::Array(items)) => items
+                    .iter()
+                    .filter_map(|i| Some((i.get("month")?.as_str()?.to_string(), Usage::from_json(i))))
+                    .collect(),
+                _ => UsageByMonth::new(),
+            },
+            payments: match j.get("payments") {
+                Some(Json::Array(items)) => items
+                    .iter()
+                    .filter_map(|i| {
+                        Some(Payment {
+                            mills: i.get("mills")?.as_f()? as i64,
+                            reference: i.get("reference")?.as_str()?.to_string(),
+                            at_ms: i.get("at_ms")?.as_f()? as i64,
+                        })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
+            revoked_at_ms: j.get("revoked_at_ms").and_then(|v| v.as_f()).map(|t| t as i64),
+            purged: matches!(j.get("purged"), Some(Json::Bool(true))),
         })
     }
 }
@@ -433,6 +522,18 @@ pub struct Engine {
     verified_owner: HashMap<String, String>,
     /// When each agent first did anything scored or registered — account age for the profile.
     first_seen: HashMap<String, i64>,
+    /// Anti-farming state — see the rules at the top of this file. When each pair of agents
+    /// (keyed by `pair_key`) last earned points from each other.
+    pair_last_credit: HashMap<String, i64>,
+    /// Positive points each platform has handed each agent, per domain: agent → platform →
+    /// domain → points. Enforces `PLATFORM_CAP`, and is exactly what `purge_platform` takes back.
+    platform_credit: HashMap<String, HashMap<String, HashMap<Domain, i32>>>,
+    /// Distinct agents each agent has settled an agreement with.
+    counterparties: HashMap<String, HashSet<String>>,
+    /// Distinct platforms each agent has settled an agreement through.
+    platforms: HashMap<String, HashSet<String>>,
+    /// The price list — set from the environment at boot, not persisted.
+    pub pricing: Pricing,
     /// SHA-256 of the secret each agent/source id has claimed, by trust-on-first-use: the first
     /// authenticated call for an id sets its secret, and every call after that must match. This
     /// is what closes "any caller can claim to be any agent_id" — see [`Engine::authenticate`].
@@ -487,6 +588,11 @@ impl Engine {
             registrations: HashMap::new(),
             verified_owner: HashMap::new(),
             first_seen: HashMap::new(),
+            pair_last_credit: HashMap::new(),
+            platform_credit: HashMap::new(),
+            counterparties: HashMap::new(),
+            platforms: HashMap::new(),
+            pricing: Pricing::default(),
             agent_secrets: HashMap::new(),
             admin_secret_hash: sha256_hex(admin_secret.as_bytes()),
             network,
@@ -553,6 +659,10 @@ impl Engine {
                 active: true,
                 agreements_created: 0,
                 disputes_escalated: 0,
+                usage: UsageByMonth::new(),
+                payments: Vec::new(),
+                revoked_at_ms: None,
+                purged: false,
             },
         );
         self.append(
@@ -582,25 +692,131 @@ impl Engine {
     /// Turns a key off — for a customer who stopped paying, or a key that leaked.
     pub fn revoke_customer(&mut self, id: &str, now_ms: i64) -> Result<(), &'static str> {
         let c = self.customers.get_mut(id).ok_or("no such customer")?;
-        c.active = false;
+        if c.active {
+            c.active = false;
+            c.revoked_at_ms = Some(now_ms);
+        }
         self.append(now_ms, "customer_revoked", Json::obj(vec![("customer_id", Json::str(id.to_string()))]));
         Ok(())
     }
 
-    /// Records which customer opened an agreement, for billing when it escalates.
-    pub fn tag_agreement(&mut self, agreement_id: &str, customer_id: &str) {
+    /// Revokes a platform caught farming and takes back every point it ever gave anyone. The
+    /// platform also stops counting toward any bot's "distinct platforms". Losses it recorded
+    /// stay: they were real disputes that other bots lost, not points it handed out.
+    pub fn purge_platform(&mut self, id: &str, now_ms: i64) -> Result<usize, &'static str> {
+        self.revoke_customer(id, now_ms)?;
+        if let Some(c) = self.customers.get_mut(id) {
+            c.purged = true;
+        }
+        let mut touched = 0;
+        let agents: Vec<String> = self.platform_credit.keys().cloned().collect();
+        for agent in agents {
+            let Some(by_domain) = self.platform_credit.get_mut(&agent).and_then(|m| m.remove(id)) else { continue };
+            let subject = self.identity_of(&agent);
+            for (domain, points) in by_domain {
+                self.network.adjust(&subject, domain, -points);
+            }
+            touched += 1;
+        }
+        for set in self.platforms.values_mut() {
+            set.remove(id);
+        }
+        self.append(
+            now_ms,
+            "platform_purged",
+            Json::obj(vec![
+                ("customer_id", Json::str(id.to_string())),
+                ("agents_adjusted", Json::num(touched as f64)),
+            ]),
+        );
+        Ok(touched)
+    }
+
+    fn usage_mut(&mut self, customer_id: &str, now_ms: i64) -> Option<&mut Usage> {
+        let c = self.customers.get_mut(customer_id)?;
+        Some(c.usage.entry(billing::month_of(now_ms)).or_default())
+    }
+
+    /// Records which customer opened an agreement, and meters it.
+    pub fn tag_agreement(&mut self, agreement_id: &str, customer_id: &str, now_ms: i64) {
         self.agreement_customer.insert(agreement_id.to_string(), customer_id.to_string());
         if let Some(c) = self.customers.get_mut(customer_id) {
             c.agreements_created += 1;
         }
+        if let Some(u) = self.usage_mut(customer_id, now_ms) {
+            u.agreements += 1;
+        }
     }
 
-    fn bill_dispute(&mut self, agreement_id: &str) {
+    fn bill_dispute(&mut self, agreement_id: &str, now_ms: i64) {
         if let Some(cid) = self.agreement_customer.get(agreement_id).cloned() {
             if let Some(c) = self.customers.get_mut(&cid) {
                 c.disputes_escalated += 1;
             }
+            if let Some(u) = self.usage_mut(&cid, now_ms) {
+                u.disputes += 1;
+            }
         }
+    }
+
+    /// Meters one trust lookup made with a customer's key. Not an audit event — lookups are
+    /// reads, and the public feed is for things that change someone's standing.
+    pub fn meter_lookup(&mut self, customer_id: &str, now_ms: i64) {
+        if let Some(u) = self.usage_mut(customer_id, now_ms) {
+            u.lookups += 1;
+        }
+    }
+
+    pub fn record_payment(&mut self, customer_id: &str, mills: i64, reference: &str, now_ms: i64) -> Result<(), &'static str> {
+        if mills <= 0 {
+            return Err("amount must be positive");
+        }
+        let c = self.customers.get_mut(customer_id).ok_or("no such customer")?;
+        c.payments.push(Payment { mills, reference: reference.to_string(), at_ms: now_ms });
+        self.append(
+            now_ms,
+            "payment_recorded",
+            Json::obj(vec![
+                ("customer_id", Json::str(customer_id.to_string())),
+                ("usd", billing::usd(mills)),
+                ("reference", Json::str(reference.to_string())),
+            ]),
+        );
+        Ok(())
+    }
+
+    /// Every month's bill from sign-up through now (or through the month the key was revoked),
+    /// what's been paid, and what's still owed. Nothing is stored about a bill: it is always
+    /// recomputed from usage and the current price list.
+    pub fn statement_json(&self, c: &Customer, now_ms: i64) -> Json {
+        let end = c.revoked_at_ms.unwrap_or(now_ms).min(now_ms);
+        let current = billing::month_of(now_ms);
+        let mut months = Vec::new();
+        let (mut billed, mut this_month) = (0i64, 0i64);
+        for m in billing::months_between(c.created_at_ms, end) {
+            let usage = c.usage.get(&m).copied().unwrap_or_default();
+            let lines = billing::invoice(&self.pricing, &usage);
+            let t = billing::total(&lines);
+            billed += t;
+            if m == current {
+                this_month = t;
+            }
+            months.push(billing::invoice_json(&m, &lines, &usage));
+        }
+        let paid: i64 = c.payments.iter().map(|p| p.mills).sum();
+        let balance = billed - paid;
+        Json::obj(vec![
+            ("customer_id", Json::str(c.id.clone())),
+            ("name", Json::str(c.name.clone())),
+            ("pricing", self.pricing.to_json()),
+            ("months", Json::Array(months)),
+            ("billed_usd", billing::usd(billed)),
+            ("paid_usd", billing::usd(paid)),
+            ("balance_usd", billing::usd(balance)),
+            ("this_month_usd", billing::usd(this_month)),
+            // Owing more than the month still in progress means an earlier month is unpaid.
+            ("overdue", Json::Bool(balance > this_month)),
+        ])
     }
 
     // ---- settlement (the platform moves the money, this service records that it did) ------
@@ -705,10 +921,16 @@ impl Engine {
 
     /// A customer's summary for the admin page, including how many verdicts it has not yet
     /// confirmed paying out — the number that shows whether a platform is honoring verdicts.
-    pub fn customer_json(&self, c: &Customer) -> Json {
+    pub fn customer_json(&self, c: &Customer, now_ms: i64) -> Json {
         let mut j = c.to_json();
+        let st = self.statement_json(c, now_ms);
         if let Json::Object(m) = &mut j {
             m.insert("payouts_pending".into(), Json::num(self.pending_payouts(&c.id).len() as f64));
+            for k in ["balance_usd", "this_month_usd", "overdue"] {
+                if let Some(v) = st.get(k) {
+                    m.insert(k.into(), v.clone());
+                }
+            }
         }
         j
     }
@@ -1041,7 +1263,7 @@ impl Engine {
                 Some(arb) => self.open_arbitration(agreement_id, arb, now_ms),
                 None => self.open_jury(agreement_id, now_ms),
             }
-            self.bill_dispute(agreement_id);
+            self.bill_dispute(agreement_id, now_ms);
             return Ok(ReportResult::Disagreed);
         }
         // Past the deadline with only one answer in, that answer decides — reported now rather
@@ -1085,8 +1307,9 @@ impl Engine {
                 ),
             ]),
         );
+        self.record_relationship(agreement_id);
         let events = events_from_report(&result, reporter_id, &parties);
-        self.apply_score_events(events, domain, now_ms);
+        self.apply_score_events(events, agreement_id, domain, now_ms);
     }
 
     fn void(&mut self, agreement_id: &str, why: &'static str, now_ms: i64) {
@@ -1107,10 +1330,13 @@ impl Engine {
 
     /// Everyone eligible to be drawn: enough settled history to clear the Sybil bar, and not one
     /// of the two sides of this particular argument.
+    ///
+    /// Counts *distinct* partners, not deals: an account that settled a hundred times with one
+    /// sock puppet has not shown anything a juror needs.
     pub fn eligible_jurors(&self, exclude: &[String]) -> Vec<String> {
-        self.settled_count
+        self.counterparties
             .iter()
-            .filter(|(agent, count)| **count >= MIN_JUROR_SETTLED && !exclude.contains(agent))
+            .filter(|(agent, partners)| partners.len() >= MIN_JUROR_SETTLED && !exclude.contains(agent))
             .map(|(agent, _)| agent.clone())
             .collect()
     }
@@ -1305,8 +1531,9 @@ impl Engine {
                 );
                 let claims: Vec<(String, usize)> =
                     jury.claims.iter().map(|c| (c.agent_id.clone(), c.outcome)).collect();
+                self.record_relationship(agreement_id);
                 let events = events_from_verdict(&verdict, &claims);
-                self.apply_score_events(events, domain, now_ms);
+                self.apply_score_events(events, agreement_id, domain, now_ms);
             }
             Verdict::NoVerdict { why } => {
                 if let Some(a) = self.agreements.get_mut(agreement_id) {
@@ -1443,35 +1670,99 @@ impl Engine {
                 (c.agent_id.clone(), event)
             })
             .collect();
-        self.apply_score_events(events, domain, now_ms);
+        self.record_relationship(agreement_id);
+        self.apply_score_events(events, agreement_id, domain, now_ms);
         Ok(outcome)
     }
 
     // ---- reputation -----------------------------------------------------------------------
 
+    /// Notes who settled with whom, and through which platform — the inputs to the "distinct
+    /// partners" and "distinct platforms" counts.
+    fn record_relationship(&mut self, agreement_id: &str) {
+        let Some(a) = self.agreements.get(agreement_id) else { return };
+        let parties = a.parties.clone();
+        let platform = self.agreement_customer.get(agreement_id).cloned();
+        for p in &parties {
+            for q in &parties {
+                if p != q {
+                    self.counterparties.entry(p.clone()).or_default().insert(q.clone());
+                }
+            }
+            if let Some(pl) = &platform {
+                self.platforms.entry(p.clone()).or_default().insert(pl.clone());
+            }
+        }
+    }
+
+    fn pair_key(a: &str, b: &str) -> String {
+        if a < b {
+            format!("{a}\u{0}{b}")
+        } else {
+            format!("{b}\u{0}{a}")
+        }
+    }
+
+    fn platform_total(&self, agent: &str, platform: &str) -> i32 {
+        self.platform_credit
+            .get(agent)
+            .and_then(|m| m.get(platform))
+            .map(|d| d.values().sum())
+            .unwrap_or(0)
+    }
+
+    /// Scores one settled agreement's events, applying the anti-farming rules at the top of this
+    /// file to every gain. Each audit entry says how many points actually moved and, when fewer
+    /// than the event is worth, which rule limited it.
     fn apply_score_events(
         &mut self,
         events: Vec<(String, crate::trust::ScoreEvent)>,
+        agreement_id: &str,
         domain: Domain,
         now_ms: i64,
     ) {
+        let parties: Vec<String> = self.agreements.get(agreement_id).map(|a| a.parties.clone()).unwrap_or_default();
+        let platform = self.agreement_customer.get(agreement_id).cloned().unwrap_or_else(|| "none".to_string());
+        let pair = if parties.len() == 2 { Some(Self::pair_key(&parties[0], &parties[1])) } else { None };
+        let pair_cooling = pair
+            .as_ref()
+            .and_then(|k| self.pair_last_credit.get(k))
+            .map(|last| now_ms - last < PAIR_COOLDOWN_MS)
+            .unwrap_or(false);
+        let mut pair_earned = false;
+
         for (agent_id, event) in events {
             self.touch(&agent_id, now_ms);
             let subject = self.identity_of(&agent_id);
-            let att = Attestation {
-                source: "local".to_string(),
-                subject: subject.clone(),
-                event,
-                domain,
-                at_ms: now_ms,
-                signature: None,
+            let full = event.delta();
+            let is_party = parties.contains(&agent_id);
+            let (points, limited_by) = if full <= 0 {
+                (full, None)
+            } else if is_party && pair_cooling {
+                (0, Some("same_partner_within_24h"))
+            } else {
+                let room = (PLATFORM_CAP - self.platform_total(&agent_id, &platform)).max(0);
+                if room < full {
+                    (room, Some("platform_cap"))
+                } else {
+                    (full, None)
+                }
             };
-            self.network.ingest(&att);
-            let score = self
-                .network
-                .lookup(&subject)
-                .map(|s| s.in_domain(domain))
-                .unwrap_or(0);
+            if points > 0 {
+                *self
+                    .platform_credit
+                    .entry(agent_id.clone())
+                    .or_default()
+                    .entry(platform.clone())
+                    .or_default()
+                    .entry(domain)
+                    .or_insert(0) += points;
+                if is_party {
+                    pair_earned = true;
+                }
+            }
+            self.network.record_points(&subject, domain, event, points);
+            let score = self.network.lookup(&subject).map(|s| s.in_domain(domain)).unwrap_or(0);
             self.append(
                 now_ms,
                 "reputation_updated",
@@ -1481,9 +1772,16 @@ impl Engine {
                     ("source", Json::str("local")),
                     ("domain", Json::str(domain_label(domain))),
                     ("event", Json::str(format!("{event:?}"))),
+                    ("points", Json::num(points as f64)),
+                    ("limited_by", limited_by.map(Json::str).unwrap_or(Json::Null)),
                     ("score_now", Json::num(score as f64)),
                 ]),
             );
+        }
+        if pair_earned {
+            if let Some(k) = pair {
+                self.pair_last_credit.insert(k, now_ms);
+            }
         }
     }
 
@@ -1567,9 +1865,9 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
     ///
     /// The verdict is a convenience over the numbers, never a replacement for them — every
     /// rule behind it is in this function and every input is in the same response. It reads the
-    /// record (how many deals, how often silent, disputes lost) rather than score bands, because
-    /// the score climbs slowly on purpose (+2 per clean deal against -60 for going silent) and a
-    /// verdict pegged to it would call a bot with 100 flawless deals merely "fair".
+    /// record rather than score bands, and it counts *distinct* partners and *distinct*
+    /// platforms rather than deals, because deal counts are exactly what a bot trading with its
+    /// own sock puppets can inflate (see the anti-farming rules at the top of this file).
     pub fn trust_profile_json(&self, agent_id: &str, now_ms: i64) -> Json {
         let scores = self.network.lookup(&self.identity_of(agent_id));
         let score = scores.map(|s| s.overall()).unwrap_or(crate::trust::STARTING_SCORE);
@@ -1598,6 +1896,8 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
         let regs = self.registrations_of(agent_id);
         let verified: Vec<&Registration> = regs.iter().filter(|r| r.verified.is_some()).collect();
         let deals = clean + won + lost + ghosted;
+        let partners = self.counterparties.get(agent_id).map(|s| s.len()).unwrap_or(0);
+        let platforms = self.platforms.get(agent_id).map(|s| s.len()).unwrap_or(0);
         let first_seen = self.first_seen.get(agent_id).copied();
         let known = first_seen.is_some() || !regs.is_empty() || self.agent_secrets.contains_key(agent_id);
         let age_days = first_seen.map(|t| ((now_ms - t).max(0) / 86_400_000) as f64);
@@ -1620,14 +1920,26 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
                 reasons.push("score has fallen below where every new agent starts".into());
             }
             "caution"
-        } else if deals >= 50 && !verified.is_empty() && ghost_rate < 0.02 {
-            reasons.push(format!("{deals} agreements, went silent on {:.0}% of them, proven identity", ghost_rate * 100.0));
+        } else if partners >= 25 && platforms >= 3 && !verified.is_empty() && ghost_rate < 0.02 {
+            reasons.push(format!(
+                "{deals} agreements with {partners} different partners on {platforms} platforms, and a proven identity"
+            ));
             "excellent"
-        } else if deals >= 10 && ghost_rate < 0.05 {
-            reasons.push(format!("{deals} agreements with a clean record"));
+        } else if partners >= 10 && platforms >= 2 && ghost_rate < 0.05 {
+            reasons.push(format!("{deals} agreements with {partners} different partners on {platforms} platforms"));
             "good"
         } else {
-            reasons.push(format!("some history ({deals} agreements) but not yet a strong record"));
+            reasons.push(format!("{deals} agreements, but not yet a record that is hard to fake"));
+            if partners < 10 {
+                reasons.push(format!("only {partners} different partners (a good rating needs 10)"));
+            }
+            if platforms < 2 {
+                reasons.push(format!(
+                    "history comes from {} platform{} (a good rating needs 2 independent ones)",
+                    platforms,
+                    if platforms == 1 { "" } else { "s" }
+                ));
+            }
             "fair"
         };
         if known && verified.is_empty() {
@@ -1649,16 +1961,22 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
                 "history",
                 Json::obj(vec![
                     ("agreements", Json::num(deals as f64)),
+                    ("distinct_partners", Json::num(partners as f64)),
+                    ("platforms", Json::num(platforms as f64)),
                     ("clean_settlements", Json::num(clean as f64)),
                     ("disputes_won", Json::num(won as f64)),
                     ("disputes_lost", Json::num(lost as f64)),
                     ("times_ghosted", Json::num(ghosted as f64)),
                     ("jury_majorities", Json::num(majorities as f64)),
-                    (
-                        "jury_eligible",
-                        Json::Bool(*self.settled_count.get(agent_id).unwrap_or(&0) >= MIN_JUROR_SETTLED),
-                    ),
+                    ("jury_eligible", Json::Bool(partners >= MIN_JUROR_SETTLED)),
                 ]),
+            ),
+            (
+                "how_points_are_limited",
+                Json::str(
+                    "the same two bots earn points from each other at most once a day, and one \
+                     platform can give a bot at most 150 points; losses always count in full",
+                ),
             ),
             ("by_domain", Json::Array(by_domain)),
             ("first_seen_ms", first_seen.map(|t| Json::num(t as f64)).unwrap_or(Json::Null)),
@@ -1707,6 +2025,88 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
     // implementation isn't taking on. A snapshot of the actual state, written after every
     // request that changed anything, is the honest version of "a restart doesn't lose history"
     // that this codebase can back up today.
+
+    fn integrity_snapshot(&self) -> Json {
+        let sets = |m: &HashMap<String, HashSet<String>>| {
+            Json::Array(
+                m.iter()
+                    .map(|(agent, ids)| {
+                        Json::obj(vec![
+                            ("agent_id", Json::str(agent.clone())),
+                            ("ids", Json::Array(ids.iter().map(|i| Json::str(i.clone())).collect())),
+                        ])
+                    })
+                    .collect(),
+            )
+        };
+        let mut credit = Vec::new();
+        for (agent, by_platform) in &self.platform_credit {
+            for (platform, by_domain) in by_platform {
+                for (domain, points) in by_domain {
+                    credit.push(Json::obj(vec![
+                        ("agent_id", Json::str(agent.clone())),
+                        ("platform", Json::str(platform.clone())),
+                        ("domain", Json::str(domain_label(*domain))),
+                        ("points", Json::num(*points as f64)),
+                    ]));
+                }
+            }
+        }
+        Json::obj(vec![
+            (
+                "pair_last_credit",
+                Json::Array(
+                    self.pair_last_credit
+                        .iter()
+                        .map(|(k, at)| Json::obj(vec![("pair", Json::str(k.clone())), ("at_ms", Json::num(*at as f64))]))
+                        .collect(),
+                ),
+            ),
+            ("platform_credit", Json::Array(credit)),
+            ("counterparties", sets(&self.counterparties)),
+            ("platforms", sets(&self.platforms)),
+        ])
+    }
+
+    fn load_integrity(&mut self, j: &Json) {
+        if let Some(Json::Array(items)) = j.get("pair_last_credit") {
+            for i in items {
+                if let (Some(k), Some(at)) = (i.get("pair").and_then(|v| v.as_str()), i.get("at_ms").and_then(|v| v.as_f())) {
+                    self.pair_last_credit.insert(k.to_string(), at as i64);
+                }
+            }
+        }
+        if let Some(Json::Array(items)) = j.get("platform_credit") {
+            for i in items {
+                let (Some(a), Some(p), Some(d), Some(pts)) = (
+                    i.get("agent_id").and_then(|v| v.as_str()),
+                    i.get("platform").and_then(|v| v.as_str()),
+                    i.get("domain").and_then(|v| v.as_str()),
+                    i.get("points").and_then(|v| v.as_f()),
+                ) else {
+                    continue;
+                };
+                self.platform_credit
+                    .entry(a.to_string())
+                    .or_default()
+                    .entry(p.to_string())
+                    .or_default()
+                    .insert(domain_from(d), pts as i32);
+            }
+        }
+        for (key, target) in [("counterparties", &mut self.counterparties), ("platforms", &mut self.platforms)] {
+            if let Some(Json::Array(items)) = j.get(key) {
+                for i in items {
+                    let Some(a) = i.get("agent_id").and_then(|v| v.as_str()) else { continue };
+                    let ids: HashSet<String> = match i.get("ids") {
+                        Some(Json::Array(ids)) => ids.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
+                        _ => HashSet::new(),
+                    };
+                    target.insert(a.to_string(), ids);
+                }
+            }
+        }
+    }
 
     pub fn to_snapshot(&self) -> Json {
         Json::obj(vec![
@@ -1807,6 +2207,7 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
                         .collect(),
                 ),
             ),
+            ("integrity", self.integrity_snapshot()),
             (
                 "agent_secrets",
                 Json::Array(
@@ -1955,6 +2356,9 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
                 }
                 engine.registrations.entry(agent).or_default().push(reg);
             }
+        }
+        if let Some(integrity) = j.get("integrity") {
+            engine.load_integrity(integrity);
         }
         if let Some(Json::Array(items)) = j.get("first_seen") {
             for item in items {
@@ -2304,7 +2708,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        e.tag_agreement(&id, &cus);
+        e.tag_agreement(&id, &cus, 0);
         e.report(&id, "alice", 0, None, 1).unwrap();
         e.report(&id, "bob", 1, None, 2).unwrap();
 
@@ -2312,7 +2716,7 @@ mod tests {
         let clean = e
             .create_agreement(vec!["x".into(), "y".into()], 2, 10.0, "USDC".into(), Domain::Other, None, 0)
             .unwrap();
-        e.tag_agreement(&clean, &cus);
+        e.tag_agreement(&clean, &cus, 0);
         e.report(&clean, "x", 1, None, 1).unwrap();
         e.report(&clean, "y", 1, None, 2).unwrap();
 
@@ -2335,7 +2739,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        e.tag_agreement(&id, cus);
+        e.tag_agreement(&id, &cus, 0);
         id
     }
 
@@ -2392,13 +2796,13 @@ mod tests {
         let id = e
             .create_agreement(vec!["alice".into(), "bob".into()], 2, 500.0, "USDC".into(), Domain::Commerce, None, 10)
             .unwrap();
-        e.tag_agreement(&id, &cus);
+        e.tag_agreement(&id, &cus, 0);
         e.report(&id, "alice", 0, Some("receipt".into()), 11).unwrap();
         e.report(&id, "bob", 1, None, 12).unwrap();
         let paid = e
             .create_agreement(vec!["x".into(), "y".into()], 2, 5.0, "USDC".into(), Domain::Other, None, 13)
             .unwrap();
-        e.tag_agreement(&paid, &cus);
+        e.tag_agreement(&paid, &cus, 0);
         e.report(&paid, "x", 0, None, 14).unwrap();
         e.report(&paid, "y", 0, None, 15).unwrap();
         e.confirm_payout(&paid, &cus, "0xpaid", 16).unwrap();
@@ -2557,24 +2961,151 @@ mod tests {
         assert!(regs[0].verified.is_none(), "a legacy binding was only ever claimed");
     }
 
+    /// One clean deal between `a` and `b`, opened through platform `cus` (if any), at `now`.
+    fn deal(e: &mut Engine, a: &str, b: &str, cus: Option<&str>, now: i64) {
+        let id = e
+            .create_agreement(vec![a.into(), b.into()], 2, 10.0, "USDC".into(), Domain::Commerce, None, now)
+            .unwrap();
+        if let Some(c) = cus {
+            e.tag_agreement(&id, c, now);
+        }
+        e.report(&id, a, 0, None, now).unwrap();
+        e.report(&id, b, 0, None, now).unwrap();
+    }
+
+    fn level(e: &Engine, agent: &str) -> String {
+        e.trust_profile_json(agent, 0).get("trust_level").unwrap().as_str().unwrap().to_string()
+    }
+
+    const DAY: i64 = PAIR_COOLDOWN_MS;
+
     #[test]
     fn the_trust_level_follows_the_published_rules() {
         let mut e = Engine::new();
-        assert_eq!(e.trust_profile_json("nobody", 0).get("trust_level").unwrap().as_str(), Some("unknown"));
+        assert_eq!(level(&e, "nobody"), "unknown");
         assert_eq!(e.trust_profile_json("nobody", 0).get("known"), Some(&Json::Bool(false)));
-        season(&mut e, "steady", 6, 0);
-        let p = e.trust_profile_json("steady", 0);
-        assert_eq!(p.get("known"), Some(&Json::Bool(true)));
-        assert_eq!(p.get("history").unwrap().get("agreements").unwrap().as_f(), Some(6.0));
-        assert_eq!(p.get("trust_level").unwrap().as_str(), Some("fair"));
-        let reasons = format!("{:?}", p.get("reasons"));
+        let p1 = e.create_customer("one", "k1", 0);
+        let p2 = e.create_customer("two", "k2", 0);
+        let p3 = e.create_customer("three", "k3", 0);
+        for i in 0..12 {
+            deal(&mut e, "steady", &format!("p{i}"), Some(&p1), 0);
+        }
+        // Twelve partners, but all on one platform: capped at fair, and it says why.
+        assert_eq!(level(&e, "steady"), "fair");
+        let reasons = format!("{:?}", e.trust_profile_json("steady", 0).get("reasons"));
+        assert!(reasons.contains("1 platform"), "{reasons}");
         assert!(reasons.contains("no proven outside identity"));
-        season(&mut e, "steady", 6, 0);
-        assert_eq!(e.trust_profile_json("steady", 0).get("trust_level").unwrap().as_str(), Some("good"));
-        // Fifty clean deals is still only "good" until the bot proves an outside identity.
-        season(&mut e, "steady", 40, 0);
-        assert_eq!(e.trust_profile_json("steady", 0).get("trust_level").unwrap().as_str(), Some("good"));
+        deal(&mut e, "steady", "q0", Some(&p2), 0);
+        assert_eq!(level(&e, "steady"), "good");
+        for i in 0..13 {
+            deal(&mut e, "steady", &format!("r{i}"), Some(&p3), 0);
+        }
+        // 26 partners on 3 platforms is still only good until an outside identity is proven.
+        assert_eq!(level(&e, "steady"), "good");
         e.record_verified("steady", "eth", "0xabc", "sig", 1, 1).unwrap();
-        assert_eq!(e.trust_profile_json("steady", 0).get("trust_level").unwrap().as_str(), Some("excellent"));
+        assert_eq!(level(&e, "steady"), "excellent");
+    }
+
+    #[test]
+    fn a_hundred_deals_with_one_sock_puppet_earn_one_deals_points() {
+        let mut e = Engine::new();
+        let cus = e.create_customer("farm", "k", 0);
+        for _ in 0..100 {
+            deal(&mut e, "farmer", "puppet", Some(&cus), 5);
+        }
+        let start = crate::trust::STARTING_SCORE as f64;
+        assert_eq!(score(&e, "farmer"), start + 2.0);
+        let p = e.trust_profile_json("farmer", 0);
+        let h = p.get("history").unwrap();
+        assert_eq!(h.get("agreements").unwrap().as_f(), Some(100.0), "the deals still show in the history");
+        assert_eq!(h.get("distinct_partners").unwrap().as_f(), Some(1.0));
+        assert_eq!(h.get("jury_eligible"), Some(&Json::Bool(false)));
+        assert_eq!(level(&e, "farmer"), "fair");
+        // A day later the pair can earn again — once.
+        deal(&mut e, "farmer", "puppet", Some(&cus), 5 + DAY);
+        deal(&mut e, "farmer", "puppet", Some(&cus), 5 + DAY);
+        assert_eq!(score(&e, "farmer"), start + 4.0);
+    }
+
+    #[test]
+    fn one_platform_can_only_lift_a_bot_so_far_but_losses_always_count() {
+        let mut e = Engine::new();
+        let cus = e.create_customer("farm", "k", 0);
+        for i in 0..200 {
+            deal(&mut e, "star", &format!("puppet{i}"), Some(&cus), 0);
+        }
+        let start = crate::trust::STARTING_SCORE as f64;
+        assert_eq!(score(&e, "star"), start + PLATFORM_CAP as f64);
+        // Now it ghosts someone on the same platform: the loss is not capped.
+        let id = e
+            .create_agreement(vec!["victim".into(), "star".into()], 2, 10.0, "USDC".into(), Domain::Commerce, None, 0)
+            .unwrap();
+        e.tag_agreement(&id, &cus, 0);
+        e.report(&id, "victim", 0, None, 10).unwrap();
+        e.sweep(REPORT_WINDOW_MS + 11);
+        assert_eq!(score(&e, "star"), start + PLATFORM_CAP as f64 - 60.0);
+        // A second, independent platform can still add more.
+        let other = e.create_customer("other", "k2", 0);
+        deal(&mut e, "star", "stranger", Some(&other), 0);
+        assert_eq!(score(&e, "star"), start + PLATFORM_CAP as f64 - 60.0 + 2.0);
+    }
+
+    #[test]
+    fn purging_a_farming_platform_takes_its_points_back() {
+        let mut e = Engine::new();
+        let bad = e.create_customer("farm", "k", 0);
+        let good = e.create_customer("honest", "k2", 0);
+        for i in 0..20 {
+            deal(&mut e, "bot", &format!("puppet{i}"), Some(&bad), 0);
+        }
+        deal(&mut e, "bot", "real_partner", Some(&good), 0);
+        let start = crate::trust::STARTING_SCORE as f64;
+        assert_eq!(score(&e, "bot"), start + 42.0);
+        assert_eq!(e.purge_platform(&bad, 1).unwrap(), 21, "the bot and its 20 puppets");
+        assert_eq!(score(&e, "bot"), start + 2.0);
+        assert_eq!(e.trust_profile_json("bot", 0).get("history").unwrap().get("platforms").unwrap().as_f(), Some(1.0));
+        assert!(e.customer_for_key("k").is_none());
+        assert!(e.customer(&bad).unwrap().purged);
+        // Survives a restart.
+        let restored = Engine::from_snapshot(&e.to_snapshot()).unwrap();
+        assert_eq!(score(&restored, "bot"), start + 2.0);
+    }
+
+    #[test]
+    fn jurors_need_distinct_partners_not_just_many_deals() {
+        let mut e = Engine::new();
+        for _ in 0..10 {
+            deal(&mut e, "grinder", "puppet", None, 0);
+        }
+        season(&mut e, "citizen", 3, 0);
+        let pool = e.eligible_jurors(&[]);
+        assert!(pool.contains(&"citizen".to_string()));
+        assert!(!pool.contains(&"grinder".to_string()));
+    }
+
+    #[test]
+    fn the_monthly_bill_is_plan_plus_metered_overage_minus_payments() {
+        let mut e = Engine::new();
+        let aug = 1_785_542_400_000; // 2026-08-01
+        let sep = aug + 31 * DAY;
+        let cus = e.create_customer("arena", "k", aug);
+        for i in 0..3 {
+            e.meter_lookup(&cus, aug + i);
+        }
+        let st = e.statement_json(e.customer(&cus).unwrap(), sep + 5);
+        assert_eq!(st.get("billed_usd").unwrap().as_f(), Some(58.0), "two months of the plan");
+        assert_eq!(st.get("this_month_usd").unwrap().as_f(), Some(29.0));
+        assert_eq!(st.get("overdue"), Some(&Json::Bool(true)), "August is unpaid");
+        e.record_payment(&cus, 29_000, "pi_123", sep + 6).unwrap();
+        let st = e.statement_json(e.customer(&cus).unwrap(), sep + 7);
+        assert_eq!(st.get("balance_usd").unwrap().as_f(), Some(29.0));
+        assert_eq!(st.get("overdue"), Some(&Json::Bool(false)));
+        // Billing stops the month the key is revoked, and all of it survives a restart.
+        e.revoke_customer(&cus, sep + 8).unwrap();
+        let restored = Engine::from_snapshot(&e.to_snapshot()).unwrap();
+        let st = restored.statement_json(restored.customer(&cus).unwrap(), sep + 100 * DAY);
+        assert_eq!(st.get("billed_usd").unwrap().as_f(), Some(58.0));
+        assert_eq!(st.get("paid_usd").unwrap().as_f(), Some(29.0));
+        assert!(e.record_payment(&cus, 0, "x", 1).is_err());
     }
 }

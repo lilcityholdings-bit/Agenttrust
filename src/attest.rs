@@ -336,6 +336,29 @@ impl TrustNetwork {
         entry.record(att, standing);
     }
 
+    /// Records that `event` happened and moves the score by exactly `points`, which the caller
+    /// has already limited (see store.rs's anti-farming rules). The event is always counted in
+    /// the history even when `points` is zero — the deal happened, it just earned nothing.
+    pub fn record_points(&mut self, identity: &IdentityBinding, domain: Domain, event: ScoreEvent, points: i32) {
+        let entry = self
+            .agents
+            .entry(identity.key())
+            .or_insert_with(|| DomainScores::new(identity.clone()));
+        let key = entry.identity.key();
+        let rep = entry.by_domain.entry(domain).or_insert_with(|| Reputation::fresh(key));
+        let before = rep.score;
+        rep.record(event);
+        rep.score = (before + points).clamp(MIN_SCORE, MAX_SCORE);
+    }
+
+    /// Moves a score without recording an event — used only to take back points a platform
+    /// handed out before it was caught farming.
+    pub fn adjust(&mut self, identity: &IdentityBinding, domain: Domain, delta: i32) {
+        if let Some(rep) = self.agents.get_mut(&identity.key()).and_then(|a| a.by_domain.get_mut(&domain)) {
+            rep.score = (rep.score + delta).clamp(MIN_SCORE, MAX_SCORE);
+        }
+    }
+
     /// Moves whatever history sits under `from` onto `to`, if `to` has none of its own. Used
     /// once, to migrate old snapshots that filed scores under a claimed identity.
     pub fn rekey(&mut self, from: &IdentityBinding, to: &IdentityBinding) {

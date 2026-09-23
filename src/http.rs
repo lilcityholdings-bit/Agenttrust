@@ -158,7 +158,24 @@ fn parse_request(stream: &mut TcpStream) -> Option<Request> {
         query.insert(decode(k), decode(v));
     }
 
+    // The socket's peer address, under a header name no client can set: anything a client sent
+    // as `x-peer-addr` is overwritten here.
+    if let Ok(peer) = stream.peer_addr() {
+        headers.insert(PEER_HEADER.to_string(), peer.ip().to_string());
+    }
+
     Some(Request { method, path: decode(&path), query, headers, body })
+}
+
+const PEER_HEADER: &str = "x-peer-addr";
+
+impl Request {
+    /// Who is calling, for per-caller rate limits. Behind Railway's edge every connection comes
+    /// from the proxy, which puts the real client address in `X-Real-IP`; run without a proxy,
+    /// the socket's own peer address is used.
+    pub fn client_ip(&self) -> &str {
+        self.header("x-real-ip").or_else(|| self.header(PEER_HEADER)).unwrap_or("unknown")
+    }
 }
 
 const CORS: &str = "Access-Control-Allow-Origin: *\r\n\

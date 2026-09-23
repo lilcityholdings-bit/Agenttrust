@@ -22,7 +22,7 @@ checks before signing is a courthouse in a field.
 | `trust.html` | The public trust-check page at `/trust`, compiled into the binary. |
 | `json.rs`, `http.rs`, `hash.rs` | Hand-rolled JSON, HTTP/1.1, SHA-256/224 and a seeded PRNG. |
 
-81 unit tests. `cargo test` runs them.
+90 unit tests. `cargo test` runs them.
 
 ## The trust score
 
@@ -46,9 +46,30 @@ the reasons:
 |---|---|
 | unknown | no agreements yet |
 | caution | went silent on ≥10% of deals, lost most of ≥3 disputes, or fell below 100 |
-| good | ≥10 deals, went silent on <5% |
-| excellent | ≥50 deals, went silent on <2%, and at least one proven identity |
+| good | ≥10 different partners on ≥2 platforms, went silent on <5% |
+| excellent | ≥25 different partners on ≥3 platforms, went silent on <2%, and at least one proven identity |
 | fair | everything else |
+
+### Stopping bots from gaming it
+
+Faking a record by trading with yourself is the obvious attack: run two bots and have them
+"settle" deal after deal. These rules make that stop paying. They limit *gains* only. Losses and
+going silent always count in full.
+
+1. **The same two bots earn points from each other at most once a day.** A hundred fake deals
+   with one sock puppet earn the points of one. The deals still show in the history, so the
+   pattern is visible.
+2. **One platform can give a bot at most 150 points.** To score higher, a bot has to be trusted
+   on other platforms too.
+3. **The verdicts count different partners and different platforms, not deals.** A ring of sock
+   puppets all run through one platform can't get past "fair".
+4. **Jurors need 3 different partners**, not just 3 deals.
+5. **A platform caught farming can be purged.** That revokes its key and takes back every point
+   it ever gave any bot. It is one button on `/admin`.
+6. **The free tier is rate-limited per IP**: 120 lookups and 30 identity registrations an hour.
+
+This works because sock-puppet bots are free but platforms are not. Each platform is an API key
+you issue by hand, and it costs a monthly fee.
 
 **Identities: claimed vs verified.** A bot can *list* any identity it likes, and it shows as
 "claimed". It shows as "verified" only after the bot signs a challenge with that identity's key
@@ -106,18 +127,40 @@ Set `ADMIN_SECRET` yourself before you need a stable one across restarts.
 
 ## API keys and billing
 
-**Every endpoint except `/health`, `/admin` and the public audit feed needs a customer API key**,
-sent as `Authorization: Bearer <key>` or `X-Api-Key: <key>`. A key identifies a *paying
-customer* — a platform or developer — and covers every agent that customer runs.
+**Who pays: platforms.** A platform is a marketplace, game, or app that runs deals between bots.
+It gets an API key from you and pays a monthly plan. Anyone can look up trust scores for free,
+up to a per-IP limit. That keeps the score useful to everyone, and it drives platforms to sign
+up.
 
-- **Issue keys** at `https://<your-domain>/admin` with your `ADMIN_SECRET`. The key is shown once;
-  only its SHA-256 is stored. Revoke it from the same page when a customer stops paying.
-- **Usage is counted per customer**: agreements created, and disputes escalated to a jury or
-  arbiter (the billable unit — a clean settlement is not a dispute). The admin page shows it; a
-  customer can check their own at `GET /v1/usage`.
-- **Payment happens in Stripe, not here.** This service never touches money. The flow is: a
-  customer pays through your Stripe link → you create their key on `/admin` → you send it to
-  them. If they stop paying, revoke the key.
+| | Default price | Change it with |
+|---|---|---|
+| Platform plan | $29 / month, includes 500 agreements and 10,000 lookups | `PRICE_MONTHLY_USD`, `INCLUDED_AGREEMENTS`, `INCLUDED_LOOKUPS` |
+| Extra agreements | $0.02 each | `PRICE_AGREEMENT_USD` |
+| Escalated dispute (jury or arbiter) | $0.50 each | `PRICE_DISPUTE_USD` |
+| Extra keyed lookups | $0.001 each | `PRICE_LOOKUP_USD` |
+| Public lookups with no key | free, 120 an hour per IP | — |
+
+The monthly fee also blocks cheating. Getting past "fair" needs history from several
+independent platforms, so faking that means paying for several platforms, every month.
+
+**There is no pay-to-win.** Nothing a platform or bot pays changes a score or a verdict. A trust
+score you could buy would be worthless to everyone reading it.
+
+**How money comes in (for now, by hand):**
+
+1. The platform pays you with a Stripe payment link or a USDC transfer.
+2. You create its key on `/admin` and send the key to it.
+3. At the end of each month, `/admin` shows each platform's bill and balance. Collect the
+   money, then tap **Record payment** and paste the Stripe payment id or transaction hash.
+4. "Overdue" means an earlier month is still unpaid. Revoke the key if they don't pay.
+
+A platform can see its own bill at `GET /v1/usage`, and you can see any platform's month-by-month
+statement at `GET /v1/customers/{id}/statement`. Bills are always recomputed from metered usage,
+and every payment you record goes into the public audit chain. Automating collection (x402 or a
+Stripe webhook) is the next step.
+
+**Keys:** send them as `Authorization: Bearer <key>` or `X-Api-Key: <key>`. Only a key's SHA-256
+is stored, and it's shown once when created.
 
 `/v1/audit` and `/v1/audit/verify` stay public on purpose: anyone being able to check the record
 without paying is the whole point of it.
@@ -215,6 +258,8 @@ Every request above except the public ones also needs `Authorization: Bearer <ap
 | `STATE_FILE` | `data/state.json` | Where state is saved. Point it at a mounted volume (e.g. `/data/state.json`). |
 | `REQUIRE_API_KEY` | `1` | `0` lets anyone use the API with no key — local development only. |
 | `ALLOW_CLOCK_OVERRIDE` | `0` | `1` honors a `now_ms` in requests, to test deadlines without waiting. **Never in production**: it lets one side report with a future clock and win by default before the other side's window has passed. |
+| `PRICE_MONTHLY_USD` … `PRICE_LOOKUP_USD` | see "API keys and billing" | The price list. Takes effect on restart; bills are recomputed with the new prices. |
+| `RPC_URL_<chainId>` | public nodes | Your own RPC endpoint for ERC-8004 checks on that chain. |
 
 ## Why there's a second dispute path: arbitration
 
@@ -309,9 +354,13 @@ Said plainly, because a service that overstates itself is worse than one that do
   any event. It does not defend against a compromised secret, a man-in-the-middle on a connection
   that isn't actually HTTPS, or a host that logs request bodies. Real request signing (Web Bot
   Auth-style) is the next step up, not implemented here.
-- **Trust lookups have no rate limit** other than a global cap of 120 outbound proof checks a
-  minute (chain RPC and domain fetches). They are free on purpose for now; they are the natural
-  thing to meter with x402 later.
+- **Payment collection is manual.** The service computes bills; you collect the money and
+  record it. x402 or a Stripe webhook would automate this.
+- **Rate limits live in memory** and reset when the server restarts. Behind Railway, the caller's
+  IP comes from the `X-Real-IP` header Railway sets.
+- **A big enough sock-puppet ring could still crowd the jury pool.** Jurors need 3 different
+  partners, and puppets can deal with each other to get there. Until the network is large,
+  prefer the named-arbiter path for high-stakes agreements.
 - **An ERC-8004 verification reflects the chain at the moment of proof.** If the NFT is sold
   later, the profile still shows the old owner's proof until someone proves again. Rechecking
   on a schedule is a later step.

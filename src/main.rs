@@ -15,6 +15,7 @@
 //! ```
 
 mod attest;
+mod billing;
 mod hash;
 mod http;
 mod json;
@@ -180,8 +181,76 @@ fn is_public(method: &str, segments: &[&str]) -> bool {
             | ("GET", ["trust", ..])
             | ("GET", ["v1", "trust", ..])
             | ("GET", ["v1", "registrations", "challenge"])
+            | ("GET", ["v1", "pricing"])
             | ("POST", ["v1", "agents", _, "registrations"])
             | ("POST", ["v1", "agents", _, "identity"])
+    )
+}
+
+/// Free-tier ceilings, per caller IP per hour. A caller with an API key skips these and is
+/// metered instead (billing.rs).
+const FREE_LOOKUPS_PER_HOUR: u32 = 120;
+const FREE_WRITES_PER_HOUR: u32 = 30;
+
+/// A fixed-window counter per (bucket, IP). In memory on purpose: it resets on restart, which is
+/// fine for a limit whose only job is to stop one caller from hogging the free tier.
+fn rate_ok(bucket: &str, ip: &str, limit: u32, now: i64) -> bool {
+    use std::collections::HashMap;
+    static WINDOWS: Mutex<Option<HashMap<String, (i64, u32)>>> = Mutex::new(None);
+    const HOUR: i64 = 60 * 60 * 1000;
+    let mut guard = WINDOWS.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.len() > 50_000 {
+        map.retain(|_, (start, _)| now - *start < HOUR);
+    }
+    let w = map.entry(format!("{bucket}|{ip}")).or_insert((now, 0));
+    if now - w.0 >= HOUR {
+        *w = (now, 0);
+    }
+    w.1 += 1;
+    w.1 <= limit
+}
+
+/// Trust reads and identity writes are free, but not unlimited. With a valid key the call is
+/// metered to that customer; with no key it counts against the caller's IP; with a bad key it
+/// fails loudly rather than silently falling back to the free tier.
+fn free_tier_gate(engine: &mut Engine, req: &Request, write: bool, now: i64) -> Result<(), Response> {
+    match req.api_key() {
+        Some(k) => match engine.customer_for_key(k).map(|c| c.id.clone()) {
+            Some(id) => {
+                if !write {
+                    engine.meter_lookup(&id, now);
+                }
+                Ok(())
+            }
+            None => Err(err(401, "that API key isn't valid — send no key to use the free tier")),
+        },
+        None => {
+            let (bucket, limit) = if write { ("write", FREE_WRITES_PER_HOUR) } else { ("lookup", FREE_LOOKUPS_PER_HOUR) };
+            if rate_ok(bucket, req.client_ip(), limit, now) {
+                Ok(())
+            } else {
+                Err(err(
+                    429,
+                    &format!(
+                        "free tier limit reached ({limit} an hour) — wait, or use an API key for unlimited, metered access"
+                    ),
+                ))
+            }
+        }
+    }
+}
+
+fn is_lookup(method: &str, segments: &[&str]) -> bool {
+    matches!((method, segments), ("GET", ["v1", "trust", ..]) | ("GET", ["v1", "registrations", "challenge"]))
+}
+
+fn is_public_write(method: &str, segments: &[&str]) -> bool {
+    matches!(
+        (method, segments),
+        ("POST", ["v1", "agents", _, "registrations"])
+            | ("POST", ["v1", "agents", _, "identity"])
+            | ("POST", ["v1", "agents", _, "registrations", "verify"])
     )
 }
 
@@ -301,6 +370,12 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         Err(r) => return r,
     };
     let now = clock(&req, &body, cfg);
+    if is_lookup(&req.method, &segments) || is_public_write(&req.method, &segments) {
+        let write = is_public_write(&req.method, &segments);
+        if let Err(r) = free_tier_gate(&mut engine.lock().unwrap(), &req, write, now) {
+            return r;
+        }
+    }
     if let ("POST", ["v1", "agents", agent_id, "registrations", "verify"]) = (req.method.as_str(), segments.as_slice()) {
         return verify_registration(engine, agent_id, &body, now);
     }
@@ -407,12 +482,26 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             if let Err(e) = engine.check_admin(admin_secret_of(&req, &body)) {
                 return err(401, e);
             }
-            ok(Json::Array(engine.customers().iter().map(|c| engine.customer_json(c)).collect()))
+            ok(Json::Array(engine.customers().iter().map(|c| engine.customer_json(c, now)).collect()))
         }
 
+        // `{"purge": true}` is for a platform caught farming scores: it also takes back every
+        // point that platform ever gave any bot. A plain revoke (stopped paying, leaked key)
+        // leaves the history it produced alone.
         ("POST", ["v1", "customers", id, "revoke"]) => {
             if let Err(e) = engine.check_admin(admin_secret_of(&req, &body)) {
                 return err(401, e);
+            }
+            if matches!(body.get("purge"), Some(Json::Bool(true))) {
+                return match engine.purge_platform(id, now) {
+                    Ok(n) => ok(Json::obj(vec![
+                        ("customer_id", Json::str(*id)),
+                        ("active", Json::Bool(false)),
+                        ("purged", Json::Bool(true)),
+                        ("bots_adjusted", Json::num(n as f64)),
+                    ])),
+                    Err(e) => err(404, e),
+                };
             }
             match engine.revoke_customer(id, now) {
                 Ok(()) => ok(Json::obj(vec![("customer_id", Json::str(*id)), ("active", Json::Bool(false))])),
@@ -420,15 +509,53 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             }
         }
 
-        // ---- a customer's own usage -----------------------------------------------------
+        ("POST", ["v1", "customers", id, "payments"]) => {
+            if let Err(e) = engine.check_admin(admin_secret_of(&req, &body)) {
+                return err(401, e);
+            }
+            let Some(amount) = body.get("amount_usd").and_then(|v| v.as_f()).filter(|a| a.is_finite() && *a > 0.0) else {
+                return err(400, "amount_usd is required and must be positive");
+            };
+            let reference = body.get("reference").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if reference.is_empty() {
+                return err(400, "reference is required — the Stripe payment id or USDC transaction hash");
+            }
+            let mills = (amount * 1000.0).round() as i64;
+            if let Err(e) = engine.record_payment(id, mills, reference, now) {
+                return err(404, e);
+            }
+            let c = engine.customer(id).unwrap();
+            ok(engine.statement_json(c, now))
+        }
+
+        ("GET", ["v1", "customers", id, "statement"]) => {
+            if let Err(e) = engine.check_admin(admin_secret_of(&req, &body)) {
+                return err(401, e);
+            }
+            match engine.customer(id) {
+                Some(c) => ok(engine.statement_json(c, now)),
+                None => err(404, "no such customer"),
+            }
+        }
+
+        ("GET", ["v1", "pricing"]) => ok(engine.pricing.to_json()),
+
+        // ---- a customer's own usage and bill ------------------------------------------------
         ("GET", ["v1", "usage"]) => match customer_id.as_deref().and_then(|id| engine.customer(id)) {
-            Some(c) => ok(engine.customer_json(c)),
+            Some(c) => {
+                let mut j = engine.customer_json(c, now);
+                if let Json::Object(m) = &mut j {
+                    m.insert("statement".into(), engine.statement_json(c, now));
+                }
+                ok(j)
+            }
             None => err(401, "usage is per customer — call this with your API key"),
         },
         ("GET", ["health"]) | ("GET", []) => ok(Json::obj(vec![
             ("service", Json::str("agenttrust")),
             ("status", Json::str("ok")),
             ("api_key_required", Json::Bool(cfg.require_api_key)),
+            ("pricing", engine.pricing.to_json()),
             ("audit_head", Json::str(engine.audit_head())),
             ("operator_revenue", Json::num(engine.operator_revenue)),
             (
@@ -452,6 +579,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                         "GET  /v1/registrations/challenge?agent_id=&protocol=&id=",
                         "POST /v1/agents/{agent_id}/registrations/verify",
                         "GET  /trust/{agent_id}               (profile page for people)",
+                        "GET  /v1/pricing",
                         "GET  /v1/trusted?domain=commerce&floor=400",
                         "POST /v1/sources",
                         "POST /v1/attestations",
@@ -492,7 +620,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             match engine.create_agreement(parties, outcomes, stake, asset, domain, arbiter, now) {
                 Ok(id) => {
                     if let Some(cid) = &customer_id {
-                        engine.tag_agreement(&id, cid);
+                        engine.tag_agreement(&id, cid, now);
                     }
                     Response::json(
                         201,
@@ -918,7 +1046,8 @@ fn main() -> std::io::Result<()> {
         }
     };
 
-    let engine = load_or_new(&path, &admin_secret);
+    let mut engine = load_or_new(&path, &admin_secret);
+    engine.pricing = billing::Pricing::from_env();
     let engine: &'static Mutex<Engine> = Box::leak(Box::new(Mutex::new(engine)));
     let path: &'static std::path::Path = Box::leak(path.into_boxed_path());
 
@@ -1144,5 +1273,59 @@ mod settlement_tests {
         let e = Mutex::new(Engine::new());
         let b = route(&e, req("GET", "/v1/trust/%3Cscript%3E/badge.svg", "", ""), PROD);
         assert!(!b.body.contains("script"));
+    }
+
+    #[test]
+    fn the_free_tier_is_limited_per_ip_and_a_key_is_metered_instead() {
+        let e = Mutex::new(Engine::with_admin_secret("adm"));
+        let from = |ip: &str, key: &str| {
+            let mut r = req("GET", "/v1/trust/somebot", key, "");
+            r.headers.insert("x-real-ip".into(), ip.into());
+            r
+        };
+        for _ in 0..FREE_LOOKUPS_PER_HOUR {
+            assert_eq!(route(&e, from("203.0.113.9", ""), PROD).status, 200);
+        }
+        let r = route(&e, from("203.0.113.9", ""), PROD);
+        assert_eq!(r.status, 429, "{}", r.body);
+        // A different caller is unaffected.
+        assert_eq!(route(&e, from("203.0.113.10", ""), PROD).status, 200);
+        // A made-up key is refused rather than quietly treated as free.
+        assert_eq!(route(&e, from("203.0.113.9", "at_live_nope"), PROD).status, 401);
+        // A real key skips the limit and is metered to that customer.
+        let key = "at_live_real";
+        let cus = e.lock().unwrap().create_customer("arena", key, 0);
+        for _ in 0..3 {
+            assert_eq!(route(&e, from("203.0.113.9", key), PROD).status, 200);
+        }
+        let now = now_ms();
+        let engine = e.lock().unwrap();
+        let used = engine.customer(&cus).unwrap().usage.get(&billing::month_of(now)).unwrap().lookups;
+        assert_eq!(used, 3);
+    }
+
+    #[test]
+    fn the_operator_records_payments_and_can_purge_a_farming_platform() {
+        let e = Mutex::new(Engine::with_admin_secret("adm"));
+        let admin = |method: &str, path: &str, body: &str| {
+            let mut r = req(method, path, "", body);
+            r.headers.insert("x-admin-secret".into(), "adm".into());
+            r
+        };
+        let cus = e.lock().unwrap().create_customer("arena", "at_live_k", now_ms());
+        let path = format!("/v1/customers/{cus}/payments");
+        assert_eq!(route(&e, req("POST", &path, "", r#"{"amount_usd":29,"reference":"pi_1"}"#), PROD).status, 401);
+        assert_eq!(route(&e, admin("POST", &path, r#"{"amount_usd":29}"#), PROD).status, 400);
+        let r = route(&e, admin("POST", &path, r#"{"amount_usd":29,"reference":"pi_1"}"#), PROD);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(body_json(&r).get("balance_usd").unwrap().as_f(), Some(0.0));
+        let list = body_json(&route(&e, admin("GET", "/v1/customers", ""), PROD));
+        let Json::Array(items) = list else { panic!() };
+        assert_eq!(items[0].get("overdue"), Some(&Json::Bool(false)));
+
+        let r = route(&e, admin("POST", &format!("/v1/customers/{cus}/revoke"), r#"{"purge":true}"#), PROD);
+        assert_eq!(body_json(&r).get("purged"), Some(&Json::Bool(true)));
+        assert_eq!(route(&e, req("GET", "/v1/usage", "at_live_k", ""), PROD).status, 401);
+        assert_eq!(route(&e, req("GET", "/v1/pricing", "", ""), PROD).status, 200);
     }
 }
