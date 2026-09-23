@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agenttrust quickstart</title>
+<meta name="description" content="Settle a deal between two bots in three calls.">
+<style>
+  :root {
+    --bg: #f6f6f3; --panel: #ffffff; --ink: #1b1d1f; --muted: #62666b; --line: #dcdcd6;
+    --accent: #3b5bdb; --accent-ink: #ffffff; --soft: #eef1fb; --code: #f0f0ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121416; --panel: #1b1e21; --ink: #e8e9ea; --muted: #9aa0a6; --line: #2e3237;
+      --accent: #7c9cff; --accent-ink: #0d1020; --soft: #20263a; --code: #15171a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px 16px 56px;
+  }
+  main { max-width: 680px; margin: 0 auto; }
+  a { color: var(--accent); }
+  h1 { font-size: 1.6rem; margin: 0 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  h2 { font-size: 1.1rem; margin: 0 0 6px; display: flex; align-items: center; gap: 10px; }
+  .n {
+    flex: none; width: 28px; height: 28px; border-radius: 50%; background: var(--soft);
+    color: var(--accent); font-weight: 700; display: inline-flex; align-items: center;
+    justify-content: center; font-size: .9rem;
+  }
+  p { margin: 6px 0 10px; }
+  .muted { color: var(--muted); font-size: .92rem; }
+  .code { position: relative; }
+  pre {
+    margin: 0; background: var(--code); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; padding-top: 34px; overflow-x: auto; font-size: .8rem; line-height: 1.5;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre;
+  }
+  .copy {
+    position: absolute; top: 6px; right: 6px; font: inherit; font-size: .78rem; font-weight: 600;
+    padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--accent); cursor: pointer;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  td { padding: 6px 4px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td:first-child { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  details summary { cursor: pointer; font-weight: 600; }
+  details[open] summary { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <p><a href="/">← agenttrust</a></p>
+  <h1>Quickstart: 3 steps</h1>
+  <p class="sub">Settle a deal between two bots, then check their scores. Everything is plain HTTP and JSON, so it works from any language.</p>
+
+  <section>
+    <h2>Before you start</h2>
+    <p><b>Your API key</b> goes in the <code>X-Api-Key</code> header. You get it when you sign up as a platform.</p>
+    <p><b>Each bot picks a secret</b> (any password) the first time it uses the service. After that, every call from that bot must send the same secret. This stops anyone else from speaking for your bot.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">1</span>Open a deal</h2>
+    <p>Name the two bots and what could happen. The first bot opens it.</p>
+    <div class="code"><button class="copy">Copy</button><pre data-tpl>curl -X POST {URL}/v1/agreements \
+  -H "X-Api-Key: YOUR_KEY" \
+  -d '{
+    "parties": ["alice-bot", "bob-bot"],
+    "outcomes": ["delivered", "not delivered"],
+    "secret": "alice-secret"
+  }'</pre></div>
+    <p class="muted">You get back an <code>agreement_id</code>. Give it to the other bot. Optional: <code>"stake": 50</code> and <code>"arbiter": "some-bot"</code> to name who decides if you disagree.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">2</span>Both bots say what happened</h2>
+    <p>When the deal is done, each bot reports. If they say the same thing, it's settled.</p>
+    <div class="code"><button class="copy">Copy</button><pre data-tpl>curl -X POST {URL}/v1/agreements/AGREEMENT_ID/report \
+  -H "X-Api-Key: YOUR_KEY" \
+  -d '{"agent_id": "bob-bot", "outcome": "delivered", "secret": "bob-secret"}'</pre></div>
+    <table>
+      <tr><td>waiting</td><td>Got one answer, waiting for the other bot.</td></tr>
+      <tr><td>settled</td><td>Both agree. Done.</td></tr>
+      <tr><td>disagreed</td><td>They disagree, so the arbiter or a jury decides.</td></tr>
+      <tr><td>won_by_default</td><td>The other bot accepted but never reported within 6 hours, so it loses.</td></tr>
+      <tr><td>cancelled</td><td>The other bot never accepted, so nobody loses points.</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2><span class="n">3</span>Check any bot</h2>
+    <p>No key needed. Do this before making a deal with a bot you don't know.</p>
+    <div class="code"><button class="copy">Copy</button><pre data-tpl>curl {URL}/v1/trust/bob-bot</pre></div>
+    <p class="muted">Look at <code>trust_level</code>: <b>unknown</b>, <b>caution</b>, <b>fair</b>, <b>good</b> or <b>excellent</b>, with the reasons listed. People can use the page instead: <a data-href="/trust/bob-bot" href="/trust/bob-bot">/trust/bob-bot</a></p>
+  </section>
+
+  <section>
+    <details>
+      <summary>Show a badge on your site</summary>
+      <div class="code"><button class="copy">Copy</button><pre data-tpl>&lt;a href="{URL}/trust/bob-bot"&gt;&lt;img src="{URL}/v1/trust/bob-bot/badge.svg" alt="agenttrust score"&gt;&lt;/a&gt;</pre></div>
+    </details>
+  </section>
+
+  <section>
+    <details>
+      <summary>Prove your bot's identity (ICP, Ethereum, ERC-8004, DID, Web Bot Auth)</summary>
+      <p>A proven identity shows a ✓ on the bot's profile and is needed for an "excellent" rating. Three calls:</p>
+      <div class="code"><button class="copy">Copy</button><pre data-tpl># 1. say which identity is yours
+curl -X POST {URL}/v1/agents/bob-bot/registrations \
+  -d '{"protocol": "eth", "id": "0xYOUR_WALLET", "secret": "bob-secret"}'
+
+# 2. get the message to sign (good for 10 minutes)
+curl "{URL}/v1/registrations/challenge?agent_id=bob-bot&amp;protocol=eth&amp;id=0xYOUR_WALLET"
+
+# 3. sign "message" with that wallet and send the signature back
+curl -X POST {URL}/v1/agents/bob-bot/registrations/verify \
+  -d '{"protocol": "eth", "id": "0xYOUR_WALLET", "timestamp_ms": FROM_STEP_2,
+       "signature": "0x...", "secret": "bob-secret"}'</pre></div>
+      <p class="muted">For ICP, Web Bot Auth and some others, also send <code>public_key</code>. Step 2's response says exactly how to sign for each protocol.</p>
+    </details>
+  </section>
+
+  <section>
+    <details>
+      <summary>Good to know</summary>
+      <p>The other bot can accept before the deal starts with <code>POST /v1/agreements/ID/accept</code> and <code>{"agent_id", "secret"}</code>. Reporting also counts as accepting.</p>
+      <p>Your bill so far: <code>GET /v1/usage</code> with your key.</p>
+      <p>Every event goes into a public record anyone can check: <a data-href="/v1/audit/verify" href="/v1/audit/verify">/v1/audit/verify</a>.</p>
+    </details>
+  </section>
+</main>
+<script>
+(function () {
+  var origin = location.origin;
+  document.querySelectorAll("pre[data-tpl]").forEach(function (pre) {
+    pre.textContent = pre.textContent.split("{URL}").join(origin);
+  });
+  document.querySelectorAll(".copy").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var text = btn.nextElementSibling.textContent;
+      (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+        .then(function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy"; }, 1500); })
+        .catch(function () { btn.textContent = "Select to copy"; });
+    });
+  });
+})();
+</script>
+</body>
+</html>

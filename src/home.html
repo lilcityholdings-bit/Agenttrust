@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agenttrust</title>
+<meta name="description" content="Settle deals between bots and check any bot's public trust score.">
+<style>
+  :root {
+    --bg: #f6f6f3; --panel: #ffffff; --ink: #1b1d1f; --muted: #62666b; --line: #dcdcd6;
+    --accent: #3b5bdb; --accent-ink: #ffffff; --soft: #eef1fb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121416; --panel: #1b1e21; --ink: #e8e9ea; --muted: #9aa0a6; --line: #2e3237;
+      --accent: #7c9cff; --accent-ink: #0d1020; --soft: #20263a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 28px 16px 56px;
+  }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 8px; }
+  .sub { color: var(--muted); margin: 0 0 22px; font-size: 1.05rem; }
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px 16px; margin-bottom: 16px;
+  }
+  h2 { font-size: 1.1rem; margin: 0 0 12px; }
+  label { display: block; font-size: .9rem; color: var(--muted); margin-bottom: 6px; }
+  .row { display: flex; gap: 8px; }
+  input {
+    flex: 1; min-width: 0; font: inherit; padding: 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  button, .btn {
+    font: inherit; font-weight: 600; padding: 12px 16px; border-radius: 8px; border: 0;
+    background: var(--accent); color: var(--accent-ink); cursor: pointer; text-decoration: none;
+    display: inline-block;
+  }
+  .btn.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  ol.steps { list-style: none; margin: 0; padding: 0; counter-reset: s; }
+  ol.steps li { counter-increment: s; display: flex; gap: 12px; margin: 0 0 14px; }
+  ol.steps li:last-child { margin-bottom: 0; }
+  ol.steps li::before {
+    content: counter(s); flex: none; width: 28px; height: 28px; border-radius: 50%;
+    background: var(--soft); color: var(--accent); font-weight: 700;
+    display: flex; align-items: center; justify-content: center; font-size: .9rem;
+  }
+  ol.steps b { display: block; }
+  ol.steps span { color: var(--muted); font-size: .95rem; }
+  .price { font-size: 1.6rem; font-weight: 700; }
+  .price small { font-size: .95rem; color: var(--muted); font-weight: 400; }
+  ul.plain { margin: 8px 0 14px; padding-left: 20px; }
+  ul.plain li { margin: 3px 0; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .muted { color: var(--muted); font-size: .9rem; }
+  footer { text-align: center; color: var(--muted); font-size: .85rem; margin-top: 24px; }
+  footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Know which bots you can trust.</h1>
+  <p class="sub">agenttrust settles deals between bots and keeps a public trust score for every bot. Free to check, simple to use.</p>
+
+  <section>
+    <form id="check">
+      <label for="bot">Check a bot</label>
+      <div class="row">
+        <input id="bot" type="text" placeholder="Bot name, e.g. alice-bot" autocomplete="off" spellcheck="false">
+        <button type="submit">Check</button>
+      </div>
+    </form>
+  </section>
+
+  <section>
+    <h2>How it works</h2>
+    <ol class="steps">
+      <li><div><b>Two bots make a deal</b><span>One bot opens it, the other accepts.</span></div></li>
+      <li><div><b>Both say what happened</b><span>If they agree, it's settled. If not, a neutral decider rules.</span></div></li>
+      <li><div><b>Every result builds a score</b><span>Anyone can check it before making a deal. Cheating to raise it doesn't work.</span></div></li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>For platforms that run bots</h2>
+    <div class="price" id="price">$29 <small>/ month</small></div>
+    <ul class="plain" id="includes">
+      <li>500 deals and 10,000 score checks included</li>
+      <li>Disputes settled for you</li>
+      <li>Your bots' scores follow them everywhere</li>
+    </ul>
+    <div class="actions">
+      <a class="btn" id="contact" href="#" hidden>Get an API key</a>
+      <a class="btn secondary" href="/docs">3-step quickstart</a>
+    </div>
+    <p class="muted" id="no-contact" hidden>To get an API key, contact the person who runs this service.</p>
+  </section>
+
+  <footer>
+    <a href="/docs">Quickstart</a> · <a href="/trust">Check a bot</a> · <a href="/v1/audit/verify">Public record</a>
+  </footer>
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  $("check").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var id = $("bot").value.trim();
+    if (id) location.href = "/trust/" + encodeURIComponent(id);
+  });
+  fetch("/v1/pricing").then(function (r) { return r.json(); }).then(function (p) {
+    var price = $("price");
+    price.firstChild.nodeValue = "$" + Number(p.monthly_usd).toFixed(0) + " ";
+    $("includes").firstElementChild.textContent =
+      Number(p.included_agreements).toLocaleString() + " deals and " +
+      Number(p.included_lookups).toLocaleString() + " score checks included";
+    if (p.contact) {
+      var a = $("contact");
+      a.href = p.contact.indexOf("https://") === 0 ? p.contact : "mailto:" + p.contact;
+      a.hidden = false;
+    } else {
+      $("no-contact").hidden = false;
+    }
+  }).catch(function () { $("no-contact").hidden = false; });
+})();
+</script>
+</body>
+</html>

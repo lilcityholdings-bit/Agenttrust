@@ -239,8 +239,9 @@ pub fn events_from_report(
                 }
             })
             .collect(),
-        // `Waiting` and `Disagreed` don't resolve anything yet -- no event until they do.
-        ReportResult::Waiting(_) | ReportResult::Disagreed => Vec::new(),
+        // `Waiting` and `Disagreed` don't resolve anything yet -- no event until they do. A deal
+        // the other side never accepted scores nobody, either way.
+        ReportResult::Waiting(_) | ReportResult::Disagreed | ReportResult::NeverAccepted => Vec::new(),
     }
 }
 

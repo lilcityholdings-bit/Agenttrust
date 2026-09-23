@@ -58,6 +58,9 @@ pub enum ReportResult {
     Disagreed,
     /// The deadline passed with only one side having answered, so that answer stood.
     WonByDefault(usize),
+    /// The deadline passed and the other side never agreed to the deal, so it voided and
+    /// nobody was charged.
+    NeverAccepted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,9 +108,42 @@ pub struct Agreement {
     /// pool that does not yet exist cannot reach quorum, so a brand-new venue with no seasoned
     /// jurors would otherwise be unable to ever resolve its first real disagreement.
     pub arbiter: Option<String>,
+    /// Names for the outcomes, e.g. ["delivered", "not delivered"]. Empty means they are just
+    /// numbered 0, 1, 2…
+    pub labels: Vec<String>,
+    /// Which sides have agreed to this agreement. The side that opens it has; the other side
+    /// agrees by calling accept or by reporting. Only a side that agreed can lose for going
+    /// silent — otherwise anyone could name a stranger's bot in a deal it never saw, report,
+    /// and have the stranger charged with ghosting when the deadline passes.
+    pub accepted: Vec<String>,
 }
 
 impl Agreement {
+    /// The label for an outcome, or its number as text when the agreement has no labels.
+    pub fn label(&self, outcome: usize) -> String {
+        self.labels.get(outcome).cloned().unwrap_or_else(|| outcome.to_string())
+    }
+
+    /// Resolves what a caller sent as an outcome: an outcome's name (any case) or its number.
+    pub fn parse_outcome(&self, v: &Json) -> Result<usize, String> {
+        if let Some(n) = v.as_usize() {
+            return if n < self.outcomes { Ok(n) } else { Err(format!("outcome must be one of: {}", self.choices())) };
+        }
+        let text = v.as_str().map(|s| s.trim().to_lowercase()).unwrap_or_default();
+        self.labels
+            .iter()
+            .position(|l| l.to_lowercase() == text)
+            .ok_or_else(|| format!("outcome must be one of: {}", self.choices()))
+    }
+
+    pub fn choices(&self) -> String {
+        if self.labels.is_empty() {
+            (0..self.outcomes).map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+        } else {
+            self.labels.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ")
+        }
+    }
+
     pub fn to_snapshot_json(&self) -> Json {
         Json::obj(vec![
             ("id", Json::str(self.id.clone())),
@@ -133,6 +169,8 @@ impl Agreement {
                     None => Json::Null,
                 },
             ),
+            ("labels", Json::Array(self.labels.iter().map(|l| Json::str(l.clone())).collect())),
+            ("accepted", Json::Array(self.accepted.iter().map(|p| Json::str(p.clone())).collect())),
         ])
     }
 
@@ -145,7 +183,6 @@ impl Agreement {
         };
         Some(Agreement {
             id: j.get("id")?.as_str()?.to_string(),
-            parties,
             outcomes: j.get("outcomes")?.as_usize()?,
             stake: j.get("stake")?.as_f()?,
             asset: j.get("asset")?.as_str()?.to_string(),
@@ -155,6 +192,14 @@ impl Agreement {
             status: Status::from_label(j.get("status")?.as_str()?),
             resolved_outcome: j.get("resolved_outcome").and_then(|v| v.as_usize()),
             arbiter: j.get("arbiter").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            labels: strings(j.get("labels")),
+            // Snapshots from before acceptance existed: treat both sides as having agreed, so
+            // deals already in flight keep the rules they were opened under.
+            accepted: match j.get("accepted") {
+                Some(_) => strings(j.get("accepted")),
+                None => parties.clone(),
+            },
+            parties,
         })
     }
 }
@@ -1146,8 +1191,8 @@ impl Engine {
         if outcomes < 2 {
             return Err("an agreement needs at least two possible outcomes");
         }
-        if !(stake.is_finite() && stake > 0.0) {
-            return Err("stake must be a positive number");
+        if !(stake.is_finite() && stake >= 0.0) {
+            return Err("stake must be zero or a positive number");
         }
         if let Some(arb) = &arbiter {
             if parties.iter().any(|p| p == arb) {
@@ -1168,6 +1213,8 @@ impl Engine {
             status: Status::Open,
             resolved_outcome: None,
             arbiter: arbiter.clone(),
+            labels: Vec::new(),
+            accepted: vec![parties[0].clone()],
         };
         self.agreements.insert(id.clone(), agreement);
         self.append(
@@ -1226,6 +1273,11 @@ impl Engine {
             return Err("you have already reported this one");
         }
         entry.insert(agent_id.to_string(), outcome);
+        if let Some(a) = self.agreements.get_mut(agreement_id) {
+            if !a.accepted.iter().any(|p| p == agent_id) {
+                a.accepted.push(agent_id.to_string());
+            }
+        }
         let values: Vec<usize> = parties.iter().filter_map(|p| entry.get(p).copied()).collect();
         let all_in = values.len() == parties.len();
         let same = values.windows(2).all(|w| w[0] == w[1]);
@@ -1269,10 +1321,55 @@ impl Engine {
         // Past the deadline with only one answer in, that answer decides — reported now rather
         // than leaving the caller to find out from a balance that changes later.
         if now_ms >= self.agreements[agreement_id].report_deadline_ms {
+            if !self.silent_side_accepted(agreement_id, agent_id) {
+                self.void(agreement_id, "the other side never accepted this agreement", now_ms);
+                return Ok(ReportResult::NeverAccepted);
+            }
             self.settle(agreement_id, outcome, agent_id, ReportResult::WonByDefault(outcome), now_ms);
             return Ok(ReportResult::WonByDefault(outcome));
         }
         Ok(ReportResult::Waiting(parties.len() - values.len()))
+    }
+
+    /// Whether the side that did *not* report had agreed to the deal — the condition for
+    /// charging it with going silent. See `Agreement::accepted`.
+    fn silent_side_accepted(&self, agreement_id: &str, reporter: &str) -> bool {
+        let Some(a) = self.agreements.get(agreement_id) else { return false };
+        a.parties.iter().filter(|p| *p != reporter).all(|p| a.accepted.contains(p))
+    }
+
+    /// The other side says yes to an agreement it was named in. Reporting does this too, so a
+    /// bot that simply reports what happened never needs to call this separately.
+    pub fn accept(&mut self, agreement_id: &str, agent_id: &str, now_ms: i64) -> Result<(), &'static str> {
+        let a = self.agreements.get_mut(agreement_id).ok_or("no such agreement")?;
+        if !a.parties.iter().any(|p| p == agent_id) {
+            return Err("only the two sides of this agreement can accept it");
+        }
+        if a.status != Status::Open {
+            return Err("this agreement is already closed");
+        }
+        if a.accepted.iter().any(|p| p == agent_id) {
+            return Ok(());
+        }
+        a.accepted.push(agent_id.to_string());
+        self.append(
+            now_ms,
+            "agreement_accepted",
+            Json::obj(vec![
+                ("agreement_id", Json::str(agreement_id.to_string())),
+                ("agent_id", Json::str(agent_id.to_string())),
+            ]),
+        );
+        Ok(())
+    }
+
+    /// Names the outcomes, right after creating the agreement.
+    pub fn set_labels(&mut self, agreement_id: &str, labels: Vec<String>) {
+        if let Some(a) = self.agreements.get_mut(agreement_id) {
+            if labels.len() == a.outcomes {
+                a.labels = labels;
+            }
+        }
     }
 
     fn settle(
@@ -1434,7 +1531,11 @@ impl Engine {
                 }
                 1 => {
                     let (who, outcome) = reported.iter().next().map(|(k, v)| (k.clone(), *v)).unwrap();
-                    self.settle(&id, outcome, &who, ReportResult::WonByDefault(outcome), now_ms);
+                    if self.silent_side_accepted(&id, &who) {
+                        self.settle(&id, outcome, &who, ReportResult::WonByDefault(outcome), now_ms);
+                    } else {
+                        self.void(&id, "the other side never accepted this agreement", now_ms);
+                    }
                 }
                 _ => {}
             }
@@ -1903,6 +2004,7 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
         let age_days = first_seen.map(|t| ((now_ms - t).max(0) / 86_400_000) as f64);
 
         let mut reasons: Vec<String> = Vec::new();
+        let n = |count: usize, word: &str| format!("{count} {word}{}", if count == 1 { "" } else { "s" });
         let ghost_rate = if deals > 0 { ghosted as f64 / deals as f64 } else { 0.0 };
         let disputes = won + lost;
         let level = if !known || deals == 0 {
@@ -1929,9 +2031,9 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
             reasons.push(format!("{deals} agreements with {partners} different partners on {platforms} platforms"));
             "good"
         } else {
-            reasons.push(format!("{deals} agreements, but not yet a record that is hard to fake"));
+            reasons.push(format!("{}, but not yet a record that is hard to fake", n(deals as usize, "agreement")));
             if partners < 10 {
-                reasons.push(format!("only {partners} different partners (a good rating needs 10)"));
+                reasons.push(format!("only {} (a good rating needs 10)", n(partners, "different partner")));
             }
             if platforms < 2 {
                 reasons.push(format!(
@@ -2439,6 +2541,13 @@ pub fn domain_label(domain: Domain) -> &'static str {
     }
 }
 
+fn strings(j: Option<&Json>) -> Vec<String> {
+    match j {
+        Some(Json::Array(items)) => items.iter().filter_map(|i| i.as_str().map(|s| s.to_string())).collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub fn domain_from(label: &str) -> Domain {
     match label {
         "commerce" => Domain::Commerce,
@@ -2509,6 +2618,7 @@ mod tests {
                 0,
             )
             .unwrap();
+        e.accept(&id, "ghost", 5).unwrap();
         e.report(&id, "alice", 0, None, 10).unwrap();
         assert_eq!(e.sweep(REPORT_WINDOW_MS + 1), 1);
         assert_eq!(e.agreement(&id).unwrap().resolved_outcome, Some(0));
@@ -2855,6 +2965,7 @@ mod tests {
             let id = e
                 .create_agreement(vec![other.clone(), agent.to_string()], 2, 10.0, "USDC".into(), Domain::Commerce, None, 0)
                 .unwrap();
+            e.accept(&id, agent, 1).unwrap();
             e.report(&id, &other, 0, None, 10).unwrap();
         }
         e.sweep(REPORT_WINDOW_MS + 1);
@@ -3041,6 +3152,7 @@ mod tests {
             .create_agreement(vec!["victim".into(), "star".into()], 2, 10.0, "USDC".into(), Domain::Commerce, None, 0)
             .unwrap();
         e.tag_agreement(&id, &cus, 0);
+        e.accept(&id, "star", 1).unwrap();
         e.report(&id, "victim", 0, None, 10).unwrap();
         e.sweep(REPORT_WINDOW_MS + 11);
         assert_eq!(score(&e, "star"), start + PLATFORM_CAP as f64 - 60.0);
@@ -3107,5 +3219,45 @@ mod tests {
         assert_eq!(st.get("billed_usd").unwrap().as_f(), Some(58.0));
         assert_eq!(st.get("paid_usd").unwrap().as_f(), Some(29.0));
         assert!(e.record_payment(&cus, 0, "x", 1).is_err());
+    }
+
+    #[test]
+    fn a_bot_named_in_a_deal_it_never_accepted_cannot_be_charged_for_silence() {
+        let mut e = Engine::new();
+        season(&mut e, "stranger", 3, 0);
+        let before = score(&e, "stranger");
+        // A griefer opens a deal naming a bot that never heard of it, reports, and waits.
+        let id = e
+            .create_agreement(vec!["griefer".into(), "stranger".into()], 2, 0.0, "USDC".into(), Domain::Commerce, None, 0)
+            .unwrap();
+        e.report(&id, "griefer", 0, None, 10).unwrap();
+        e.sweep(REPORT_WINDOW_MS + 1);
+        assert_eq!(e.agreement(&id).unwrap().status, Status::Voided);
+        assert_eq!(score(&e, "stranger"), before);
+        assert_eq!(score(&e, "griefer"), crate::trust::STARTING_SCORE as f64, "and the griefer gains nothing");
+        // Reporting counts as accepting, so the normal two-report flow needs no extra call.
+        let id = e
+            .create_agreement(vec!["a".into(), "b".into()], 2, 0.0, "USDC".into(), Domain::Commerce, None, 0)
+            .unwrap();
+        e.report(&id, "b", 0, None, 1).unwrap();
+        assert!(e.agreement(&id).unwrap().accepted.contains(&"b".to_string()));
+        assert!(e.accept(&id, "outsider", 1).is_err());
+    }
+
+    #[test]
+    fn outcomes_can_be_named_and_reported_by_name() {
+        let mut e = Engine::new();
+        let id = e
+            .create_agreement(vec!["a".into(), "b".into()], 2, 0.0, "USDC".into(), Domain::Commerce, None, 0)
+            .unwrap();
+        e.set_labels(&id, vec!["Delivered".into(), "Not delivered".into()]);
+        let a = e.agreement(&id).unwrap();
+        assert_eq!(a.parse_outcome(&Json::str("delivered")), Ok(0));
+        assert_eq!(a.parse_outcome(&Json::str(" NOT DELIVERED ")), Ok(1));
+        assert_eq!(a.parse_outcome(&Json::num(1.0)), Ok(1));
+        assert!(a.parse_outcome(&Json::str("maybe")).unwrap_err().contains("\"Delivered\", \"Not delivered\""));
+        let restored = Engine::from_snapshot(&e.to_snapshot()).unwrap();
+        assert_eq!(restored.agreement(&id).unwrap().labels, vec!["Delivered", "Not delivered"]);
+        assert_eq!(restored.agreement(&id).unwrap().accepted, vec!["a"]);
     }
 }

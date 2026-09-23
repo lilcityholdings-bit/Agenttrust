@@ -8,6 +8,24 @@ Two halves that need each other: a **jury** that settles disagreements between t
 produced. A score with no dispute mechanism behind it is an opinion. A dispute mechanism nobody
 checks before signing is a courthouse in a field.
 
+## Start here
+
+- **People:** open the site. The home page has a "check a bot" box and a short explanation.
+- **Developers:** `/docs` is a 3-step quickstart with copy-paste commands: open a deal, both
+  bots report, check a score.
+- **You (the operator):** `/admin` creates API keys, shows each platform's bill, and records
+  payments. Set `CONTACT` in Railway to your email or a Stripe payment link, and the home page's
+  "Get an API key" button goes there.
+
+**The other side has to accept a deal.** The bot that opens a deal has accepted it. The other bot
+accepts with `POST /v1/agreements/{id}/accept`, or just by reporting. Only a bot that accepted
+can lose points for going silent. Otherwise anyone could name a stranger's bot in a fake deal
+and have it charged. A deal the other side never accepts cancels after 6 hours, and nobody
+gains or loses anything.
+
+**Outcomes can have names**, e.g. `"outcomes": ["delivered", "not delivered"]`, and bots
+report `"outcome": "delivered"`. `stake` is optional.
+
 ## What's actually in here
 
 | File | What it does |
@@ -22,7 +40,7 @@ checks before signing is a courthouse in a field.
 | `trust.html` | The public trust-check page at `/trust`, compiled into the binary. |
 | `json.rs`, `http.rs`, `hash.rs` | Hand-rolled JSON, HTTP/1.1, SHA-256/224 and a seeded PRNG. |
 
-90 unit tests. `cargo test` runs them.
+93 unit tests. `cargo test` runs them.
 
 ## The trust score
 
@@ -259,6 +277,7 @@ Every request above except the public ones also needs `Authorization: Bearer <ap
 | `REQUIRE_API_KEY` | `1` | `0` lets anyone use the API with no key — local development only. |
 | `ALLOW_CLOCK_OVERRIDE` | `0` | `1` honors a `now_ms` in requests, to test deadlines without waiting. **Never in production**: it lets one side report with a future clock and win by default before the other side's window has passed. |
 | `PRICE_MONTHLY_USD` … `PRICE_LOOKUP_USD` | see "API keys and billing" | The price list. Takes effect on restart; bills are recomputed with the new prices. |
+| `CONTACT` | none | Your email or an `https://` link (e.g. a Stripe payment link). The home page's "Get an API key" button goes there. |
 | `RPC_URL_<chainId>` | public nodes | Your own RPC endpoint for ERC-8004 checks on that chain. |
 
 ## Why there's a second dispute path: arbitration

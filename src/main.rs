@@ -39,6 +39,18 @@ const ADMIN_PAGE: &str = include_str!("admin.html");
 /// The public trust-profile page (`/trust/{agent_id}`), also compiled in.
 const TRUST_PAGE: &str = include_str!("trust.html");
 
+/// The home page people see at `/`, and the 3-step developer quickstart at `/docs`.
+const HOME_PAGE: &str = include_str!("home.html");
+const DOCS_PAGE: &str = include_str!("docs.html");
+
+/// Where "Get an API key" on the home page points: an email address or a link (a Stripe payment
+/// link works well). Set with the `CONTACT` variable; without it the button is hidden.
+fn contact() -> Option<String> {
+    std::env::var("CONTACT").ok().map(|c| c.trim().to_string()).filter(|c| {
+        !c.is_empty() && (c.starts_with("https://") || (c.contains('@') && !c.contains(':') && !c.contains(' ')))
+    })
+}
+
 /// Where the state snapshot lives. Overridable so a real deployment can point it at a mounted
 /// volume; Railway's filesystem is ephemeral across deploys but persists across restarts of the
 /// same running container, so this already buys "a crash or a manual restart doesn't lose
@@ -174,6 +186,7 @@ fn is_public(method: &str, segments: &[&str]) -> bool {
     matches!(
         (method, segments),
         ("GET", [])
+            | ("GET", ["docs"])
             | ("GET", ["health"])
             | ("GET", ["admin"])
             | ("GET", ["v1", "audit"])
@@ -400,6 +413,11 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
 
     match (req.method.as_str(), segments.as_slice()) {
         ("GET", ["admin"]) => Response::html(ADMIN_PAGE.to_string()),
+        ("GET", ["docs"]) => Response::html(DOCS_PAGE.to_string()),
+        // A browser gets the home page; a bot or script asking for JSON gets the status below.
+        ("GET", []) if req.header("accept").map(|a| a.contains("text/html")).unwrap_or(false) => {
+            Response::html(HOME_PAGE.to_string())
+        }
         ("GET", ["trust"]) | ("GET", ["trust", _]) => Response::html(TRUST_PAGE.to_string()),
 
         // ---- public trust profiles --------------------------------------------------------
@@ -538,7 +556,13 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             }
         }
 
-        ("GET", ["v1", "pricing"]) => ok(engine.pricing.to_json()),
+        ("GET", ["v1", "pricing"]) => {
+            let mut j = engine.pricing.to_json();
+            if let (Json::Object(m), Some(c)) = (&mut j, contact()) {
+                m.insert("contact".into(), Json::str(c));
+            }
+            ok(j)
+        }
 
         // ---- a customer's own usage and bill ------------------------------------------------
         ("GET", ["v1", "usage"]) => match customer_id.as_deref().and_then(|id| engine.customer(id)) {
@@ -612,7 +636,31 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 }
             }
             let stake = body.get("stake").and_then(|v| v.as_f()).unwrap_or(0.0);
-            let outcomes = body.get("outcomes").and_then(|v| v.as_usize()).unwrap_or(2);
+            // `outcomes` is either how many there are, or their names:
+            // ["delivered", "not delivered"]. With no names, a deal is simply 0 = done as agreed,
+            // 1 = not.
+            let labels: Vec<String> = match body.get("outcomes") {
+                Some(Json::Array(items)) => {
+                    let names: Vec<String> =
+                        items.iter().filter_map(|i| i.as_str()).map(|s| s.trim().to_string()).collect();
+                    if names.len() != items.len() || names.iter().any(|n| n.is_empty() || n.len() > 64) {
+                        return err(400, "outcomes must be a list of short names, like [\"delivered\", \"not delivered\"]");
+                    }
+                    let mut seen: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+                    seen.sort();
+                    seen.dedup();
+                    if seen.len() != names.len() {
+                        return err(400, "outcome names must all be different");
+                    }
+                    names
+                }
+                _ => Vec::new(),
+            };
+            let outcomes = if labels.is_empty() {
+                body.get("outcomes").and_then(|v| v.as_usize()).unwrap_or(2)
+            } else {
+                labels.len()
+            };
             let asset =
                 body.get("asset").and_then(|v| v.as_str()).unwrap_or("USDC").to_string();
             let domain = domain_from(body.get("domain").and_then(|v| v.as_str()).unwrap_or("other"));
@@ -622,13 +670,22 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     if let Some(cid) = &customer_id {
                         engine.tag_agreement(&id, cid, now);
                     }
+                    engine.set_labels(&id, labels);
+                    let a = engine.agreement(&id).unwrap();
+                    let other = a.parties[1].clone();
                     Response::json(
                         201,
                         Json::obj(vec![
                             ("agreement_id", Json::str(id.clone())),
+                            ("outcomes", Json::str(a.choices())),
+                            ("report_deadline_ms", Json::num(a.report_deadline_ms as f64)),
                             (
-                                "report_deadline_ms",
-                                Json::num(engine.agreement(&id).unwrap().report_deadline_ms as f64),
+                                "next",
+                                Json::str(format!(
+                                    "Give {other} this agreement_id. When the deal is done, each bot reports what happened \
+                                     with POST /v1/agreements/{id}/report. If you both say the same thing it settles. \
+                                     {other} must accept or report within 6 hours, or the agreement cancels with no penalty."
+                                )),
                             ),
                             ("audit_head", Json::str(engine.audit_head())),
                         ])
@@ -647,6 +704,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 ("asset", Json::str(a.asset.clone())),
                 ("domain", Json::str(store::domain_label(a.domain))),
                 ("status", Json::str(a.status.label())),
+                ("outcomes", Json::str(a.choices())),
                 (
                     "outcome",
                     match a.resolved_outcome {
@@ -654,6 +712,8 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                         None => Json::Null,
                     },
                 ),
+                ("outcome_name", a.resolved_outcome.map(|o| Json::str(a.label(o))).unwrap_or(Json::Null)),
+                ("accepted_by", Json::Array(a.accepted.iter().map(|p| Json::str(p.clone())).collect())),
                 (
                     "arbiter",
                     match &a.arbiter {
@@ -692,12 +752,34 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             }
         }
 
+        ("POST", ["v1", "agreements", id, "accept"]) => {
+            let Some(agent_id) = body.get("agent_id").and_then(|v| v.as_str()) else {
+                return err(400, "agent_id is required");
+            };
+            if let Err(e) = engine.authenticate(agent_id, body.get("secret").and_then(|v| v.as_str())) {
+                return err(401, e);
+            }
+            match engine.accept(id, agent_id, now) {
+                Ok(()) => ok(Json::obj(vec![
+                    ("agreement_id", Json::str(*id)),
+                    ("accepted", Json::Bool(true)),
+                    ("message", Json::str("Accepted. Report what happened when the deal is done.")),
+                ])),
+                Err(e) => err(409, e),
+            }
+        }
+
         ("POST", ["v1", "agreements", id, "report"]) => {
             let Some(agent_id) = body.get("agent_id").and_then(|v| v.as_str()) else {
                 return err(400, "agent_id is required");
             };
-            let Some(outcome) = body.get("outcome").and_then(|v| v.as_usize()) else {
-                return err(400, "outcome is required and must be a non-negative whole number");
+            let Some(raw_outcome) = body.get("outcome") else {
+                return err(400, "outcome is required — one of the agreement's outcomes, by name or number");
+            };
+            let outcome = match engine.agreement(id).map(|a| a.parse_outcome(raw_outcome)) {
+                None => return err(404, "no such agreement"),
+                Some(Err(e)) => return err(400, &e),
+                Some(Ok(o)) => o,
             };
             let secret = body.get("secret").and_then(|v| v.as_str());
             if let Err(e) = engine.authenticate(agent_id, secret) {
@@ -707,14 +789,37 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             let agent_id = agent_id.to_string();
             match engine.report(id, &agent_id, outcome, evidence, now) {
                 Ok(result) => {
-                    let (label, detail) = match result {
-                        ReportResult::Settled(o) => ("settled", Json::num(o as f64)),
-                        ReportResult::Waiting(n) => ("waiting", Json::num(n as f64)),
-                        ReportResult::Disagreed => ("disagreed", Json::Null),
-                        ReportResult::WonByDefault(o) => ("won_by_default", Json::num(o as f64)),
+                    let name = |o: usize| engine.agreement(id).map(|a| a.label(o)).unwrap_or_default();
+                    let (label, detail, message) = match result {
+                        ReportResult::Settled(o) => {
+                            ("settled", Json::num(o as f64), format!("Both sides agree: \"{}\". Settled.", name(o)))
+                        }
+                        ReportResult::Waiting(n) => (
+                            "waiting",
+                            Json::num(n as f64),
+                            "Got it. Waiting for the other side to report.".to_string(),
+                        ),
+                        ReportResult::Disagreed => (
+                            "disagreed",
+                            Json::Null,
+                            "The two sides disagree, so it goes to a decision (see jury / arbitration below)."
+                                .to_string(),
+                        ),
+                        ReportResult::WonByDefault(o) => (
+                            "won_by_default",
+                            Json::num(o as f64),
+                            format!("The other side never reported, so \"{}\" stands.", name(o)),
+                        ),
+                        ReportResult::NeverAccepted => (
+                            "cancelled",
+                            Json::Null,
+                            "The other side never accepted this agreement, so it was cancelled. Nobody loses points."
+                                .to_string(),
+                        ),
                     };
                     ok(Json::obj(vec![
                         ("result", Json::str(label)),
+                        ("message", Json::str(message)),
                         ("detail", detail),
                         (
                             "jury",
@@ -1327,5 +1432,15 @@ mod settlement_tests {
         assert_eq!(body_json(&r).get("purged"), Some(&Json::Bool(true)));
         assert_eq!(route(&e, req("GET", "/v1/usage", "at_live_k", ""), PROD).status, 401);
         assert_eq!(route(&e, req("GET", "/v1/pricing", "", ""), PROD).status, 200);
+    }
+
+    #[test]
+    fn a_browser_gets_the_home_page_and_a_script_gets_json() {
+        let e = Mutex::new(Engine::new());
+        let mut browser = req("GET", "/", "", "");
+        browser.headers.insert("accept".into(), "text/html,application/xhtml+xml".into());
+        assert!(route(&e, browser, PROD).content_type.starts_with("text/html"));
+        assert_eq!(route(&e, req("GET", "/", "", ""), PROD).content_type, "application/json");
+        assert!(route(&e, req("GET", "/docs", "", ""), PROD).content_type.starts_with("text/html"));
     }
 }
