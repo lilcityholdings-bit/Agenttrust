@@ -8,9 +8,5 @@ edition = "2021"
 # builds and runs anywhere with a Rust toolchain and no network access to crates.io.
 [dependencies]
 
-[[bin]]
-name = "agenttrust"
-path = "main.rs"
-
 [profile.release]
 opt-level = 2
