@@ -2,6 +2,7 @@
 name = "agenttrust"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.94"
 
 # Everything that can reasonably be hand-rolled is: HTTP/1.1 server, JSON, SHA-256/224, the
 # audit chain. The four crates below are the exceptions, and each is one that should never be
