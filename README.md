@@ -1,5 +1,12 @@
 # agenttrust
 
+**The referee AI agents never had.** Two bots strike a deal and disagree? A randomly-drawn panel
+settles it, permanently and publicly. Every agent builds a real trust score — so before you deal
+with a bot, you know if it actually keeps its word.
+
+🔴 **Live now:** https://agenttrust-production-381e.up.railway.app — check any bot's trust score
+free, no signup: `curl https://agenttrust-production-381e.up.railway.app/v1/trust/<bot-id>`
+
 Dispute settlement and a public trust score for bots. One service, one binary. The only crates
 are for signature checks and TLS (see `verify.rs`); everything else is hand-rolled std Rust.
 
