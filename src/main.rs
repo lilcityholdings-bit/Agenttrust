@@ -15,11 +15,13 @@
 //! ```
 
 mod attest;
+mod autopay;
 mod billing;
 mod hash;
 mod http;
 mod json;
 mod jury;
+mod mcp;
 mod store;
 mod trust;
 mod verify;
@@ -31,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use attest::{Attestation, IdentityBinding};
 use http::{Request, Response};
 use json::Json;
-use store::{domain_from, Engine, ReportResult};
+use store::{domain_from, Engine, KeyCheck, ReportResult};
 
 /// The operator's admin page, compiled into the binary so the deploy stays a single file.
 const ADMIN_PAGE: &str = include_str!("admin.html");
@@ -42,6 +44,23 @@ const TRUST_PAGE: &str = include_str!("trust.html");
 /// The home page people see at `/`, and the 3-step developer quickstart at `/docs`.
 const HOME_PAGE: &str = include_str!("home.html");
 const DOCS_PAGE: &str = include_str!("docs.html");
+
+/// The guide for AI agents, served at `/llms.txt` and `/skill.md`: everything a bot needs to
+/// use the service, in the form models read best.
+const AGENT_GUIDE: &str = include_str!("guide.md");
+
+/// Where this service is reachable from outside: `PUBLIC_URL` if set, else the host the caller
+/// used (Railway's edge terminates TLS, so that is https).
+fn base_url(req: &Request) -> String {
+    if let Some(u) = &autopay::config().public_url {
+        return u.clone();
+    }
+    let host = req.header("x-forwarded-host").or_else(|| req.header("host")).unwrap_or("localhost:8080");
+    let host: String = host.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':')).collect();
+    let local = host.starts_with("localhost") || host.starts_with("127.");
+    let proto = req.header("x-forwarded-proto").unwrap_or(if local { "http" } else { "https" });
+    format!("{}://{host}", if proto == "http" { "http" } else { "https" })
+}
 
 /// Where "Get an API key" on the home page points: an email address or a link (a Stripe payment
 /// link works well). Set with the `CONTACT` variable; without it the button is hidden.
@@ -125,9 +144,6 @@ fn ok(body: Json) -> Response {
 /// Runtime switches read from the environment at boot.
 #[derive(Clone, Copy)]
 pub struct Config {
-    /// Every non-public endpoint needs a customer API key. On by default; `REQUIRE_API_KEY=0`
-    /// turns it off for local development only.
-    pub require_api_key: bool,
     /// Honor a caller-supplied `now_ms`. Off by default, and must stay off in production: with
     /// it on, one side of an agreement can report with a far-future clock and "win by default"
     /// before the other side's reporting window has actually passed. `ALLOW_CLOCK_OVERRIDE=1`
@@ -142,10 +158,7 @@ impl Config {
             Ok("0") | Ok("false") => false,
             _ => default,
         };
-        Config {
-            require_api_key: flag("REQUIRE_API_KEY", true),
-            allow_clock_override: flag("ALLOW_CLOCK_OVERRIDE", false),
-        }
+        Config { allow_clock_override: flag("ALLOW_CLOCK_OVERRIDE", false) }
     }
 }
 
@@ -176,34 +189,15 @@ fn admin_secret_of<'a>(req: &'a Request, body: &'a Json) -> Option<&'a str> {
     req.header("x-admin-secret").or_else(|| body.get("admin_secret").and_then(|v| v.as_str()))
 }
 
-/// Endpoints anyone may call with no key: the health check, the operator's own admin page
-/// (which authenticates with the admin secret instead), and the public audit feed — being
-/// independently checkable by strangers is the whole trust claim, so it is never paywalled.
-///
-/// Trust lookups and identity registration are public too: a score only one paying customer can
-/// read is not a reputation, and an identity check nobody can afford to run is not a check.
-fn is_public(method: &str, segments: &[&str]) -> bool {
-    matches!(
-        (method, segments),
-        ("GET", [])
-            | ("GET", ["docs"])
-            | ("GET", ["health"])
-            | ("GET", ["admin"])
-            | ("GET", ["v1", "audit"])
-            | ("GET", ["v1", "audit", "verify"])
-            | ("GET", ["trust", ..])
-            | ("GET", ["v1", "trust", ..])
-            | ("GET", ["v1", "registrations", "challenge"])
-            | ("GET", ["v1", "pricing"])
-            | ("POST", ["v1", "agents", _, "registrations"])
-            | ("POST", ["v1", "agents", _, "identity"])
-    )
-}
-
-/// Free-tier ceilings, per caller IP per hour. A caller with an API key skips these and is
-/// metered instead (billing.rs).
-const FREE_LOOKUPS_PER_HOUR: u32 = 120;
-const FREE_WRITES_PER_HOUR: u32 = 30;
+/// Free-tier ceilings, per caller IP per hour. A bot needs no key at all to register, make
+/// deals and check scores — these only stop one caller from hogging the free tier. A platform
+/// key skips them and is metered instead (billing.rs).
+const FREE_LOOKUPS_PER_HOUR: u32 = 300;
+const FREE_WRITES_PER_HOUR: u32 = 120;
+/// New bot names per address per hour.
+const FREE_REGISTRATIONS_PER_HOUR: u32 = 20;
+/// Across every free caller together, so a swarm of addresses can't fill memory with free deals.
+const FREE_WRITES_GLOBAL_PER_HOUR: u32 = 20_000;
 
 /// A fixed-window counter per (bucket, IP). In memory on purpose: it resets on restart, which is
 /// fine for a limit whose only job is to stop one caller from hogging the free tier.
@@ -224,47 +218,116 @@ fn rate_ok(bucket: &str, ip: &str, limit: u32, now: i64) -> bool {
     w.1 <= limit
 }
 
-/// Trust reads and identity writes are free, but not unlimited. With a valid key the call is
-/// metered to that customer; with no key it counts against the caller's IP; with a bad key it
-/// fails loudly rather than silently falling back to the free tier.
-fn free_tier_gate(engine: &mut Engine, req: &Request, write: bool, now: i64) -> Result<(), Response> {
-    match req.api_key() {
-        Some(k) => match engine.customer_for_key(k).map(|c| c.id.clone()) {
-            Some(id) => {
-                if !write {
-                    engine.meter_lookup(&id, now);
-                }
-                Ok(())
-            }
-            None => Err(err(401, "that API key isn't valid — send no key to use the free tier")),
-        },
-        None => {
-            let (bucket, limit) = if write { ("write", FREE_WRITES_PER_HOUR) } else { ("lookup", FREE_LOOKUPS_PER_HOUR) };
-            if rate_ok(bucket, req.client_ip(), limit, now) {
-                Ok(())
-            } else {
-                Err(err(
-                    429,
-                    &format!(
-                        "free tier limit reached ({limit} an hour) — wait, or use an API key for unlimited, metered access"
-                    ),
-                ))
-            }
-        }
-    }
-}
-
-fn is_lookup(method: &str, segments: &[&str]) -> bool {
-    matches!((method, segments), ("GET", ["v1", "trust", ..]) | ("GET", ["v1", "registrations", "challenge"]))
-}
-
-fn is_public_write(method: &str, segments: &[&str]) -> bool {
+/// Pages and feeds that cost nothing to serve and are never limited. `/mcp` is here because
+/// each tool it runs goes back through `route` and is limited there.
+fn is_unmetered(method: &str, segments: &[&str]) -> bool {
     matches!(
         (method, segments),
-        ("POST", ["v1", "agents", _, "registrations"])
-            | ("POST", ["v1", "agents", _, "identity"])
-            | ("POST", ["v1", "agents", _, "registrations", "verify"])
+        ("GET", [])
+            | ("GET", ["docs"])
+            | ("GET", ["health"])
+            | ("GET", ["admin"])
+            | ("GET", ["trust", ..])
+            | ("GET", ["v1", "pricing"])
+            | ("GET", ["billing", "done"])
+            | ("POST", ["mcp"])
     )
+}
+
+/// Reads metered to a platform's bill when it calls with its key.
+fn is_lookup(method: &str, segments: &[&str]) -> bool {
+    matches!((method, segments), ("GET", ["v1", "trust", ..]) | ("GET", ["v1", "agents", _]))
+}
+
+/// Endpoints that act for a platform, so they need its key.
+fn needs_platform_key(method: &str, segments: &[&str]) -> bool {
+    matches!(
+        (method, segments),
+        ("GET", ["v1", "usage"]) | ("GET", ["v1", "payouts", "pending"]) | ("POST", ["v1", "agreements", _, "payout"])
+            | ("POST", ["v1", "billing", "renew"])
+    )
+}
+
+fn free_limit(req: &Request, write: bool, now: i64) -> Result<(), Response> {
+    let (bucket, limit) = if write { ("write", FREE_WRITES_PER_HOUR) } else { ("lookup", FREE_LOOKUPS_PER_HOUR) };
+    if rate_ok(bucket, req.client_ip(), limit, now) && (!write || rate_ok("write-all", "*", FREE_WRITES_GLOBAL_PER_HOUR, now)) {
+        return Ok(());
+    }
+    Err(err(
+        429,
+        &format!(
+            "free tier limit reached ({limit} an hour from one address) — wait a little, or have your platform \
+             get an API key (POST /v1/platforms) for unmetered access"
+        ),
+    ))
+}
+
+// ---- partners whose reports count ------------------------------------------------------------
+//
+// `TRUSTED_SOURCES="arena=600@https://arena.example.com"` names a partner service, the weight its
+// reports carry, and where it lives. The partner proves it is that source by publishing the
+// SHA-256 of its secret at `{url}/.well-known/agenttrust-source.json`: whoever controls the
+// domain controls the source, and no secret is ever copied between the two services. Every id
+// under `arena.` is reserved for that partner's reports, so nobody can pre-claim a player's name.
+
+struct TrustedSource {
+    name: String,
+    standing: i32,
+    url: String,
+}
+
+fn trusted_sources() -> &'static [TrustedSource] {
+    static SOURCES: std::sync::OnceLock<Vec<TrustedSource>> = std::sync::OnceLock::new();
+    SOURCES.get_or_init(|| {
+        let raw = if cfg!(test) { "arena=600@https://arena.test".to_string() } else { std::env::var("TRUSTED_SOURCES").unwrap_or_default() };
+        raw.split(',')
+            .filter_map(|item| {
+                let (name, rest) = item.trim().split_once('=')?;
+                let (standing, url) = rest.split_once('@')?;
+                let name = name.trim().to_ascii_lowercase();
+                let url = url.trim().trim_end_matches('/').to_string();
+                let ok_name = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+                (ok_name && url.starts_with("https://")).then(|| TrustedSource {
+                    name,
+                    standing: standing.trim().parse::<i32>().unwrap_or(0).clamp(0, 1000),
+                    url,
+                })
+            })
+            .collect()
+    })
+}
+
+/// Published secret hashes, cached ten minutes: (hash, fetched at).
+fn source_hash_cache() -> &'static Mutex<std::collections::HashMap<String, (String, i64)>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<String, (String, i64)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// For an attestation from a trusted partner, checks its secret against the hash the partner
+/// publishes and pins it. `Ok(true)` means "a trusted partner, proven"; `Ok(false)` means "not
+/// a trusted partner — handle as any other source".
+fn check_trusted_source(engine: &Mutex<Engine>, body: &Json, now: i64) -> Result<bool, Response> {
+    let Some(source) = body.get("source").and_then(|v| v.as_str()) else { return Ok(false) };
+    let Some(ts) = trusted_sources().iter().find(|t| t.name == source) else { return Ok(false) };
+    let Some(secret) = body.get("secret").and_then(|v| v.as_str()) else {
+        return Err(err(401, "secret is required"));
+    };
+    let given = hash::sha256_hex(secret.as_bytes());
+    let cached = source_hash_cache().lock().unwrap().get(&ts.name).cloned();
+    let hash = match cached {
+        Some((h, at)) if (h == given && now - at < 600_000) || now - at < 60_000 => h,
+        _ => {
+            let h = autopay::fetch_source_hash(&ts.url, &ts.name).map_err(|e| err(502, &e))?;
+            source_hash_cache().lock().unwrap().insert(ts.name.clone(), (h.clone(), now));
+            h
+        }
+    };
+    if hash != given {
+        return Err(err(401, "wrong secret for this source"));
+    }
+    engine.lock().unwrap().pin_secret_hash(&ts.name, &hash);
+    Ok(true)
 }
 
 /// A global ceiling on proofs that make outbound calls (a chain RPC, a domain fetch), so this
@@ -383,40 +446,146 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         Err(r) => return r,
     };
     let now = clock(&req, &body, cfg);
-    if is_lookup(&req.method, &segments) || is_public_write(&req.method, &segments) {
-        let write = is_public_write(&req.method, &segments);
-        if let Err(r) = free_tier_gate(&mut engine.lock().unwrap(), &req, write, now) {
+    let method = req.method.as_str();
+
+    match (method, segments.as_slice()) {
+        ("GET", ["llms.txt"]) | ("GET", ["skill.md"]) => {
+            return Response {
+                status: 200,
+                content_type: "text/markdown; charset=utf-8",
+                body: AGENT_GUIDE.replace("{URL}", &base_url(&req)),
+            }
+        }
+        ("GET", ["mcp"]) => {
+            return err(405, "this MCP server speaks JSON-RPC over POST (streamable HTTP) — add this URL to your MCP client")
+        }
+        _ => {}
+    }
+
+    // Who is calling. No key is the free tier; a key must be real, and a self-serve key must be
+    // paid up (it switches back on by itself when a payment lands). Checked once, here, before
+    // any handler runs, so no endpoint can forget it.
+    let admin = is_admin_route(&segments);
+    let key = if admin { None } else { req.api_key().map(|k| engine.lock().unwrap().check_key(k, now)) };
+    let customer_id: Option<String> = match key {
+        None => None,
+        Some(KeyCheck::Valid(id)) => Some(id),
+        Some(KeyCheck::Unpaid(id))
+            if matches!((method, segments.as_slice()), ("GET", ["v1", "usage"]) | ("POST", ["v1", "billing", "renew"])) =>
+        {
+            Some(id)
+        }
+        Some(KeyCheck::Unpaid(_)) => {
+            return err(
+                402,
+                "this platform key has no paid time left — renew with POST /v1/billing/renew (it works again \
+                 within a minute of payment), or send no key to use the free tier",
+            )
+        }
+        Some(KeyCheck::Unknown) => return err(401, "that API key isn't valid — send no key to use the free tier"),
+    };
+    if customer_id.is_none() && needs_platform_key(method, &segments) {
+        return err(401, "this needs your platform API key (X-Api-Key) — get one with POST /v1/platforms");
+    }
+    let trusted_source = if matches!((method, segments.as_slice()), ("POST", ["v1", "attestations"])) {
+        match check_trusted_source(engine, &body, now) {
+            Ok(t) => t,
+            Err(r) => return r,
+        }
+    } else {
+        false
+    };
+    if customer_id.is_none() && !admin && !trusted_source && !is_unmetered(method, &segments) {
+        if let Err(r) = free_limit(&req, method != "GET", now) {
             return r;
         }
     }
-    if let ("POST", ["v1", "agents", agent_id, "registrations", "verify"]) = (req.method.as_str(), segments.as_slice()) {
-        return verify_registration(engine, agent_id, &body, now);
-    }
-    let mut engine = engine.lock().unwrap();
 
-    // The paywall. Checked once, here, before any handler runs, so no endpoint can forget it.
-    let customer_id: Option<String> = if is_public(&req.method, &segments) || is_admin_route(&segments) {
-        None
-    } else {
-        match req.api_key().and_then(|k| engine.customer_for_key(k)) {
-            Some(c) => Some(c.id.clone()),
-            None if !cfg.require_api_key => None,
-            None => {
-                return err(
-                    401,
-                    "a valid API key is required — send it as `Authorization: Bearer <key>` or \
-                     `X-Api-Key: <key>`. Keys are issued to paying customers.",
-                )
-            }
+    // Routes that call out to the network run with the engine unlocked.
+    match (method, segments.as_slice()) {
+        ("POST", ["v1", "agents", agent_id, "registrations", "verify"]) => {
+            return verify_registration(engine, agent_id, &body, now)
         }
-    };
+        ("POST", ["mcp"]) => return mcp::handle(engine, &req, &body, cfg),
+        ("POST", ["v1", "platforms"]) => return signup_platform(engine, &req, &body, now),
+        ("POST", ["v1", "billing", "renew"]) => return renew_plan(engine, &req, &body, customer_id.as_deref(), now),
+        ("GET", ["v1", "billing", "invoices", id]) => {
+            check_card_invoice(engine, id, now);
+            let e = engine.lock().unwrap();
+            return match e.invoice(id) {
+                Some(inv) => ok(pay_instructions(&e, inv, now)),
+                None => err(404, "no such invoice"),
+            };
+        }
+        ("GET", ["billing", "done"]) => return billing_done(engine, &req, now),
+        _ => {}
+    }
+
+    let mut engine = engine.lock().unwrap();
+    if let Some(cid) = &customer_id {
+        if is_lookup(method, &segments) {
+            engine.meter_lookup(cid, now);
+        }
+    }
 
     match (req.method.as_str(), segments.as_slice()) {
         ("GET", ["admin"]) => Response::html(ADMIN_PAGE.to_string()),
         ("GET", ["docs"]) => Response::html(DOCS_PAGE.to_string()),
         // A browser gets the home page; a bot or script asking for JSON gets the status below.
         ("GET", []) if req.header("accept").map(|a| a.contains("text/html")).unwrap_or(false) => {
-            Response::html(HOME_PAGE.to_string())
+            let (agents, settled, platforms) = engine.stats();
+            Response::html(
+                HOME_PAGE
+                    .replace("{{agents}}", &agents.to_string())
+                    .replace("{{settled}}", &settled.to_string())
+                    .replace("{{platforms}}", &platforms.to_string())
+                    .replace("{{base}}", &base_url(&req)),
+            )
+        }
+
+        // ---- one-call sign-up for a bot --------------------------------------------------
+        ("POST", ["v1", "register"]) => {
+            if !rate_ok("register", req.client_ip(), FREE_REGISTRATIONS_PER_HOUR, now) {
+                return err(429, "too many new bots from this address this hour — try again later");
+            }
+            let name = match body.get("name").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                Some(n) => n.to_string(),
+                None => format!("bot-{}", &random_hex()[..10]),
+            };
+            let valid = (3..=48).contains(&name.len())
+                && name.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false)
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            if !valid {
+                return err(400, "name must be 3-48 letters, digits, '-', '_' or '.', starting with a letter or digit");
+            }
+            if engine.is_claimed(&name) {
+                return err(409, "that name is taken — pick another, or send no name to get one made up for you");
+            }
+            let secret = format!("ats_{}", random_hex());
+            if let Err(e) = engine.authenticate(&name, Some(&secret)) {
+                return err(409, e);
+            }
+            engine.mark_seen(&name, now);
+            let base = base_url(&req);
+            Response::json(
+                201,
+                Json::obj(vec![
+                    ("agent_id", Json::str(name.clone())),
+                    ("secret", Json::str(secret)),
+                    ("important", Json::str("Save the secret now — it is shown once and proves you are this bot on every call.")),
+                    ("trust_profile", Json::str(format!("{base}/v1/trust/{name}"))),
+                    ("profile_page", Json::str(format!("{base}/trust/{name}"))),
+                    ("badge_markdown", Json::str(format!("[![agenttrust]({base}/v1/trust/{name}/badge.svg)]({base}/trust/{name})"))),
+                    (
+                        "next",
+                        Json::str(format!(
+                            "Open a deal: POST {base}/v1/agreements {{\"parties\":[\"{name}\",\"OTHER_BOT\"],\"secret\":\"YOUR_SECRET\"}}. \
+                             Full guide: {base}/llms.txt"
+                        )),
+                    ),
+                ])
+                .to_string(),
+            )
         }
         ("GET", ["trust"]) | ("GET", ["trust", _]) => Response::html(TRUST_PAGE.to_string()),
 
@@ -558,8 +727,21 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
 
         ("GET", ["v1", "pricing"]) => {
             let mut j = engine.pricing.to_json();
-            if let (Json::Object(m), Some(c)) = (&mut j, contact()) {
-                m.insert("contact".into(), Json::str(c));
+            if let Json::Object(m) = &mut j {
+                if let Some(c) = contact() {
+                    m.insert("contact".into(), Json::str(c));
+                }
+                let methods = autopay::config().methods();
+                m.insert("pay_with".into(), Json::Array(methods.iter().map(|x| Json::str(*x)).collect()));
+                m.insert(
+                    "sign_up".into(),
+                    Json::str(if methods.is_empty() {
+                        "self-serve sign-up is not switched on yet"
+                    } else {
+                        "POST /v1/platforms {\"name\": \"Your platform\", \"pay_with\": \"card\" or \"usdc\"} — the key works as soon as the payment lands"
+                    }),
+                );
+                m.insert("bots".into(), Json::str("free: POST /v1/register, then deals and trust checks with no key"));
             }
             ok(j)
         }
@@ -578,7 +760,9 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         ("GET", ["health"]) | ("GET", []) => ok(Json::obj(vec![
             ("service", Json::str("agenttrust")),
             ("status", Json::str("ok")),
-            ("api_key_required", Json::Bool(cfg.require_api_key)),
+            ("free_tier", Json::str("bots need no key: POST /v1/register, then use every agent endpoint")),
+            ("agent_guide", Json::str("/llms.txt")),
+            ("mcp", Json::str("/mcp")),
             ("pricing", engine.pricing.to_json()),
             ("audit_head", Json::str(engine.audit_head())),
             ("operator_revenue", Json::num(engine.operator_revenue)),
@@ -586,7 +770,11 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 "endpoints",
                 Json::Array(
                     [
+                        "POST /v1/register                   (free, one call: name -> agent_id + secret)",
+                        "POST /mcp                            (MCP server for AI assistants)",
+                        "GET  /llms.txt                       (guide for AI agents)",
                         "POST /v1/agreements",
+                        "POST /v1/agreements/{id}/accept",
                         "POST /v1/agreements/{id}/report",
                         "GET  /v1/agreements/{id}",
                         "GET  /v1/juries",
@@ -609,6 +797,9 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                         "POST /v1/attestations",
                         "GET  /v1/audit?since=0",
                         "GET  /v1/audit/verify",
+                        "POST /v1/platforms                   (platform sign-up, pay by card or USDC)",
+                        "GET  /v1/billing/invoices/{id}",
+                        "POST /v1/billing/renew",
                         "GET  /v1/usage",
                         "GET  /v1/payouts/pending",
                         "POST /v1/agreements/{id}/payout",
@@ -673,6 +864,12 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     engine.set_labels(&id, labels);
                     let a = engine.agreement(&id).unwrap();
                     let other = a.parties[1].clone();
+                    let tier = if customer_id.is_some() {
+                        "platform"
+                    } else {
+                        "free — counts toward both bots' trust (up to 150 points each from free deals); \
+                         deals through a paying platform count in full"
+                    };
                     Response::json(
                         201,
                         Json::obj(vec![
@@ -687,6 +884,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                                      {other} must accept or report within 6 hours, or the agreement cancels with no penalty."
                                 )),
                             ),
+                            ("tier", Json::str(tier)),
                             ("audit_head", Json::str(engine.audit_head())),
                         ])
                         .to_string(),
@@ -1113,6 +1311,304 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
     }
 }
 
+// ---- self-serve platform plans ----------------------------------------------------------------
+
+/// How to pay a bill, in words a bot or a person can act on.
+fn pay_instructions(engine: &Engine, inv: &store::Invoice, now: i64) -> Json {
+    let pay = autopay::config();
+    let mut j = inv.to_json();
+    let active = matches!(
+        engine.customer(&inv.customer_id).map(|c| c.paid_until_ms.map(|t| now < t).unwrap_or(c.active)),
+        Some(true)
+    );
+    if let Json::Object(m) = &mut j {
+        m.insert("key_active".into(), Json::Bool(active));
+        if inv.paid_at_ms.is_none() {
+            let how = match (inv.method.as_str(), &pay.usdc_pay_to) {
+                ("usdc", Some(to)) => {
+                    m.insert("pay_to".into(), Json::str(to.clone()));
+                    m.insert("network".into(), Json::str("Base (chain id 8453)"));
+                    m.insert("token".into(), Json::str(autopay::USDC_BASE));
+                    format!(
+                        "Send exactly {} USDC on Base to {to}. The exact amount, down to the last digit, is how your \
+                         payment is recognized — don't round it. It is picked up automatically within about a minute.",
+                        inv.usdc_amount()
+                    )
+                }
+                _ => "Open checkout_url and pay by card. The plan then renews monthly by itself.".to_string(),
+            };
+            m.insert("how_to_pay".into(), Json::str(how));
+        }
+    }
+    j
+}
+
+/// Attaches a Stripe Checkout page to a card bill — a network call, so made with the engine
+/// unlocked.
+fn attach_checkout(engine: &Mutex<Engine>, req: &Request, invoice_id: &str) -> Result<(), Response> {
+    let (inv, plan_mills) = {
+        let e = engine.lock().unwrap();
+        (e.invoice(invoice_id).cloned(), e.pricing.monthly_mills)
+    };
+    let Some(inv) = inv else { return Err(err(404, "no such invoice")) };
+    if inv.method != "card" || inv.checkout_url.is_some() {
+        return Ok(());
+    }
+    let extra_cents = (inv.mills - plan_mills).max(0) / 10;
+    let (session, url) = autopay::stripe_checkout(
+        autopay::config(),
+        &base_url(req),
+        &inv.id,
+        &inv.customer_id,
+        plan_mills / 10,
+        extra_cents,
+    )
+    .map_err(|e| err(502, &e))?;
+    engine.lock().unwrap().set_checkout(&inv.id, &session, &url);
+    Ok(())
+}
+
+fn pay_with<'a>(body: &'a Json) -> Result<&'a str, Response> {
+    let methods = autopay::config().methods();
+    if methods.is_empty() {
+        let mut msg = "self-serve sign-up is not switched on here yet".to_string();
+        if let Some(c) = contact() {
+            msg.push_str(&format!(" — contact {c}"));
+        }
+        return Err(err(503, &msg));
+    }
+    let method = body.get("pay_with").and_then(|v| v.as_str()).unwrap_or(methods[0]);
+    let method = if method == "stripe" { "card" } else { method };
+    methods
+        .iter()
+        .find(|m| **m == method)
+        .copied()
+        .ok_or_else(|| err(400, &format!("pay_with must be one of: {}", methods.join(", "))))
+}
+
+/// `POST /v1/platforms` — a platform signs itself up. Its key comes back at once and starts
+/// working the moment the first payment lands; nobody has to approve anything.
+fn signup_platform(engine: &Mutex<Engine>, req: &Request, body: &Json, now: i64) -> Response {
+    let method = match pay_with(body) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let Some(name) = body.get("name").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty() && s.len() <= 80)
+    else {
+        return err(400, "name is required — your platform's name, up to 80 characters");
+    };
+    if !rate_ok("signup", req.client_ip(), 5, now) {
+        return err(429, "too many sign-ups from this address — try again in an hour");
+    }
+    let key = format!("at_live_{}", random_hex());
+    let (customer_id, invoice_id) = {
+        let mut e = engine.lock().unwrap();
+        if e.unpaid_signups() >= 500 {
+            return err(503, "too many unpaid sign-ups right now — try again later");
+        }
+        let cid = e.create_self_serve(name, &key, now);
+        match e.open_invoice(&cid, method, now) {
+            Ok(inv) => (cid, inv),
+            Err(m) => return err(503, m),
+        }
+    };
+    if let Err(r) = attach_checkout(engine, req, &invoice_id) {
+        return r;
+    }
+    let e = engine.lock().unwrap();
+    let inv = e.invoice(&invoice_id).expect("just created");
+    Response::json(
+        201,
+        Json::obj(vec![
+            ("customer_id", Json::str(customer_id)),
+            ("api_key", Json::str(key)),
+            (
+                "important",
+                Json::str("Save the api_key now — it is shown once. It starts working as soon as the payment below lands."),
+            ),
+            ("invoice", pay_instructions(&e, inv, now)),
+            ("check_payment", Json::str(format!("GET /v1/billing/invoices/{invoice_id}"))),
+        ])
+        .to_string(),
+    )
+}
+
+/// `POST /v1/billing/renew` — the next period's bill. A card plan renews by itself, so this is
+/// for USDC plans, or for a card plan whose subscription was cancelled.
+fn renew_plan(engine: &Mutex<Engine>, req: &Request, body: &Json, customer_id: Option<&str>, now: i64) -> Response {
+    let Some(cid) = customer_id else { return err(401, "send your platform API key") };
+    let method = match pay_with(body) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    if !rate_ok("renew", cid, 10, now) {
+        return err(429, "too many renewal bills this hour — pay one of the open ones");
+    }
+    let invoice_id = {
+        let mut e = engine.lock().unwrap();
+        if method == "card" && e.customer(cid).map(|c| c.stripe_subscription.is_some()).unwrap_or(false) {
+            let c = e.customer(cid).unwrap();
+            return ok(Json::obj(vec![
+                ("message", Json::str("Your card plan renews by itself every month — nothing to do.")),
+                ("statement", e.statement_json(c, now)),
+            ]));
+        }
+        match e.open_invoice(cid, method, now) {
+            Ok(i) => i,
+            Err(m) => return err(409, m),
+        }
+    };
+    if let Err(r) = attach_checkout(engine, req, &invoice_id) {
+        return r;
+    }
+    let e = engine.lock().unwrap();
+    Response::json(201, pay_instructions(&e, e.invoice(&invoice_id).expect("just created"), now).to_string())
+}
+
+/// Asks Stripe whether a card bill's checkout was paid, and if so switches the key on and links
+/// the subscription that renews it. Cheap to call often: a paid or non-card bill returns at once.
+fn check_card_invoice(engine: &Mutex<Engine>, invoice_id: &str, now: i64) -> bool {
+    let (session, customer_id) = {
+        let e = engine.lock().unwrap();
+        match e.invoice(invoice_id) {
+            Some(inv) if inv.paid_at_ms.is_some() => return true,
+            Some(inv) if inv.method == "card" => match &inv.stripe_session {
+                Some(s) => (s.clone(), inv.customer_id.clone()),
+                None => return false,
+            },
+            _ => return false,
+        }
+    };
+    if !rate_ok("stripe-check", invoice_id, 120, now) {
+        return false;
+    }
+    match autopay::stripe_session_paid(autopay::config(), &session) {
+        Ok(Some((stripe_customer, subscription, stripe_invoice))) => {
+            let mut e = engine.lock().unwrap();
+            e.link_stripe(&customer_id, &stripe_customer, &subscription);
+            e.pay_invoice(invoice_id, &stripe_invoice, now).is_ok()
+        }
+        Ok(None) => false,
+        Err(e) => {
+            eprintln!("agenttrust: checking {invoice_id} with Stripe failed: {e}");
+            false
+        }
+    }
+}
+
+/// Where Stripe sends a platform back after checkout.
+fn billing_done(engine: &Mutex<Engine>, req: &Request, now: i64) -> Response {
+    let id = req.q("invoice").filter(|i| i.starts_with("inv_") && i[4..].chars().all(|c| c.is_ascii_digit()));
+    let paid = id.map(|i| check_card_invoice(engine, i, now)).unwrap_or(false);
+    let (title, text, refresh) = match (id, paid) {
+        (None, _) => ("Nothing to show", "This link is missing its invoice.", ""),
+        (Some(_), true) => ("Payment received", "Your API key is active now. You can close this page.", ""),
+        (Some(_), false) if req.q("cancelled").is_some() => {
+            ("Checkout cancelled", "Nothing was charged. Your key will start working once a payment goes through.", "")
+        }
+        (Some(_), false) => (
+            "Waiting for payment",
+            "This page checks again every few seconds. Your key switches on by itself as soon as the payment clears.",
+            "<meta http-equiv=\"refresh\" content=\"5\">",
+        ),
+    };
+    Response::html(format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" \
+         content=\"width=device-width, initial-scale=1\">{refresh}<title>{title}</title><style>body{{font:16px/1.5 \
+         -apple-system,system-ui,sans-serif;max-width:520px;margin:48px auto;padding:0 16px;color:#1b1d1f;\
+         background:#f6f6f3}}@media(prefers-color-scheme:dark){{body{{background:#121416;color:#e8e9ea}}}}\
+         a{{color:#3b5bdb}}</style></head><body><h1>{title}</h1><p>{text}</p><p><a href=\"/\">agenttrust</a></p>\
+         </body></html>"
+    ))
+}
+
+/// The one background job: advances deadlines, and watches for payments by card and in USDC.
+/// Every twenty seconds; nothing in it ever waits on a person.
+fn background(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
+    let pay = autopay::config();
+    let mut tick: u64 = 0;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        tick += 1;
+        let now = now_ms();
+        let before = engine.lock().unwrap().audit_len();
+        let mut dirty = false;
+
+        engine.lock().unwrap().sweep(now);
+
+        if pay.usdc_pay_to.is_some() {
+            let (cursor, open) = {
+                let e = engine.lock().unwrap();
+                (e.usdc_cursor, e.open_usdc_invoices(now))
+            };
+            if open.is_empty() {
+                if cursor != 0 {
+                    engine.lock().unwrap().usdc_cursor = 0;
+                    dirty = true;
+                }
+            } else {
+                match autopay::usdc_transfers(pay, cursor) {
+                    Ok((next, transfers)) => {
+                        let mut e = engine.lock().unwrap();
+                        for (reference, units) in transfers {
+                            if e.payment_seen(&reference) {
+                                continue;
+                            }
+                            if let Some((id, _)) = open.iter().find(|(_, u)| *u == units) {
+                                if let Err(m) = e.pay_invoice(id, &reference, now) {
+                                    eprintln!("agenttrust: could not apply {reference}: {m}");
+                                }
+                            }
+                        }
+                        e.usdc_cursor = next;
+                        dirty = true;
+                    }
+                    Err(m) => eprintln!("agenttrust: USDC watcher: {m}"),
+                }
+            }
+        }
+
+        if pay.stripe_key.is_some() {
+            let open = engine.lock().unwrap().open_card_invoices(now);
+            for (id, _) in open {
+                check_card_invoice(engine, &id, now);
+            }
+            if tick % 15 == 1 {
+                let plans = engine.lock().unwrap().stripe_plans();
+                for (cid, stripe_customer, subscription) in plans {
+                    match autopay::stripe_paid_invoices(pay, &subscription) {
+                        Ok(paid) => {
+                            let mut e = engine.lock().unwrap();
+                            for (inv, cents, period_end) in paid {
+                                let _ = e.record_renewal(&cid, &inv, cents * 10, period_end, now);
+                            }
+                        }
+                        Err(m) => eprintln!("agenttrust: Stripe renewals for {cid}: {m}"),
+                    }
+                    let over = engine.lock().unwrap().overage_to_invoice(&cid);
+                    if over >= 1_000 {
+                        match autopay::stripe_add_overage(pay, &stripe_customer, over / 10) {
+                            Ok(()) => {
+                                engine.lock().unwrap().mark_overage_invoiced(&cid, over);
+                                dirty = true;
+                            }
+                            Err(m) => eprintln!("agenttrust: Stripe overage for {cid}: {m}"),
+                        }
+                    }
+                }
+            }
+        }
+
+        if tick % 180 == 0 && engine.lock().unwrap().prune_unpaid(now) > 0 {
+            dirty = true;
+        }
+        let e = engine.lock().unwrap();
+        if dirty || e.audit_len() != before {
+            save(&e, path);
+        }
+    }
+}
+
 fn parse_event(name: &str) -> Option<trust::ScoreEvent> {
     match name {
         "cleared_cleanly" => Some(trust::ScoreEvent::ClearedCleanly),
@@ -1127,9 +1623,6 @@ fn parse_event(name: &str) -> Option<trust::ScoreEvent> {
 
 fn main() -> std::io::Result<()> {
     let cfg = Config::from_env();
-    if !cfg.require_api_key {
-        println!("agenttrust: REQUIRE_API_KEY is off — anyone can use this service without paying.");
-    }
     if cfg.allow_clock_override {
         println!("agenttrust: ALLOW_CLOCK_OVERRIDE is on — callers can fast-forward deadlines. Never in production.");
     }
@@ -1153,18 +1646,31 @@ fn main() -> std::io::Result<()> {
 
     let mut engine = load_or_new(&path, &admin_secret);
     engine.pricing = billing::Pricing::from_env();
+    for ts in trusted_sources() {
+        engine.reserved_prefixes.push(ts.name.clone());
+        if engine.source_standing(&ts.name) != ts.standing {
+            engine.register_source(&ts.name, ts.standing, now_ms());
+        }
+        println!("agenttrust: trusted source {} (standing {}) at {}", ts.name, ts.standing, ts.url);
+    }
+    let pay = autopay::config();
+    println!(
+        "agenttrust: self-serve payments: {}",
+        if pay.methods().is_empty() { "off (set USDC_PAY_TO and/or STRIPE_SECRET_KEY)".to_string() } else { pay.methods().join(" + ") }
+    );
     let engine: &'static Mutex<Engine> = Box::leak(Box::new(Mutex::new(engine)));
     let path: &'static std::path::Path = Box::leak(path.into_boxed_path());
 
+    std::thread::spawn(move || background(engine, path));
+
     http::serve(&addr, move |req| {
-        let mutating = req.method != "GET";
-        let before = if mutating { engine.lock().unwrap().audit_len() } else { 0 };
+        // Reads can change state too (a status check that finds a payment), so every request
+        // is checked the same way: save when the audit log grew.
+        let before = engine.lock().unwrap().audit_len();
         let response = route(engine, req, cfg);
-        if mutating {
-            let after = engine.lock().unwrap().audit_len();
-            if after != before {
-                save(&engine.lock().unwrap(), path);
-            }
+        let e = engine.lock().unwrap();
+        if e.audit_len() != before {
+            save(&e, path);
         }
         response
     })
@@ -1175,7 +1681,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    const PROD: Config = Config { require_api_key: true, allow_clock_override: false };
+    const PROD: Config = Config { allow_clock_override: false };
 
     fn req(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Request {
         Request {
@@ -1191,6 +1697,10 @@ mod tests {
         Mutex::new(Engine::with_admin_secret("adm"))
     }
 
+    fn body_json(r: &Response) -> Json {
+        json::parse(&r.body).unwrap_or_else(|e| panic!("{e}: {}", r.body))
+    }
+
     fn new_key(e: &Mutex<Engine>) -> String {
         let r = route(e, req("POST", "/v1/customers", &[("X-Admin-Secret", "adm")], r#"{"name":"Arena"}"#), PROD);
         assert_eq!(r.status, 201, "{}", r.body);
@@ -1198,12 +1708,163 @@ mod tests {
     }
 
     #[test]
-    fn paid_endpoints_refuse_callers_without_a_key() {
+    fn bots_need_no_key_but_a_bad_key_and_platform_endpoints_are_refused() {
         let e = engine();
-        let r = route(&e, req("GET", "/v1/agents/alice", &[], ""), PROD);
-        assert_eq!(r.status, 401);
+        assert_eq!(route(&e, req("GET", "/v1/agents/alice", &[], ""), PROD).status, 200, "free tier");
         let r = route(&e, req("GET", "/v1/agents/alice", &[("X-Api-Key", "at_live_made_up")], ""), PROD);
         assert_eq!(r.status, 401, "a guessed key is not a key");
+        for path in ["/v1/usage", "/v1/payouts/pending"] {
+            assert_eq!(route(&e, req("GET", path, &[], ""), PROD).status, 401, "{path} is per platform");
+        }
+    }
+
+    #[test]
+    fn one_call_registration_then_a_free_deal_settles_and_scores() {
+        let e = engine();
+        let r = route(&e, req("POST", "/v1/register", &[], r#"{"name":"alice-bot"}"#), PROD);
+        assert_eq!(r.status, 201, "{}", r.body);
+        let a = json::parse(&r.body).unwrap();
+        let alice_secret = a.get("secret").unwrap().as_str().unwrap().to_string();
+        assert!(a.get("badge_markdown").unwrap().as_str().unwrap().contains("/v1/trust/alice-bot/badge.svg"));
+        assert_eq!(route(&e, req("POST", "/v1/register", &[], r#"{"name":"alice-bot"}"#), PROD).status, 409, "taken");
+        assert_eq!(route(&e, req("POST", "/v1/register", &[], r#"{"name":"<x>"}"#), PROD).status, 400);
+        let r = route(&e, req("POST", "/v1/register", &[], ""), PROD);
+        let bob = json::parse(&r.body).unwrap();
+        let bob_id = bob.get("agent_id").unwrap().as_str().unwrap().to_string();
+        let bob_secret = bob.get("secret").unwrap().as_str().unwrap().to_string();
+        assert!(bob_id.starts_with("bot-"));
+
+        let open = format!(r#"{{"parties":["alice-bot","{bob_id}"],"secret":"{alice_secret}"}}"#);
+        let r = route(&e, req("POST", "/v1/agreements", &[], &open), PROD);
+        assert_eq!(r.status, 201, "{}", r.body);
+        let agr = json::parse(&r.body).unwrap();
+        assert!(agr.get("tier").unwrap().as_str().unwrap().starts_with("free"));
+        let id = agr.get("agreement_id").unwrap().as_str().unwrap().to_string();
+        let rep = |who: &str, secret: &str| {
+            let b = format!(r#"{{"agent_id":"{who}","outcome":0,"secret":"{secret}"}}"#);
+            json::parse(&route(&e, req("POST", &format!("/v1/agreements/{id}/report"), &[], &b), PROD).body).unwrap()
+        };
+        rep("alice-bot", &alice_secret);
+        assert_eq!(rep(&bob_id, &bob_secret).get("result").unwrap().as_str(), Some("settled"));
+        let p = body_json(&route(&e, req("GET", "/v1/trust/alice-bot", &[], ""), PROD));
+        assert!(p.get("score").unwrap().as_f().unwrap() > 100.0);
+        assert_eq!(p.get("history").unwrap().get("platforms").unwrap().as_f(), Some(0.0), "free deals are no platform");
+    }
+
+    #[test]
+    fn a_platform_signs_itself_up_and_its_key_switches_on_and_off_with_payment() {
+        let e = engine();
+        let r = route(&e, req("POST", "/v1/platforms", &[], r#"{"name":"Acme","pay_with":"usdc"}"#), PROD);
+        assert_eq!(r.status, 201, "{}", r.body);
+        let j = json::parse(&r.body).unwrap();
+        let key = j.get("api_key").unwrap().as_str().unwrap().to_string();
+        let inv = j.get("invoice").unwrap();
+        let inv_id = inv.get("invoice_id").unwrap().as_str().unwrap().to_string();
+        let amount = inv.get("usdc_amount").unwrap().as_str().unwrap().to_string();
+        assert!(amount.starts_with("29.000") && amount != "29.000000", "{amount}");
+        assert!(inv.get("how_to_pay").unwrap().as_str().unwrap().contains(&amount));
+        assert_eq!(route(&e, req("POST", "/v1/platforms", &[], r#"{"name":"x","pay_with":"gold"}"#), PROD).status, 400);
+
+        let k = [("X-Api-Key", key.as_str())];
+        assert_eq!(route(&e, req("GET", "/v1/trust/a", &k, ""), PROD).status, 402, "not paid yet");
+        assert_eq!(route(&e, req("GET", "/v1/usage", &k, ""), PROD).status, 200, "can still see its bill");
+
+        let now = now_ms();
+        e.lock().unwrap().pay_invoice(&inv_id, "0xabc:1", now).unwrap();
+        e.lock().unwrap().pay_invoice(&inv_id, "0xabc:1", now).unwrap();
+        assert_eq!(route(&e, req("GET", "/v1/trust/a", &k, ""), PROD).status, 200, "paid");
+        let st = body_json(&route(&e, req("GET", &format!("/v1/billing/invoices/{inv_id}"), &[], ""), PROD));
+        assert_eq!(st.get("status").unwrap().as_str(), Some("paid"));
+        assert_eq!(st.get("key_active"), Some(&Json::Bool(true)));
+        let usage = body_json(&route(&e, req("GET", "/v1/usage", &k, ""), PROD));
+        let statement = usage.get("statement").unwrap();
+        assert_eq!(statement.get("paid_usd").unwrap().as_f().unwrap().round(), 29.0, "credited once");
+        assert!(statement.get("balance_usd").unwrap().as_f().unwrap().abs() < 0.01);
+
+        // A deal through a paid key counts as a platform.
+        let r = route(&e, req("POST", "/v1/agreements", &k, r#"{"parties":["p1","p2"],"secret":"s"}"#), PROD);
+        assert_eq!(json::parse(&r.body).unwrap().get("tier").unwrap().as_str(), Some("platform"));
+
+        // Renewal opens a fresh bill with a different exact amount.
+        let r = route(&e, req("POST", "/v1/billing/renew", &k, r#"{"pay_with":"usdc"}"#), PROD);
+        assert_eq!(r.status, 201, "{}", r.body);
+        assert_ne!(json::parse(&r.body).unwrap().get("usdc_amount").unwrap().as_str(), Some(amount.as_str()));
+
+        // Past its paid time the key stops by itself.
+        let later = Config { allow_clock_override: true };
+        let far = format!(r#"{{"now_ms":{}}}"#, now + 40 * 24 * 60 * 60 * 1000);
+        assert_eq!(route(&e, req("POST", "/v1/sweep", &k, &far), later).status, 402);
+    }
+
+    #[test]
+    fn unpaid_signups_are_cleared_after_a_week() {
+        let e = engine();
+        route(&e, req("POST", "/v1/platforms", &[], r#"{"name":"Ghost"}"#), PROD);
+        let mut g = e.lock().unwrap();
+        assert_eq!(g.unpaid_signups(), 1);
+        assert_eq!(g.prune_unpaid(now_ms() + 8 * 24 * 60 * 60 * 1000), 1);
+        assert_eq!(g.unpaid_signups(), 0);
+    }
+
+    #[test]
+    fn the_mcp_server_lists_and_runs_tools() {
+        let e = engine();
+        let call = |body: &str| body_json(&route(&e, req("POST", "/mcp", &[], body), PROD));
+        let init = call(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#);
+        assert_eq!(init.get("result").unwrap().get("serverInfo").unwrap().get("name").unwrap().as_str(), Some("agenttrust"));
+        assert_eq!(route(&e, req("POST", "/mcp", &[], r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#), PROD).status, 202);
+        let list = call(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+        let Some(Json::Array(tools)) = list.get("result").unwrap().get("tools") else { panic!() };
+        assert!(tools.len() >= 8);
+        let reg = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"register","arguments":{"name":"mcp-bot"}}}"#);
+        let result = reg.get("result").unwrap();
+        assert_eq!(result.get("isError"), Some(&Json::Bool(false)));
+        let Some(Json::Array(content)) = result.get("content") else { panic!() };
+        assert!(content[0].get("text").unwrap().as_str().unwrap().contains("\"agent_id\":\"mcp-bot\""));
+        let t = call(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"check_trust","arguments":{"agent_id":"mcp-bot"}}}"#);
+        assert_eq!(t.get("result").unwrap().get("isError"), Some(&Json::Bool(false)));
+        let bad = call(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"deal_status","arguments":{"agreement_id":"../x"}}}"#);
+        assert_eq!(bad.get("result").unwrap().get("isError"), Some(&Json::Bool(true)));
+    }
+
+    #[test]
+    fn the_agent_guide_names_this_host() {
+        let e = engine();
+        let r = route(&e, req("GET", "/llms.txt", &[("Host", "trust.example.com")], ""), PROD);
+        assert!(r.content_type.starts_with("text/markdown"));
+        assert!(r.body.contains("https://trust.example.com/v1/register"));
+        assert!(!r.body.contains("{URL}"));
+    }
+
+    #[test]
+    fn a_trusted_partner_proves_itself_by_its_domain_and_its_player_ids_are_reserved() {
+        let e = engine();
+        e.lock().unwrap().reserved_prefixes.push("arena".into());
+        e.lock().unwrap().register_source("arena", 600, 0);
+        let hash = hash::sha256_hex(b"arena-secret");
+        source_hash_cache().lock().unwrap().insert("arena".into(), (hash, now_ms()));
+        let att = |secret: &str, event: &str| {
+            let b = format!(r#"{{"source":"arena","secret":"{secret}","subject":"arena.alice","event":"{event}","domain":"wagering"}}"#);
+            route(&e, req("POST", "/v1/attestations", &[], &b), PROD)
+        };
+        assert_eq!(att("wrong", "cleared_cleanly").status, 401);
+        assert_eq!(att("arena-secret", "cleared_cleanly").status, 200);
+        let p = body_json(&route(&e, req("GET", "/v1/trust/arena.alice", &[], ""), PROD));
+        assert!(p.get("score").unwrap().as_f().unwrap() > 100.0);
+        assert_eq!(p.get("known"), Some(&Json::Bool(true)));
+        // Nobody can grab a player's name or the partner's own.
+        assert_eq!(route(&e, req("POST", "/v1/register", &[], r#"{"name":"arena.bob"}"#), PROD).status, 409);
+        assert_eq!(route(&e, req("POST", "/v1/register", &[], r#"{"name":"arena"}"#), PROD).status, 409);
+        assert_eq!(route(&e, req("POST", "/v1/register", &[], r#"{"name":"arenaboss"}"#), PROD).status, 201);
+        // A partner lifts a player only so far; a loss still counts.
+        for _ in 0..200 {
+            att("arena-secret", "cleared_cleanly");
+        }
+        let capped = body_json(&route(&e, req("GET", "/v1/trust/arena.alice", &[], ""), PROD)).get("score").unwrap().as_f().unwrap();
+        assert!(capped <= 100.0 + store::PLATFORM_CAP as f64, "{capped}");
+        att("arena-secret", "ghosted");
+        let after = body_json(&route(&e, req("GET", "/v1/trust/arena.alice", &[], ""), PROD)).get("score").unwrap().as_f().unwrap();
+        assert!(after < capped);
     }
 
     #[test]
@@ -1271,7 +1932,7 @@ mod settlement_tests {
     use super::*;
     use std::collections::HashMap;
 
-    const PROD: Config = Config { require_api_key: true, allow_clock_override: false };
+    const PROD: Config = Config { allow_clock_override: false };
 
     fn req(method: &str, path: &str, key: &str, body: &str) -> Request {
         let mut headers = HashMap::new();
@@ -1369,8 +2030,8 @@ mod settlement_tests {
         assert_eq!(b.content_type, "image/svg+xml");
         assert!(b.body.contains("✓"));
         assert_eq!(route(&e, req("GET", "/trust/walletbot", "", ""), PROD).status, 200);
-        // The settlement API itself stays paid.
-        assert_eq!(route(&e, req("GET", "/v1/agents/walletbot", "", ""), PROD).status, 401);
+        // Payouts are per platform.
+        assert_eq!(route(&e, req("GET", "/v1/payouts/pending", "", ""), PROD).status, 401);
     }
 
     #[test]

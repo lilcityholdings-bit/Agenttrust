@@ -354,6 +354,17 @@ pub struct Customer {
     pub revoked_at_ms: Option<i64>,
     /// Revoked for farming: every point it handed out was taken back.
     pub purged: bool,
+    /// Self-serve plans only: the key works until this moment and stops by itself after it —
+    /// no one has to flip anything. `None` is an operator-issued key with no expiry.
+    pub paid_until_ms: Option<i64>,
+    /// Self-serve plans only: plan fees charged so far (one per paid period), so a statement
+    /// can say what is owed without assuming calendar months line up with paid periods.
+    pub plan_charged_mills: i64,
+    /// Card plans only: the Stripe customer and subscription that renew this plan.
+    pub stripe_customer: Option<String>,
+    pub stripe_subscription: Option<String>,
+    /// Card plans only: overage already added to the next Stripe invoice.
+    pub overage_invoiced_mills: i64,
 }
 
 impl Customer {
@@ -410,6 +421,11 @@ impl Customer {
             ),
             ("revoked_at_ms", self.revoked_at_ms.map(|t| Json::num(t as f64)).unwrap_or(Json::Null)),
             ("purged", Json::Bool(self.purged)),
+            ("paid_until_ms", self.paid_until_ms.map(|t| Json::num(t as f64)).unwrap_or(Json::Null)),
+            ("plan_charged_mills", Json::num(self.plan_charged_mills as f64)),
+            ("stripe_customer", self.stripe_customer.clone().map(Json::str).unwrap_or(Json::Null)),
+            ("stripe_subscription", self.stripe_subscription.clone().map(Json::str).unwrap_or(Json::Null)),
+            ("overage_invoiced_mills", Json::num(self.overage_invoiced_mills as f64)),
         ])
     }
 
@@ -444,9 +460,114 @@ impl Customer {
             },
             revoked_at_ms: j.get("revoked_at_ms").and_then(|v| v.as_f()).map(|t| t as i64),
             purged: matches!(j.get("purged"), Some(Json::Bool(true))),
+            paid_until_ms: j.get("paid_until_ms").and_then(|v| v.as_f()).map(|t| t as i64),
+            plan_charged_mills: j.get("plan_charged_mills").and_then(|v| v.as_f()).unwrap_or(0.0) as i64,
+            stripe_customer: j.get("stripe_customer").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            stripe_subscription: j.get("stripe_subscription").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            overage_invoiced_mills: j.get("overage_invoiced_mills").and_then(|v| v.as_f()).unwrap_or(0.0) as i64,
         })
     }
+
+    /// A self-serve plan: paid for by card or USDC, and switched on and off by payments alone.
+    pub fn self_serve(&self) -> bool {
+        self.paid_until_ms.is_some()
+    }
 }
+
+/// A bill a self-serve platform can pay, by card (a Stripe Checkout page) or in USDC on Base (an
+/// exact amount sent to the operator's wallet — the odd last digits are what identify the payer,
+/// so no memo or account is needed).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Invoice {
+    pub id: String,
+    pub customer_id: String,
+    /// "card" or "usdc".
+    pub method: String,
+    pub mills: i64,
+    /// USDC has 6 decimals: 1 mill is 1,000 units. Zero for a card invoice.
+    pub usdc_units: u64,
+    pub stripe_session: Option<String>,
+    pub checkout_url: Option<String>,
+    pub created_at_ms: i64,
+    pub paid_at_ms: Option<i64>,
+    pub reference: Option<String>,
+}
+
+impl Invoice {
+    fn to_snapshot_json(&self) -> Json {
+        let opt = |v: &Option<String>| v.clone().map(Json::str).unwrap_or(Json::Null);
+        Json::obj(vec![
+            ("id", Json::str(self.id.clone())),
+            ("customer_id", Json::str(self.customer_id.clone())),
+            ("method", Json::str(self.method.clone())),
+            ("mills", Json::num(self.mills as f64)),
+            ("usdc_units", Json::num(self.usdc_units as f64)),
+            ("stripe_session", opt(&self.stripe_session)),
+            ("checkout_url", opt(&self.checkout_url)),
+            ("created_at_ms", Json::num(self.created_at_ms as f64)),
+            ("paid_at_ms", self.paid_at_ms.map(|t| Json::num(t as f64)).unwrap_or(Json::Null)),
+            ("reference", opt(&self.reference)),
+        ])
+    }
+
+    fn from_snapshot_json(j: &Json) -> Option<Invoice> {
+        let s = |k: &str| j.get(k).and_then(|v| v.as_str()).map(|v| v.to_string());
+        Some(Invoice {
+            id: s("id")?,
+            customer_id: s("customer_id")?,
+            method: s("method")?,
+            mills: j.get("mills")?.as_f()? as i64,
+            usdc_units: j.get("usdc_units").and_then(|v| v.as_f()).unwrap_or(0.0) as u64,
+            stripe_session: s("stripe_session"),
+            checkout_url: s("checkout_url"),
+            created_at_ms: j.get("created_at_ms")?.as_f()? as i64,
+            paid_at_ms: j.get("paid_at_ms").and_then(|v| v.as_f()).map(|t| t as i64),
+            reference: s("reference"),
+        })
+    }
+
+    /// USDC units as a decimal string, e.g. 29000437 -> "29.000437".
+    pub fn usdc_amount(&self) -> String {
+        format!("{}.{:06}", self.usdc_units / 1_000_000, self.usdc_units % 1_000_000)
+    }
+
+    /// What a caller polling for payment sees.
+    pub fn to_json(&self) -> Json {
+        let mut fields = vec![
+            ("invoice_id", Json::str(self.id.clone())),
+            ("customer_id", Json::str(self.customer_id.clone())),
+            ("method", Json::str(self.method.clone())),
+            ("usd", billing::usd(self.mills)),
+            ("status", Json::str(if self.paid_at_ms.is_some() { "paid" } else { "unpaid" })),
+            ("paid_at_ms", self.paid_at_ms.map(|t| Json::num(t as f64)).unwrap_or(Json::Null)),
+            ("reference", self.reference.clone().map(Json::str).unwrap_or(Json::Null)),
+        ];
+        if self.method == "usdc" {
+            fields.push(("usdc_amount", Json::str(self.usdc_amount())));
+        }
+        if let Some(url) = &self.checkout_url {
+            fields.push(("checkout_url", Json::str(url.clone())));
+        }
+        Json::obj(fields)
+    }
+}
+
+/// What an API key turned out to be.
+pub enum KeyCheck {
+    /// A working key, for this customer.
+    Valid(String),
+    /// A self-serve key whose paid time has run out (or was never paid): it works again the
+    /// moment a payment lands.
+    Unpaid(String),
+    /// Not a key this service issued, or one the operator revoked.
+    Unknown,
+}
+
+/// How long one paid period of a self-serve plan lasts.
+pub const PLAN_PERIOD_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// How long an unpaid sign-up (and its invoice) is kept before it is cleared away.
+pub const UNPAID_SIGNUP_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 pub struct Payout {
@@ -593,6 +714,14 @@ pub struct Engine {
     audit: Vec<AuditEntry>,
     pub operator_revenue: f64,
     next_id: u64,
+    /// Self-serve bills, by id.
+    invoices: HashMap<String, Invoice>,
+    next_invoice_id: u64,
+    /// The last Base block the USDC watcher has scanned.
+    pub usdc_cursor: u64,
+    /// Id prefixes no one can claim by trust-on-first-use, because an outside source reports
+    /// about ids under them (e.g. `arena.` for Agent Arena players). Set at boot, not persisted.
+    pub reserved_prefixes: Vec<String>,
 }
 
 impl Default for Engine {
@@ -644,6 +773,10 @@ impl Engine {
             audit: Vec::new(),
             operator_revenue: 0.0,
             next_id: 1,
+            invoices: HashMap::new(),
+            next_invoice_id: 1,
+            usdc_cursor: 0,
+            reserved_prefixes: Vec::new(),
         }
     }
 
@@ -667,6 +800,9 @@ impl Engine {
                 None => Err("this id is already claimed — include its secret"),
             },
             None => match secret {
+                Some(_) if self.reserved_prefixes.iter().any(|p| id == p || id.strip_prefix(p.as_str()).map_or(false, |r| r.starts_with('.'))) => {
+                    Err("ids starting with that prefix are reserved for a partner service's players")
+                }
                 Some(given) => {
                     self.agent_secrets.insert(id.to_string(), sha256_hex(given.as_bytes()));
                     Ok(())
@@ -708,6 +844,11 @@ impl Engine {
                 payments: Vec::new(),
                 revoked_at_ms: None,
                 purged: false,
+                paid_until_ms: None,
+                plan_charged_mills: 0,
+                stripe_customer: None,
+                stripe_subscription: None,
+                overage_invoiced_mills: 0,
             },
         );
         self.append(
@@ -718,7 +859,9 @@ impl Engine {
         id
     }
 
-    /// The active customer a raw API key belongs to, if any.
+    /// The active customer a raw API key belongs to, if any, ignoring paid time — the live
+    /// check is [`Engine::check_key`].
+    #[cfg(test)]
     pub fn customer_for_key(&self, raw_key: &str) -> Option<&Customer> {
         let hash = sha256_hex(raw_key.as_bytes());
         self.customers.values().find(|c| c.active && c.key_hash == hash)
@@ -732,6 +875,260 @@ impl Engine {
         let mut all: Vec<&Customer> = self.customers.values().collect();
         all.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms).then(a.id.cmp(&b.id)));
         all
+    }
+
+    // ---- self-serve plans (no operator in the loop) -------------------------------------------
+    //
+    // A platform signs itself up, gets its key at once, and the key starts working the moment a
+    // payment lands — by card through Stripe, or in USDC on Base. Each payment buys one period;
+    // when paid time runs out the key simply stops counting as a platform until the next payment.
+    // Nothing here needs the operator to approve, record or switch anything.
+
+    /// Creates a self-serve customer whose key does nothing until its first payment.
+    pub fn create_self_serve(&mut self, name: &str, raw_key: &str, now_ms: i64) -> String {
+        let id = self.create_customer(name, raw_key, now_ms);
+        if let Some(c) = self.customers.get_mut(&id) {
+            c.paid_until_ms = Some(now_ms);
+        }
+        id
+    }
+
+    /// Checks a key, telling a lapsed self-serve key apart from one that never existed.
+    pub fn check_key(&self, raw_key: &str, now_ms: i64) -> KeyCheck {
+        let hash = sha256_hex(raw_key.as_bytes());
+        match self.customers.values().find(|c| c.active && c.key_hash == hash) {
+            None => KeyCheck::Unknown,
+            Some(c) if c.paid_until_ms.map(|t| now_ms < t).unwrap_or(true) => KeyCheck::Valid(c.id.clone()),
+            Some(c) => KeyCheck::Unpaid(c.id.clone()),
+        }
+    }
+
+    /// Unpaid sign-ups right now — capped, so free sign-ups can't be used to fill memory.
+    pub fn unpaid_signups(&self) -> usize {
+        self.customers.values().filter(|c| c.self_serve() && c.payments.is_empty() && c.active).count()
+    }
+
+    /// Clears sign-ups that never paid, with their invoices. They never did anything (an unpaid
+    /// key can't open agreements), so nothing else refers to them.
+    pub fn prune_unpaid(&mut self, now_ms: i64) -> usize {
+        let stale: Vec<String> = self
+            .customers
+            .values()
+            .filter(|c| c.self_serve() && c.payments.is_empty() && now_ms - c.created_at_ms > UNPAID_SIGNUP_TTL_MS)
+            .map(|c| c.id.clone())
+            .collect();
+        for id in &stale {
+            self.customers.remove(id);
+            self.invoices.retain(|_, inv| &inv.customer_id != id);
+        }
+        stale.len()
+    }
+
+    /// Overage (usage beyond each month's included bundle) across every month so far.
+    fn overage_mills(&self, c: &Customer) -> i64 {
+        c.usage
+            .values()
+            .map(|u| billing::total(&billing::invoice(&self.pricing, u)) - self.pricing.monthly_mills)
+            .sum()
+    }
+
+    /// What a self-serve customer owes right now: plan periods charged plus overage, less
+    /// payments. Negative means credit.
+    pub fn self_serve_balance(&self, c: &Customer) -> i64 {
+        let paid: i64 = c.payments.iter().map(|p| p.mills).sum();
+        c.plan_charged_mills + self.overage_mills(c) - paid
+    }
+
+    /// Opens a bill for the next period: one plan fee plus anything still owed. A card bill gets
+    /// its checkout link attached by the caller (it needs a network call to Stripe); a USDC bill
+    /// gets an exact amount no other open bill has, which is how its payment is recognized.
+    pub fn open_invoice(&mut self, customer_id: &str, method: &str, now_ms: i64) -> Result<String, &'static str> {
+        let c = self.customers.get(customer_id).ok_or("no such customer")?;
+        if !c.self_serve() {
+            return Err("this key was issued by the operator and is billed separately");
+        }
+        if !c.active {
+            return Err("this key was revoked");
+        }
+        let mills = self.pricing.monthly_mills + self.self_serve_balance(c).max(0);
+        let usdc_units = if method == "usdc" {
+            let base = mills as u64 * 1000;
+            let taken: HashSet<u64> =
+                self.invoices.values().filter(|i| i.paid_at_ms.is_none()).map(|i| i.usdc_units).collect();
+            // 1..=999 units is under a tenth of a cent — the tag that tells payers apart.
+            let seed = self.next_invoice_id * 7919 % 999;
+            let tag = (0..999u64).map(|k| (seed + k) % 999 + 1).find(|t| !taken.contains(&(base + t)));
+            base + tag.ok_or("too many open USDC bills right now — try again in a few minutes")?
+        } else {
+            0
+        };
+        let id = format!("inv_{}", self.next_invoice_id);
+        self.next_invoice_id += 1;
+        self.invoices.insert(
+            id.clone(),
+            Invoice {
+                id: id.clone(),
+                customer_id: customer_id.to_string(),
+                method: method.to_string(),
+                mills,
+                usdc_units,
+                stripe_session: None,
+                checkout_url: None,
+                created_at_ms: now_ms,
+                paid_at_ms: None,
+                reference: None,
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn invoice(&self, id: &str) -> Option<&Invoice> {
+        self.invoices.get(id)
+    }
+
+    pub fn set_checkout(&mut self, invoice_id: &str, session: &str, url: &str) {
+        if let Some(inv) = self.invoices.get_mut(invoice_id) {
+            inv.stripe_session = Some(session.to_string());
+            inv.checkout_url = Some(url.to_string());
+        }
+    }
+
+    /// Unpaid USDC bills young enough to still be watched for: (invoice id, exact units).
+    pub fn open_usdc_invoices(&self, now_ms: i64) -> Vec<(String, u64)> {
+        self.invoices
+            .values()
+            .filter(|i| i.method == "usdc" && i.paid_at_ms.is_none() && now_ms - i.created_at_ms < UNPAID_SIGNUP_TTL_MS)
+            .map(|i| (i.id.clone(), i.usdc_units))
+            .collect()
+    }
+
+    /// Unpaid card bills with a checkout session to poll: (invoice id, session id).
+    pub fn open_card_invoices(&self, now_ms: i64) -> Vec<(String, String)> {
+        self.invoices
+            .values()
+            .filter(|i| i.method == "card" && i.paid_at_ms.is_none() && now_ms - i.created_at_ms < 2 * 24 * 60 * 60 * 1000)
+            .filter_map(|i| Some((i.id.clone(), i.stripe_session.clone()?)))
+            .collect()
+    }
+
+    /// Whether a payment with this reference (a tx hash, a Stripe invoice id) was already
+    /// counted — so the same payment seen twice is only ever credited once.
+    pub fn payment_seen(&self, reference: &str) -> bool {
+        self.customers.values().any(|c| c.payments.iter().any(|p| p.reference == reference))
+            || self.invoices.values().any(|i| i.reference.as_deref() == Some(reference))
+    }
+
+    fn extend_plan(&mut self, customer_id: &str, until_ms: i64, now_ms: i64) {
+        let monthly = self.pricing.monthly_mills;
+        if let Some(c) = self.customers.get_mut(customer_id) {
+            let from = c.paid_until_ms.unwrap_or(now_ms).max(now_ms);
+            c.paid_until_ms = Some(from.max(until_ms));
+            c.plan_charged_mills += monthly;
+        }
+        self.append(
+            now_ms,
+            "plan_extended",
+            Json::obj(vec![
+                ("customer_id", Json::str(customer_id.to_string())),
+                ("paid_until_ms", Json::num(self.customers.get(customer_id).and_then(|c| c.paid_until_ms).unwrap_or(0) as f64)),
+            ]),
+        );
+    }
+
+    /// A USDC or first card payment arrived for a bill: credit it and switch the key on for one
+    /// more period. Idempotent — a bill is only ever paid once.
+    pub fn pay_invoice(&mut self, invoice_id: &str, reference: &str, now_ms: i64) -> Result<(), &'static str> {
+        let inv = self.invoices.get(invoice_id).ok_or("no such invoice")?;
+        if inv.paid_at_ms.is_some() {
+            return Ok(());
+        }
+        let (cid, mills) = (inv.customer_id.clone(), inv.mills);
+        self.record_payment(&cid, mills, reference, now_ms)?;
+        if let Some(inv) = self.invoices.get_mut(invoice_id) {
+            inv.paid_at_ms = Some(now_ms);
+            inv.reference = Some(reference.to_string());
+        }
+        let start = self.customers.get(&cid).and_then(|c| c.paid_until_ms).unwrap_or(now_ms).max(now_ms);
+        self.extend_plan(&cid, start + PLAN_PERIOD_MS, now_ms);
+        Ok(())
+    }
+
+    /// Links a card plan to the Stripe subscription that renews it.
+    pub fn link_stripe(&mut self, customer_id: &str, stripe_customer: &str, subscription: &str) {
+        if let Some(c) = self.customers.get_mut(customer_id) {
+            c.stripe_customer = Some(stripe_customer.to_string());
+            c.stripe_subscription = Some(subscription.to_string());
+        }
+    }
+
+    /// Card plans that renew by themselves: (customer id, Stripe customer, subscription).
+    pub fn stripe_plans(&self) -> Vec<(String, String, String)> {
+        self.customers
+            .values()
+            .filter(|c| c.active)
+            .filter_map(|c| Some((c.id.clone(), c.stripe_customer.clone()?, c.stripe_subscription.clone()?)))
+            .collect()
+    }
+
+    /// A renewal Stripe charged by itself: credit it and extend the key to the end of the
+    /// period it paid for (plus a day's grace for the next charge to land).
+    pub fn record_renewal(
+        &mut self,
+        customer_id: &str,
+        stripe_invoice: &str,
+        mills: i64,
+        period_end_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), &'static str> {
+        if self.payment_seen(stripe_invoice) {
+            return Ok(());
+        }
+        if mills > 0 {
+            self.record_payment(customer_id, mills, stripe_invoice, now_ms)?;
+        }
+        self.extend_plan(customer_id, period_end_ms + 24 * 60 * 60 * 1000, now_ms);
+        Ok(())
+    }
+
+    /// Card plans: overage not yet added to a Stripe invoice, in whole cents' worth of mills.
+    pub fn overage_to_invoice(&self, customer_id: &str) -> i64 {
+        let Some(c) = self.customers.get(customer_id) else { return 0 };
+        let pending = self.overage_mills(c) - c.overage_invoiced_mills;
+        pending - pending.rem_euclid(10)
+    }
+
+    pub fn mark_overage_invoiced(&mut self, customer_id: &str, mills: i64) {
+        if let Some(c) = self.customers.get_mut(customer_id) {
+            c.overage_invoiced_mills += mills;
+        }
+    }
+
+    /// Headline numbers for the home page.
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let agents = self.agent_secrets.len();
+        let settled = self.agreements.values().filter(|a| a.status == Status::Settled).count();
+        let platforms = self
+            .customers
+            .values()
+            .filter(|c| c.active && (!c.self_serve() || !c.payments.is_empty()))
+            .count();
+        (agents, settled, platforms)
+    }
+
+    /// Marks an agent as known from now, so its profile shows its age before its first deal.
+    pub fn mark_seen(&mut self, agent_id: &str, now_ms: i64) {
+        self.touch(agent_id, now_ms);
+    }
+
+    /// Whether an id has been claimed by anyone.
+    pub fn is_claimed(&self, id: &str) -> bool {
+        self.agent_secrets.contains_key(id)
+    }
+
+    /// Pins a source's secret to one proven elsewhere (see `main.rs`'s trusted sources), so the
+    /// name can never be claimed by whoever happened to ask first.
+    pub fn pin_secret_hash(&mut self, id: &str, secret_hash: &str) {
+        self.agent_secrets.insert(id.to_string(), secret_hash.to_string());
     }
 
     /// Turns a key off — for a customer who stopped paying, or a key that leaked.
@@ -834,6 +1231,33 @@ impl Engine {
     /// what's been paid, and what's still owed. Nothing is stored about a bill: it is always
     /// recomputed from usage and the current price list.
     pub fn statement_json(&self, c: &Customer, now_ms: i64) -> Json {
+        if c.self_serve() {
+            let paid: i64 = c.payments.iter().map(|p| p.mills).sum();
+            let balance = self.self_serve_balance(c);
+            let months: Vec<Json> = c
+                .usage
+                .iter()
+                .map(|(m, u)| {
+                    let lines: Vec<billing::Line> = billing::invoice(&self.pricing, u).into_iter().skip(1).collect();
+                    billing::invoice_json(m, &lines, u)
+                })
+                .collect();
+            return Json::obj(vec![
+                ("customer_id", Json::str(c.id.clone())),
+                ("name", Json::str(c.name.clone())),
+                ("plan", Json::str(if c.stripe_subscription.is_some() { "card, renews automatically" } else { "prepaid" })),
+                ("pricing", self.pricing.to_json()),
+                ("paid_until_ms", Json::num(c.paid_until_ms.unwrap_or(0) as f64)),
+                ("active", Json::Bool(c.paid_until_ms.map(|t| now_ms < t).unwrap_or(false))),
+                ("usage_beyond_plan", Json::Array(months)),
+                ("plan_fees_usd", billing::usd(c.plan_charged_mills)),
+                ("billed_usd", billing::usd(c.plan_charged_mills + self.overage_mills(c))),
+                ("paid_usd", billing::usd(paid)),
+                ("balance_usd", billing::usd(balance)),
+                ("this_month_usd", billing::usd(0)),
+                ("overdue", Json::Bool(false)),
+            ]);
+        }
         let end = c.revoked_at_ms.unwrap_or(now_ms).min(now_ms);
         let current = billing::month_of(now_ms);
         let mut months = Vec::new();
@@ -1893,10 +2317,39 @@ impl Engine {
         self.network.source_standing(source)
     }
 
+    ///
+    /// The same cap that limits a platform limits an outside source: it can lift any one agent by
+    /// at most `PLATFORM_CAP` points in total, so a source whose players farm it (a bot beating
+    /// the same easy opponent all day) can't mint a good record. Losses always count in full.
     pub fn ingest_external(&mut self, att: &Attestation, now_ms: i64) {
-        self.network.ingest(att);
+        let key = att.subject.key();
+        let bucket = format!("source:{}", att.source);
+        let before = self.network.lookup(&att.subject).map(|s| s.in_domain(att.domain)).unwrap_or(0);
+        let capped = att.event.delta() > 0 && self.platform_total(&key, &bucket) >= PLATFORM_CAP;
+        if !capped {
+            self.network.ingest(att);
+        }
+        let score = self.network.lookup(&att.subject).map(|s| s.in_domain(att.domain)).unwrap_or(0);
+        if score > before {
+            let room = (PLATFORM_CAP - self.platform_total(&key, &bucket)).max(0);
+            let gained = (score - before).min(room);
+            if gained < score - before {
+                self.network.adjust(&att.subject, att.domain, gained - (score - before));
+            }
+            *self
+                .platform_credit
+                .entry(key.clone())
+                .or_default()
+                .entry(bucket)
+                .or_default()
+                .entry(att.domain)
+                .or_insert(0) += gained;
+        }
         let score = self.network.lookup(&att.subject).map(|s| s.in_domain(att.domain)).unwrap_or(0);
         let standing = self.network.source_standing(&att.source);
+        if att.subject.protocol_and_id().0 == "local" {
+            self.touch(&att.subject.protocol_and_id().1, now_ms);
+        }
         self.append(
             now_ms,
             "external_attestation",
@@ -1906,6 +2359,7 @@ impl Engine {
                 ("source_standing", Json::num(standing as f64)),
                 ("domain", Json::str(domain_label(att.domain))),
                 ("event", Json::str(format!("{:?}", att.event))),
+                ("limited_by", if capped { Json::str("source_cap") } else { Json::Null }),
                 ("score_now", Json::num(score as f64)),
             ]),
         );
@@ -2364,6 +2818,9 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
             ("audit", Json::Array(self.audit.iter().map(|e| e.to_json()).collect())),
             ("operator_revenue", Json::num(self.operator_revenue)),
             ("next_id", Json::num(self.next_id as f64)),
+            ("invoices", Json::Array(self.invoices.values().map(|i| i.to_snapshot_json()).collect())),
+            ("next_invoice_id", Json::num(self.next_invoice_id as f64)),
+            ("usdc_cursor", Json::num(self.usdc_cursor as f64)),
         ])
     }
 
@@ -2528,6 +2985,14 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
         }
         engine.operator_revenue = j.get("operator_revenue").and_then(|v| v.as_f()).unwrap_or(0.0);
         engine.next_id = j.get("next_id").and_then(|v| v.as_f()).map(|n| n as u64).unwrap_or(1);
+        if let Some(Json::Array(items)) = j.get("invoices") {
+            for item in items {
+                let inv = Invoice::from_snapshot_json(item).ok_or("a malformed invoice in the snapshot")?;
+                engine.invoices.insert(inv.id.clone(), inv);
+            }
+        }
+        engine.next_invoice_id = j.get("next_invoice_id").and_then(|v| v.as_f()).map(|n| n as u64).unwrap_or(1);
+        engine.usdc_cursor = j.get("usdc_cursor").and_then(|v| v.as_f()).map(|n| n as u64).unwrap_or(0);
         Ok(engine)
     }
 }

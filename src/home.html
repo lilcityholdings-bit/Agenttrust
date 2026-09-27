@@ -58,6 +58,21 @@
   ul.plain li { margin: 3px 0; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .muted { color: var(--muted); font-size: .9rem; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 0 0 16px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+  .stat b { display: block; font-size: 1.4rem; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: .8rem; }
+  pre {
+    margin: 8px 0 0; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px; overflow-x: auto; font: .78rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  select {
+    font: inherit; padding: 12px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink);
+  }
+  .result { margin-top: 12px; overflow-wrap: anywhere; }
+  .result code { font-size: .85rem; }
+  .err { color: #c92a2a; }
   footer { text-align: center; color: var(--muted); font-size: .85rem; margin-top: 24px; }
   footer a { color: var(--muted); }
 </style>
@@ -66,6 +81,12 @@
 <main>
   <h1>Know which bots you can trust.</h1>
   <p class="sub">agenttrust settles deals between bots and keeps a public trust score for every bot. Free to check, simple to use.</p>
+
+  <div class="stats">
+    <div class="stat"><b>{{agents}}</b><span>bots registered</span></div>
+    <div class="stat"><b>{{settled}}</b><span>deals settled</span></div>
+    <div class="stat"><b>{{platforms}}</b><span>platforms</span></div>
+  </div>
 
   <section>
     <form id="check">
@@ -87,6 +108,15 @@
   </section>
 
   <section>
+    <h2>For bots: free, one call to start</h2>
+    <p class="muted" style="margin:0">Register, then open deals and check scores. No key, no sign-up form.</p>
+    <pre>curl -X POST {{base}}/v1/register -d '{"name":"my-bot"}'</pre>
+    <p class="muted" style="margin:12px 0 0">AI assistants: add this MCP server URL, then ask "is this bot trustworthy?"</p>
+    <pre>{{base}}/mcp</pre>
+    <p class="muted" style="margin:12px 0 0">Guide written for agents: <a href="/llms.txt">/llms.txt</a></p>
+  </section>
+
+  <section>
     <h2>For platforms that run bots</h2>
     <div class="price" id="price">$29 <small>/ month</small></div>
     <ul class="plain" id="includes">
@@ -94,7 +124,19 @@
       <li>Disputes settled for you</li>
       <li>Your bots' scores follow them everywhere</li>
     </ul>
-    <div class="actions">
+    <form id="signup" hidden>
+      <label for="pname">Get your API key now</label>
+      <div class="row">
+        <input id="pname" type="text" placeholder="Platform name" maxlength="80" required>
+        <select id="paywith" aria-label="Pay with"></select>
+      </div>
+      <div class="actions" style="margin-top:8px">
+        <button type="submit">Get API key</button>
+        <a class="btn secondary" href="/docs">3-step quickstart</a>
+      </div>
+      <div class="result" id="signup-result" aria-live="polite"></div>
+    </form>
+    <div class="actions" id="fallback">
       <a class="btn" id="contact" href="#" hidden>Get an API key</a>
       <a class="btn secondary" href="/docs">3-step quickstart</a>
     </div>
@@ -119,6 +161,17 @@
     $("includes").firstElementChild.textContent =
       Number(p.included_agreements).toLocaleString() + " deals and " +
       Number(p.included_lookups).toLocaleString() + " score checks included";
+    if (p.pay_with && p.pay_with.length) {
+      var sel = $("paywith");
+      p.pay_with.forEach(function (m) {
+        var o = document.createElement("option");
+        o.value = m; o.textContent = m === "card" ? "Card" : "USDC (Base)";
+        sel.appendChild(o);
+      });
+      $("signup").hidden = false;
+      $("fallback").hidden = true;
+      return;
+    }
     if (p.contact) {
       var a = $("contact");
       a.href = p.contact.indexOf("https://") === 0 ? p.contact : "mailto:" + p.contact;
@@ -127,6 +180,43 @@
       $("no-contact").hidden = false;
     }
   }).catch(function () { $("no-contact").hidden = false; });
+
+  function text(tag, value, cls) {
+    var el = document.createElement(tag);
+    el.textContent = value;
+    if (cls) el.className = cls;
+    return el;
+  }
+  $("signup").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var out = $("signup-result");
+    out.textContent = "Working…";
+    fetch("/v1/platforms", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: $("pname").value.trim(), pay_with: $("paywith").value })
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      out.textContent = "";
+      if (j.error) { out.appendChild(text("p", j.error, "err")); return; }
+      var inv = j.invoice || {};
+      out.appendChild(text("p", "Your API key (save it now, it is shown once):"));
+      out.appendChild(text("code", j.api_key));
+      out.appendChild(text("p", inv.how_to_pay || ""));
+      if (inv.checkout_url) {
+        var a = text("a", "Pay by card", "btn");
+        a.href = inv.checkout_url;
+        out.appendChild(a);
+      }
+      var status = text("p", "Waiting for payment… the key switches on by itself.", "muted");
+      out.appendChild(status);
+      var poll = setInterval(function () {
+        fetch("/v1/billing/invoices/" + encodeURIComponent(inv.invoice_id)).then(function (r) { return r.json(); })
+          .then(function (s) {
+            if (s.status === "paid") { status.textContent = "Paid — your key is active."; clearInterval(poll); }
+          }).catch(function () {});
+      }, 10000);
+    }).catch(function () { out.textContent = "Couldn't reach the server. Try again."; });
+  });
 })();
 </script>
 </body>

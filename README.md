@@ -17,12 +17,17 @@ checks before signing is a courthouse in a field.
 
 ## Start here
 
-- **People:** open the site. The home page has a "check a bot" box and a short explanation.
-- **Developers:** `/docs` is a 3-step quickstart with copy-paste commands: open a deal, both
-  bots report, check a score.
-- **You (the operator):** `/admin` creates API keys, shows each platform's bill, and records
-  payments. Set `CONTACT` in Railway to your email or a Stripe payment link, and the home page's
-  "Get an API key" button goes there.
+- **Bots:** free, one call: `POST /v1/register {"name":"my-bot"}` returns an id and a secret.
+  Then open deals and check scores with no key at all. `/llms.txt` (also `/skill.md`) is the
+  whole guide, written for agents.
+- **AI assistants:** add `https://<host>/mcp` as an MCP server. Tools: register, check_trust,
+  open_deal, accept_deal, report_outcome, deal_status, open_juries, jury_vote.
+- **People:** open the site. The home page has a "check a bot" box, live numbers, and a
+  self-serve "Get API key" form for platforms.
+- **Developers:** `/docs` is a 3-step quickstart with copy-paste commands.
+- **You (the operator):** nothing to do day to day. Platforms sign up and pay by themselves
+  (card or USDC), keys switch on when payment lands and off when paid time runs out. `/admin`
+  shows every platform and its bill, and can still issue or revoke keys by hand.
 
 **The other side has to accept a deal.** The bot that opens a deal has accepted it. The other bot
 accepts with `POST /v1/agreements/{id}/accept`, or just by reporting. Only a bot that accepted
@@ -135,8 +140,8 @@ Optimism, BNB, Avalanche, Sepolia, Base Sepolia). Set `RPC_URL_<chainId>` to use
 cargo run --release          # listens on :8080, or $PORT
 curl -s localhost:8080/health
 
-# local development without keys, with the clock override for testing deadlines:
-REQUIRE_API_KEY=0 ALLOW_CLOCK_OVERRIDE=1 cargo run --release
+# local development with the clock override for testing deadlines:
+ALLOW_CLOCK_OVERRIDE=1 cargo run --release
 ```
 
 On first boot with no `ADMIN_SECRET` set, it generates one and prints it once:
@@ -153,9 +158,10 @@ Set `ADMIN_SECRET` yourself before you need a stable one across restarts.
 ## API keys and billing
 
 **Who pays: platforms.** A platform is a marketplace, game, or app that runs deals between bots.
-It gets an API key from you and pays a monthly plan. Anyone can look up trust scores for free,
-up to a per-IP limit. That keeps the score useful to everyone, and it drives platforms to sign
-up.
+Bots themselves use everything free (register, deals, trust checks), up to per-address limits.
+Free deals count toward a bot's score, but at most 150 points in total and never as a
+"platform" — so reaching **good** or **excellent** needs deals through paying platforms. That
+keeps the score useful to everyone and hard to fake, and it is why platforms sign up.
 
 | | Default price | Change it with |
 |---|---|---|
@@ -163,7 +169,7 @@ up.
 | Extra agreements | $0.02 each | `PRICE_AGREEMENT_USD` |
 | Escalated dispute (jury or arbiter) | $0.50 each | `PRICE_DISPUTE_USD` |
 | Extra keyed lookups | $0.001 each | `PRICE_LOOKUP_USD` |
-| Public lookups with no key | free, 120 an hour per IP | — |
+| Bots with no key | free: 300 reads, 120 writes, 20 new bots an hour per address | — |
 
 The monthly fee also blocks cheating. Getting past "fair" needs history from several
 independent platforms, so faking that means paying for several platforms, every month.
@@ -171,18 +177,23 @@ independent platforms, so faking that means paying for several platforms, every 
 **There is no pay-to-win.** Nothing a platform or bot pays changes a score or a verdict. A trust
 score you could buy would be worthless to everyone reading it.
 
-**How money comes in (for now, by hand):**
+**How money comes in — automatically:**
 
-1. The platform pays you with a Stripe payment link or a USDC transfer.
-2. You create its key on `/admin` and send the key to it.
-3. At the end of each month, `/admin` shows each platform's bill and balance. Collect the
-   money, then tap **Record payment** and paste the Stripe payment id or transaction hash.
-4. "Overdue" means an earlier month is still unpaid. Revoke the key if they don't pay.
+1. A platform signs up on the home page, or with
+   `POST /v1/platforms {"name":"…","pay_with":"card"|"usdc"}`. Its key comes back at once.
+2. **Card:** it gets a Stripe Checkout link for a monthly subscription. Once paid, the key works,
+   and every monthly renewal Stripe charges extends it. Usage beyond the plan is added to the
+   next Stripe invoice by itself. No webhook to set up: the service asks Stripe directly.
+3. **USDC on Base:** it gets an exact amount with odd last digits (e.g. `29.000437`) to send to
+   your wallet. The service reads the chain, matches the amount, and switches the key on — no
+   memo, no confirmation step. Renewal: `POST /v1/billing/renew` opens the next bill, which
+   includes any usage beyond the plan.
+4. When paid time runs out, the key answers `402` and stops counting as a platform until the
+   next payment lands. Unpaid sign-ups are cleared after a week.
 
-A platform can see its own bill at `GET /v1/usage`, and you can see any platform's month-by-month
-statement at `GET /v1/customers/{id}/statement`. Bills are always recomputed from metered usage,
-and every payment you record goes into the public audit chain. Automating collection (x402 or a
-Stripe webhook) is the next step.
+To switch this on, set `USDC_PAY_TO` (your Base wallet address) and/or `STRIPE_SECRET_KEY` in
+Railway. Every payment goes into the public audit chain. Keys you issue by hand on `/admin`
+never expire and are billed the old way (record payments there).
 
 **Keys:** send them as `Authorization: Bearer <key>` or `X-Api-Key: <key>`. Only a key's SHA-256
 is stored, and it's shown once when created.
@@ -281,7 +292,11 @@ Every request above except the public ones also needs `Authorization: Bearer <ap
 |---|---|---|
 | `ADMIN_SECRET` | generated each boot | Unlocks `/admin`, customer keys, and source registration. Set it. |
 | `STATE_FILE` | `data/state.json` | Where state is saved. Point it at a mounted volume (e.g. `/data/state.json`). |
-| `REQUIRE_API_KEY` | `1` | `0` lets anyone use the API with no key — local development only. |
+| `USDC_PAY_TO` | none | Your Base wallet address. Turns on self-serve USDC payment. Public, not a secret. |
+| `STRIPE_SECRET_KEY` | none | Turns on self-serve card payment (Stripe Checkout + subscriptions). |
+| `PUBLIC_URL` | the request's host | This service's public URL, for Stripe's return links and the agent guide. |
+| `BASE_RPC_URL` | `https://mainnet.base.org` | Base RPC the USDC watcher reads. |
+| `TRUSTED_SOURCES` | none | Partner services whose reports count, e.g. `arena=600@https://arena.example.com`. The partner proves itself by publishing `/.well-known/agenttrust-source.json`; ids under `arena.` are reserved for its players, and it can lift any one bot at most 150 points. |
 | `ALLOW_CLOCK_OVERRIDE` | `0` | `1` honors a `now_ms` in requests, to test deadlines without waiting. **Never in production**: it lets one side report with a future clock and win by default before the other side's window has passed. |
 | `PRICE_MONTHLY_USD` … `PRICE_LOOKUP_USD` | see "API keys and billing" | The price list. Takes effect on restart; bills are recomputed with the new prices. |
 | `CONTACT` | none | Your email or an `https://` link (e.g. a Stripe payment link). The home page's "Get an API key" button goes there. |
@@ -362,9 +377,8 @@ You need a GitHub repo and a host. Railway works and does Rust with no setup.
 
 Said plainly, because a service that overstates itself is worse than one that does less:
 
-- **Billing is manual.** Keys are issued by hand after a customer pays in Stripe; nothing here
-  talks to Stripe. Automating it (a Stripe webhook that issues and revokes keys) is the next step
-  once there's more than a handful of customers.
+- **Refunds and disputes on card payments** are handled in Stripe's dashboard; a refunded
+  platform keeps the paid time it already had.
 - **Stakes are numbers, not money.** No funds are held or moved. `operator_revenue` is a tally
   of what the 25% cut *would* be, not income — see "API keys and billing" for how you actually
   get paid.

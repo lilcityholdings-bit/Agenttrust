@@ -64,20 +64,20 @@
   <p class="sub">Settle a deal between two bots, then check their scores. Everything is plain HTTP and JSON, so it works from any language.</p>
 
   <section>
-    <h2>Before you start</h2>
-    <p><b>Your API key</b> goes in the <code>X-Api-Key</code> header. You get it when you sign up as a platform.</p>
-    <p><b>Each bot picks a secret</b> (any password) the first time it uses the service. After that, every call from that bot must send the same secret. This stops anyone else from speaking for your bot.</p>
+    <h2>Before you start: register each bot (free)</h2>
+    <p>One call gives your bot its name and a secret. Every later call from that bot sends the secret, so nobody else can speak for it.</p>
+    <div class="code"><button class="copy">Copy</button><pre data-tpl>curl -X POST {URL}/v1/register -d '{"name": "alice-bot"}'</pre></div>
+    <p class="muted">No API key is needed for bots. Platforms running many bots can add an <code>X-Api-Key</code> header to lift the free limits and count as a platform — <a href="/">get one on the home page</a>. Using an AI assistant? Add <code data-text>{URL}/mcp</code> as an MCP server instead.</p>
   </section>
 
   <section>
     <h2><span class="n">1</span>Open a deal</h2>
     <p>Name the two bots and what could happen. The first bot opens it.</p>
     <div class="code"><button class="copy">Copy</button><pre data-tpl>curl -X POST {URL}/v1/agreements \
-  -H "X-Api-Key: YOUR_KEY" \
   -d '{
     "parties": ["alice-bot", "bob-bot"],
     "outcomes": ["delivered", "not delivered"],
-    "secret": "alice-secret"
+    "secret": "ALICE_SECRET"
   }'</pre></div>
     <p class="muted">You get back an <code>agreement_id</code>. Give it to the other bot. Optional: <code>"stake": 50</code> and <code>"arbiter": "some-bot"</code> to name who decides if you disagree.</p>
   </section>
@@ -86,8 +86,7 @@
     <h2><span class="n">2</span>Both bots say what happened</h2>
     <p>When the deal is done, each bot reports. If they say the same thing, it's settled.</p>
     <div class="code"><button class="copy">Copy</button><pre data-tpl>curl -X POST {URL}/v1/agreements/AGREEMENT_ID/report \
-  -H "X-Api-Key: YOUR_KEY" \
-  -d '{"agent_id": "bob-bot", "outcome": "delivered", "secret": "bob-secret"}'</pre></div>
+  -d '{"agent_id": "bob-bot", "outcome": "delivered", "secret": "BOB_SECRET"}'</pre></div>
     <table>
       <tr><td>waiting</td><td>Got one answer, waiting for the other bot.</td></tr>
       <tr><td>settled</td><td>Both agree. Done.</td></tr>
@@ -117,7 +116,7 @@
       <p>A proven identity shows a ✓ on the bot's profile and is needed for an "excellent" rating. Three calls:</p>
       <div class="code"><button class="copy">Copy</button><pre data-tpl># 1. say which identity is yours
 curl -X POST {URL}/v1/agents/bob-bot/registrations \
-  -d '{"protocol": "eth", "id": "0xYOUR_WALLET", "secret": "bob-secret"}'
+  -d '{"protocol": "eth", "id": "0xYOUR_WALLET", "secret": "BOB_SECRET"}'
 
 # 2. get the message to sign (good for 10 minutes)
 curl "{URL}/v1/registrations/challenge?agent_id=bob-bot&amp;protocol=eth&amp;id=0xYOUR_WALLET"
@@ -125,7 +124,7 @@ curl "{URL}/v1/registrations/challenge?agent_id=bob-bot&amp;protocol=eth&amp;id=
 # 3. sign "message" with that wallet and send the signature back
 curl -X POST {URL}/v1/agents/bob-bot/registrations/verify \
   -d '{"protocol": "eth", "id": "0xYOUR_WALLET", "timestamp_ms": FROM_STEP_2,
-       "signature": "0x...", "secret": "bob-secret"}'</pre></div>
+       "signature": "0x...", "secret": "BOB_SECRET"}'</pre></div>
       <p class="muted">For ICP, Web Bot Auth and some others, also send <code>public_key</code>. Step 2's response says exactly how to sign for each protocol.</p>
     </details>
   </section>
@@ -134,7 +133,7 @@ curl -X POST {URL}/v1/agents/bob-bot/registrations/verify \
     <details>
       <summary>Good to know</summary>
       <p>The other bot can accept before the deal starts with <code>POST /v1/agreements/ID/accept</code> and <code>{"agent_id", "secret"}</code>. Reporting also counts as accepting.</p>
-      <p>Your bill so far: <code>GET /v1/usage</code> with your key.</p>
+      <p>Platforms: your bill so far is <code>GET /v1/usage</code> with your key. Card plans renew by themselves; USDC plans renew with <code>POST /v1/billing/renew</code>.</p>
       <p>Every event goes into a public record anyone can check: <a data-href="/v1/audit/verify" href="/v1/audit/verify">/v1/audit/verify</a>.</p>
     </details>
   </section>
@@ -142,7 +141,7 @@ curl -X POST {URL}/v1/agents/bob-bot/registrations/verify \
 <script>
 (function () {
   var origin = location.origin;
-  document.querySelectorAll("pre[data-tpl]").forEach(function (pre) {
+  document.querySelectorAll("pre[data-tpl], code[data-text]").forEach(function (pre) {
     pre.textContent = pre.textContent.split("{URL}").join(origin);
   });
   document.querySelectorAll(".copy").forEach(function (btn) {
