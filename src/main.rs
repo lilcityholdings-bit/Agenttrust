@@ -762,6 +762,16 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             ("status", Json::str("ok")),
             ("free_tier", Json::str("bots need no key: POST /v1/register, then use every agent endpoint")),
             ("agent_guide", Json::str("/llms.txt")),
+            (
+                "trusted_sources",
+                Json::Array(
+                    trusted_sources()
+                        .iter()
+                        .filter(|t| engine.source_standing(&t.name) > 0)
+                        .map(|t| Json::str(t.name.clone()))
+                        .collect(),
+                ),
+            ),
             ("mcp", Json::str("/mcp")),
             ("pricing", engine.pricing.to_json()),
             ("audit_head", Json::str(engine.audit_head())),
