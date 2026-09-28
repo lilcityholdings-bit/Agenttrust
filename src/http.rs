@@ -8,7 +8,20 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Limits that keep one caller from tying up the server. Every request this service accepts is
+/// small JSON, so these are generous for real use and tight for abuse.
+const MAX_BODY_BYTES: usize = 64 * 1024;
+const MAX_LINE_BYTES: u64 = 8 * 1024;
+const MAX_HEADERS: usize = 100;
+/// A client has this long to send its request, and to read the answer. Without it, a client that
+/// opens connections and never finishes them holds a thread each until the server runs out.
+const IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Connections served at once; past this, new ones get a quick 503 instead of a thread.
+const MAX_CONNECTIONS: usize = 512;
 
 pub struct Request {
     pub method: String,
@@ -114,19 +127,31 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Reads one line, refusing one longer than `MAX_LINE_BYTES` rather than buffering it forever.
+fn read_line_capped(reader: &mut BufReader<TcpStream>, out: &mut String) -> Option<usize> {
+    let n = reader.by_ref().take(MAX_LINE_BYTES).read_line(out).ok()?;
+    if n as u64 == MAX_LINE_BYTES && !out.ends_with('\n') {
+        return None;
+    }
+    Some(n)
+}
+
 fn parse_request(stream: &mut TcpStream) -> Option<Request> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
+    read_line_capped(&mut reader, &mut line)?;
     let mut parts = line.split_whitespace();
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
 
     let mut headers = HashMap::new();
     let mut content_length = 0usize;
-    loop {
+    for count in 0.. {
+        if count > MAX_HEADERS {
+            return None;
+        }
         let mut header = String::new();
-        if reader.read_line(&mut header).ok()? == 0 {
+        if read_line_capped(&mut reader, &mut header)? == 0 {
             break;
         }
         let trimmed = header.trim_end();
@@ -144,10 +169,11 @@ fn parse_request(stream: &mut TcpStream) -> Option<Request> {
     }
 
     let mut body = String::new();
+    if content_length > MAX_BODY_BYTES {
+        return None;
+    }
     if content_length > 0 {
-        // Capped so one request cannot ask this process to allocate the machine.
-        let capped = content_length.min(1 << 20);
-        let mut buf = vec![0u8; capped];
+        let mut buf = vec![0u8; content_length];
         reader.read_exact(&mut buf).ok()?;
         body = String::from_utf8_lossy(&buf).into_owned();
     }
@@ -186,6 +212,20 @@ const CORS: &str = "Access-Control-Allow-Origin: *\r\n\
 Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
 Access-Control-Allow-Headers: Authorization, Content-Type, X-Api-Key, X-Admin-Secret\r\n";
 
+/// Sent with every response: no content-type guessing, no framing by other sites (so the admin
+/// page can't be clickjacked), no leaking URLs to other sites, and HTTPS only from here on.
+const SECURITY: &str = "X-Content-Type-Options: nosniff\r\n\
+X-Frame-Options: DENY\r\n\
+Referrer-Policy: no-referrer\r\n\
+Strict-Transport-Security: max-age=31536000\r\n";
+
+/// For pages: scripts and styles only from this page itself, network calls only back to this
+/// service, and never inside a frame. The pages build everything with `textContent`, and this is
+/// the second wall if that ever slips.
+const PAGE_POLICY: &str = "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; \
+style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self'; \
+base-uri 'none'; frame-ancestors 'none'\r\n";
+
 pub fn serve<F>(addr: &str, handler: F) -> std::io::Result<()>
 where
     F: Fn(Request) -> Response + Send + Sync + 'static,
@@ -193,10 +233,27 @@ where
     let listener = TcpListener::bind(addr)?;
     println!("agenttrust listening on http://{addr}");
     let handler = Arc::new(handler);
+    let open = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
+        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            open.fetch_sub(1, Ordering::SeqCst);
+            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            continue;
+        }
         let handler = Arc::clone(&handler);
+        let open = Arc::clone(&open);
         std::thread::spawn(move || {
+            // Released however this thread ends, even if the handler panics.
+            struct Slot(Arc<AtomicUsize>);
+            impl Drop for Slot {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _slot = Slot(open);
             let response = match parse_request(&mut stream) {
                 // Browsers send a preflight before any cross-origin request carrying an
                 // Authorization or X-Api-Key header; answer it here, before routing or auth.
@@ -204,10 +261,11 @@ where
                     Response { status: 204, content_type: "text/plain", body: String::new() }
                 }
                 Some(req) => handler(req),
-                None => Response::json(400, "{\"error\":\"malformed request\"}".into()),
+                None => Response::json(400, "{\"error\":\"malformed or oversized request (limit 64 KB)\"}".into()),
             };
+            let page = if response.content_type.starts_with("text/html") { PAGE_POLICY } else { "" };
             let payload = format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n{CORS}\r\n{}",
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n{CORS}{SECURITY}{page}\r\n{}",
                 response.status,
                 reason(response.status),
                 response.content_type,

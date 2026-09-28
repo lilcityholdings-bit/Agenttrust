@@ -104,6 +104,24 @@ fn load_or_new(path: &std::path::Path, admin_secret: &str) -> Engine {
     Engine::with_admin_secret(admin_secret)
 }
 
+/// When state was last written, and how long the audit log was then. Writing the whole snapshot
+/// on every change would let a burst of cheap writes turn into a burst of expensive saves, so a
+/// request saves at most once a second and the background job catches whatever is left.
+static LAST_SAVE: Mutex<(i64, usize)> = Mutex::new((0, 0));
+
+fn save_if_changed(engine: &Engine, path: &std::path::Path, now: i64, force: bool) {
+    let mut last = LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner());
+    let len = engine.audit_len();
+    if len == last.1 && !force {
+        return;
+    }
+    if !force && now - last.0 < 1_000 {
+        return;
+    }
+    save(engine, path);
+    *last = (now, len);
+}
+
 /// Writes the snapshot to `path`, via a temp file renamed into place, so a process killed
 /// mid-write leaves the previous, still-valid snapshot on disk instead of a half-written one.
 fn save(engine: &Engine, path: &std::path::Path) {
@@ -199,13 +217,21 @@ const FREE_REGISTRATIONS_PER_HOUR: u32 = 20;
 /// Across every free caller together, so a swarm of addresses can't fill memory with free deals.
 const FREE_WRITES_GLOBAL_PER_HOUR: u32 = 20_000;
 
+/// Evidence is a note or a link, not a document store.
+const MAX_EVIDENCE_CHARS: usize = 2_000;
+
 /// A fixed-window counter per (bucket, IP). In memory on purpose: it resets on restart, which is
 /// fine for a limit whose only job is to stop one caller from hogging the free tier.
 fn rate_ok(bucket: &str, ip: &str, limit: u32, now: i64) -> bool {
+    rate_count(bucket, ip, now, true) <= limit
+}
+
+/// How many hits `(bucket, ip)` has this hour, counting this one when `hit` is set.
+fn rate_count(bucket: &str, ip: &str, now: i64, hit: bool) -> u32 {
     use std::collections::HashMap;
     static WINDOWS: Mutex<Option<HashMap<String, (i64, u32)>>> = Mutex::new(None);
     const HOUR: i64 = 60 * 60 * 1000;
-    let mut guard = WINDOWS.lock().unwrap();
+    let mut guard = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
     if map.len() > 50_000 {
         map.retain(|_, (start, _)| now - *start < HOUR);
@@ -214,8 +240,10 @@ fn rate_ok(bucket: &str, ip: &str, limit: u32, now: i64) -> bool {
     if now - w.0 >= HOUR {
         *w = (now, 0);
     }
-    w.1 += 1;
-    w.1 <= limit
+    if hit {
+        w.1 += 1;
+    }
+    w.1
 }
 
 /// Pages and feeds that cost nothing to serve and are never limited. `/mcp` is here because
@@ -314,19 +342,19 @@ fn check_trusted_source(engine: &Mutex<Engine>, body: &Json, now: i64) -> Result
         return Err(err(401, "secret is required"));
     };
     let given = hash::sha256_hex(secret.as_bytes());
-    let cached = source_hash_cache().lock().unwrap().get(&ts.name).cloned();
+    let cached = source_hash_cache().lock().unwrap_or_else(|e| e.into_inner()).get(&ts.name).cloned();
     let hash = match cached {
         Some((h, at)) if (h == given && now - at < 600_000) || now - at < 60_000 => h,
         _ => {
             let h = autopay::fetch_source_hash(&ts.url, &ts.name).map_err(|e| err(502, &e))?;
-            source_hash_cache().lock().unwrap().insert(ts.name.clone(), (h.clone(), now));
+            source_hash_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(ts.name.clone(), (h.clone(), now));
             h
         }
     };
     if hash != given {
         return Err(err(401, "wrong secret for this source"));
     }
-    engine.lock().unwrap().pin_secret_hash(&ts.name, &hash);
+    engine.lock().unwrap_or_else(|e| e.into_inner()).pin_secret_hash(&ts.name, &hash);
     Ok(true)
 }
 
@@ -334,7 +362,7 @@ fn check_trusted_source(engine: &Mutex<Engine>, body: &Json, now: i64) -> Result
 /// server can't be used to hammer someone else's.
 fn outbound_allowed(now: i64) -> bool {
     static WINDOW: Mutex<(i64, u32)> = Mutex::new((0, 0));
-    let mut w = WINDOW.lock().unwrap();
+    let mut w = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
     if now - w.0 > 60_000 {
         *w = (now, 0);
     }
@@ -375,7 +403,7 @@ fn verify_registration(engine: &Mutex<Engine>, agent_id: &str, body: &Json, now:
     let Some(signature) = body.get("signature").and_then(|v| v.as_str()) else {
         return err(400, "signature is required");
     };
-    if let Err(e) = engine.lock().unwrap().authenticate(agent_id, body.get("secret").and_then(|v| v.as_str())) {
+    if let Err(e) = engine.lock().unwrap_or_else(|e| e.into_inner()).authenticate(agent_id, body.get("secret").and_then(|v| v.as_str())) {
         return err(401, e);
     }
     if matches!(protocol, "erc8004" | "web_bot_auth") && !outbound_allowed(now) {
@@ -393,7 +421,7 @@ fn verify_registration(engine: &Mutex<Engine>, agent_id: &str, body: &Json, now:
         Ok(m) => m,
         Err(e) => return err(422, &format!("proof rejected: {e}")),
     };
-    let mut engine = engine.lock().unwrap();
+    let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
     match engine.record_verified(agent_id, protocol, &external_id, &method, timestamp_ms, now) {
         Ok(()) => ok(Json::obj(vec![
             ("agent_id", Json::str(agent_id)),
@@ -466,7 +494,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
     // paid up (it switches back on by itself when a payment lands). Checked once, here, before
     // any handler runs, so no endpoint can forget it.
     let admin = is_admin_route(&segments);
-    let key = if admin { None } else { req.api_key().map(|k| engine.lock().unwrap().check_key(k, now)) };
+    let key = if admin { None } else { req.api_key().map(|k| engine.lock().unwrap_or_else(|e| e.into_inner()).check_key(k, now)) };
     let customer_id: Option<String> = match key {
         None => None,
         Some(KeyCheck::Valid(id)) => Some(id),
@@ -501,6 +529,19 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         }
     }
 
+    // Guessing the admin secret: after 10 wrong tries in an hour, this address is refused every
+    // admin call — right secret or not — so guessing can't continue and can't be confirmed.
+    if admin {
+        const ADMIN_FAILS_PER_HOUR: u32 = 10;
+        if rate_count("admin-fail", req.client_ip(), now, false) >= ADMIN_FAILS_PER_HOUR {
+            return err(429, "too many wrong admin secrets from this address — try again in an hour");
+        }
+        let supplied = admin_secret_of(&req, &body);
+        if engine.lock().unwrap_or_else(|e| e.into_inner()).check_admin(supplied).is_err() {
+            rate_count("admin-fail", req.client_ip(), now, true);
+        }
+    }
+
     // Routes that call out to the network run with the engine unlocked.
     match (method, segments.as_slice()) {
         ("POST", ["v1", "agents", agent_id, "registrations", "verify"]) => {
@@ -511,7 +552,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         ("POST", ["v1", "billing", "renew"]) => return renew_plan(engine, &req, &body, customer_id.as_deref(), now),
         ("GET", ["v1", "billing", "invoices", id]) => {
             check_card_invoice(engine, id, now);
-            let e = engine.lock().unwrap();
+            let e = engine.lock().unwrap_or_else(|e| e.into_inner());
             return match e.invoice(id) {
                 Some(inv) => ok(pay_instructions(&e, inv, now)),
                 None => err(404, "no such invoice"),
@@ -521,7 +562,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         _ => {}
     }
 
-    let mut engine = engine.lock().unwrap();
+    let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cid) = &customer_id {
         if is_lookup(method, &segments) {
             engine.meter_lookup(cid, now);
@@ -830,6 +871,12 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 }
                 _ => return err(400, "parties must be an array of two agent ids"),
             };
+            if parties.iter().any(|p| !store::valid_agent_id(p)) {
+                return err(400, "agent ids are 1-64 characters, with no spaces or / ? # < > \" '");
+            }
+            if body.get("outcomes").map(|o| matches!(o, Json::Array(a) if a.len() > 16)).unwrap_or(false) {
+                return err(400, "at most 16 outcomes");
+            }
             let secret = body.get("secret").and_then(|v| v.as_str());
             if let Some(creator) = parties.first() {
                 if let Err(e) = engine.authenticate(creator, secret) {
@@ -994,6 +1041,9 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 return err(401, e);
             }
             let evidence = body.get("evidence").and_then(|v| v.as_str()).map(|s| s.to_string());
+            if evidence.as_ref().map(|e| e.chars().count() > MAX_EVIDENCE_CHARS).unwrap_or(false) {
+                return err(400, "evidence is limited to 2,000 characters — link to anything longer");
+            }
             let agent_id = agent_id.to_string();
             match engine.report(id, &agent_id, outcome, evidence, now) {
                 Ok(result) => {
@@ -1067,6 +1117,9 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 return err(401, e);
             }
             let evidence = body.get("evidence").and_then(|v| v.as_str()).map(|s| s.to_string());
+            if evidence.as_ref().map(|e| e.chars().count() > MAX_EVIDENCE_CHARS).unwrap_or(false) {
+                return err(400, "evidence is limited to 2,000 characters — link to anything longer");
+            }
             let agent_id = agent_id.to_string();
             match engine.vote(id, &agent_id, outcome, evidence, now) {
                 Ok(()) => ok(Json::obj(vec![
@@ -1266,6 +1319,14 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     Err(e) => return err(400, &e),
                 }
             };
+            // A trusted partner reports only about its own players (`arena.<name>`), so even a
+            // leaked partner secret can't touch anyone else's score.
+            if trusted_source && !(kind == "local" && subject.starts_with(&format!("{source}."))) {
+                return err(403, "a partner source can only report about its own players (ids starting with its name and a dot)");
+            }
+            if subject.chars().count() > 128 {
+                return err(400, "subject is too long");
+            }
             // A report about an outside identity lands on whichever agent has *proven* it holds
             // that identity — never on one that merely claimed it.
             let subject_binding = engine.resolve_subject(IdentityBinding::from_protocol(&kind, &subject));
@@ -1296,12 +1357,13 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         // ---- audit --------------------------------------------------------------------
         ("GET", ["v1", "audit"]) => {
             let since: u64 = req.q("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let limit: usize = req.q("limit").and_then(|s| s.parse().ok()).unwrap_or(500).clamp(1, 1000);
+            let page: Vec<&store::AuditEntry> = engine.audit_since(since).into_iter().take(limit).collect();
+            let next = page.last().map(|e| Json::num(e.seq as f64)).unwrap_or(Json::Null);
             ok(Json::obj(vec![
                 ("head", Json::str(engine.audit_head())),
-                (
-                    "entries",
-                    Json::Array(engine.audit_since(since).iter().map(|e| e.to_json()).collect()),
-                ),
+                ("entries", Json::Array(page.iter().map(|e| e.to_json()).collect())),
+                ("next_since", if page.len() == limit { next } else { Json::Null }),
             ]))
         }
 
@@ -1357,7 +1419,7 @@ fn pay_instructions(engine: &Engine, inv: &store::Invoice, now: i64) -> Json {
 /// unlocked.
 fn attach_checkout(engine: &Mutex<Engine>, req: &Request, invoice_id: &str) -> Result<(), Response> {
     let (inv, plan_mills) = {
-        let e = engine.lock().unwrap();
+        let e = engine.lock().unwrap_or_else(|e| e.into_inner());
         (e.invoice(invoice_id).cloned(), e.pricing.monthly_mills)
     };
     let Some(inv) = inv else { return Err(err(404, "no such invoice")) };
@@ -1374,7 +1436,7 @@ fn attach_checkout(engine: &Mutex<Engine>, req: &Request, invoice_id: &str) -> R
         extra_cents,
     )
     .map_err(|e| err(502, &e))?;
-    engine.lock().unwrap().set_checkout(&inv.id, &session, &url);
+    engine.lock().unwrap_or_else(|e| e.into_inner()).set_checkout(&inv.id, &session, &url);
     Ok(())
 }
 
@@ -1412,7 +1474,7 @@ fn signup_platform(engine: &Mutex<Engine>, req: &Request, body: &Json, now: i64)
     }
     let key = format!("at_live_{}", random_hex());
     let (customer_id, invoice_id) = {
-        let mut e = engine.lock().unwrap();
+        let mut e = engine.lock().unwrap_or_else(|e| e.into_inner());
         if e.unpaid_signups() >= 500 {
             return err(503, "too many unpaid sign-ups right now — try again later");
         }
@@ -1425,7 +1487,7 @@ fn signup_platform(engine: &Mutex<Engine>, req: &Request, body: &Json, now: i64)
     if let Err(r) = attach_checkout(engine, req, &invoice_id) {
         return r;
     }
-    let e = engine.lock().unwrap();
+    let e = engine.lock().unwrap_or_else(|e| e.into_inner());
     let inv = e.invoice(&invoice_id).expect("just created");
     Response::json(
         201,
@@ -1455,7 +1517,7 @@ fn renew_plan(engine: &Mutex<Engine>, req: &Request, body: &Json, customer_id: O
         return err(429, "too many renewal bills this hour — pay one of the open ones");
     }
     let invoice_id = {
-        let mut e = engine.lock().unwrap();
+        let mut e = engine.lock().unwrap_or_else(|e| e.into_inner());
         if method == "card" && e.customer(cid).map(|c| c.stripe_subscription.is_some()).unwrap_or(false) {
             let c = e.customer(cid).unwrap();
             return ok(Json::obj(vec![
@@ -1471,7 +1533,7 @@ fn renew_plan(engine: &Mutex<Engine>, req: &Request, body: &Json, customer_id: O
     if let Err(r) = attach_checkout(engine, req, &invoice_id) {
         return r;
     }
-    let e = engine.lock().unwrap();
+    let e = engine.lock().unwrap_or_else(|e| e.into_inner());
     Response::json(201, pay_instructions(&e, e.invoice(&invoice_id).expect("just created"), now).to_string())
 }
 
@@ -1479,7 +1541,7 @@ fn renew_plan(engine: &Mutex<Engine>, req: &Request, body: &Json, customer_id: O
 /// the subscription that renews it. Cheap to call often: a paid or non-card bill returns at once.
 fn check_card_invoice(engine: &Mutex<Engine>, invoice_id: &str, now: i64) -> bool {
     let (session, customer_id) = {
-        let e = engine.lock().unwrap();
+        let e = engine.lock().unwrap_or_else(|e| e.into_inner());
         match e.invoice(invoice_id) {
             Some(inv) if inv.paid_at_ms.is_some() => return true,
             Some(inv) if inv.method == "card" => match &inv.stripe_session {
@@ -1494,7 +1556,7 @@ fn check_card_invoice(engine: &Mutex<Engine>, invoice_id: &str, now: i64) -> boo
     }
     match autopay::stripe_session_paid(autopay::config(), &session) {
         Ok(Some((stripe_customer, subscription, stripe_invoice))) => {
-            let mut e = engine.lock().unwrap();
+            let mut e = engine.lock().unwrap_or_else(|e| e.into_inner());
             e.link_stripe(&customer_id, &stripe_customer, &subscription);
             e.pay_invoice(invoice_id, &stripe_invoice, now).is_ok()
         }
@@ -1541,25 +1603,25 @@ fn background(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
         std::thread::sleep(std::time::Duration::from_secs(20));
         tick += 1;
         let now = now_ms();
-        let before = engine.lock().unwrap().audit_len();
+        let before = engine.lock().unwrap_or_else(|e| e.into_inner()).audit_len();
         let mut dirty = false;
 
-        engine.lock().unwrap().sweep(now);
+        engine.lock().unwrap_or_else(|e| e.into_inner()).sweep(now);
 
         if pay.usdc_pay_to.is_some() {
             let (cursor, open) = {
-                let e = engine.lock().unwrap();
+                let e = engine.lock().unwrap_or_else(|e| e.into_inner());
                 (e.usdc_cursor, e.open_usdc_invoices(now))
             };
             if open.is_empty() {
                 if cursor != 0 {
-                    engine.lock().unwrap().usdc_cursor = 0;
+                    engine.lock().unwrap_or_else(|e| e.into_inner()).usdc_cursor = 0;
                     dirty = true;
                 }
             } else {
                 match autopay::usdc_transfers(pay, cursor) {
                     Ok((next, transfers)) => {
-                        let mut e = engine.lock().unwrap();
+                        let mut e = engine.lock().unwrap_or_else(|e| e.into_inner());
                         for (reference, units) in transfers {
                             if e.payment_seen(&reference) {
                                 continue;
@@ -1579,27 +1641,27 @@ fn background(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
         }
 
         if pay.stripe_key.is_some() {
-            let open = engine.lock().unwrap().open_card_invoices(now);
+            let open = engine.lock().unwrap_or_else(|e| e.into_inner()).open_card_invoices(now);
             for (id, _) in open {
                 check_card_invoice(engine, &id, now);
             }
             if tick % 15 == 1 {
-                let plans = engine.lock().unwrap().stripe_plans();
+                let plans = engine.lock().unwrap_or_else(|e| e.into_inner()).stripe_plans();
                 for (cid, stripe_customer, subscription) in plans {
                     match autopay::stripe_paid_invoices(pay, &subscription) {
                         Ok(paid) => {
-                            let mut e = engine.lock().unwrap();
+                            let mut e = engine.lock().unwrap_or_else(|e| e.into_inner());
                             for (inv, cents, period_end) in paid {
                                 let _ = e.record_renewal(&cid, &inv, cents * 10, period_end, now);
                             }
                         }
                         Err(m) => eprintln!("agenttrust: Stripe renewals for {cid}: {m}"),
                     }
-                    let over = engine.lock().unwrap().overage_to_invoice(&cid);
+                    let over = engine.lock().unwrap_or_else(|e| e.into_inner()).overage_to_invoice(&cid);
                     if over >= 1_000 {
                         match autopay::stripe_add_overage(pay, &stripe_customer, over / 10) {
                             Ok(()) => {
-                                engine.lock().unwrap().mark_overage_invoiced(&cid, over);
+                                engine.lock().unwrap_or_else(|e| e.into_inner()).mark_overage_invoiced(&cid, over);
                                 dirty = true;
                             }
                             Err(m) => eprintln!("agenttrust: Stripe overage for {cid}: {m}"),
@@ -1609,13 +1671,11 @@ fn background(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
             }
         }
 
-        if tick % 180 == 0 && engine.lock().unwrap().prune_unpaid(now) > 0 {
+        if tick % 180 == 0 && engine.lock().unwrap_or_else(|e| e.into_inner()).prune_unpaid(now) > 0 {
             dirty = true;
         }
-        let e = engine.lock().unwrap();
-        if dirty || e.audit_len() != before {
-            save(&e, path);
-        }
+        let e = engine.lock().unwrap_or_else(|e| e.into_inner());
+        save_if_changed(&e, path, now_ms(), dirty || e.audit_len() != before);
     }
 }
 
@@ -1676,12 +1736,8 @@ fn main() -> std::io::Result<()> {
     http::serve(&addr, move |req| {
         // Reads can change state too (a status check that finds a payment), so every request
         // is checked the same way: save when the audit log grew.
-        let before = engine.lock().unwrap().audit_len();
         let response = route(engine, req, cfg);
-        let e = engine.lock().unwrap();
-        if e.audit_len() != before {
-            save(&e, path);
-        }
+        save_if_changed(&engine.lock().unwrap_or_else(|e| e.into_inner()), path, now_ms(), false);
         response
     })
 }
@@ -1780,8 +1836,8 @@ mod tests {
         assert_eq!(route(&e, req("GET", "/v1/usage", &k, ""), PROD).status, 200, "can still see its bill");
 
         let now = now_ms();
-        e.lock().unwrap().pay_invoice(&inv_id, "0xabc:1", now).unwrap();
-        e.lock().unwrap().pay_invoice(&inv_id, "0xabc:1", now).unwrap();
+        e.lock().unwrap_or_else(|e| e.into_inner()).pay_invoice(&inv_id, "0xabc:1", now).unwrap();
+        e.lock().unwrap_or_else(|e| e.into_inner()).pay_invoice(&inv_id, "0xabc:1", now).unwrap();
         assert_eq!(route(&e, req("GET", "/v1/trust/a", &k, ""), PROD).status, 200, "paid");
         let st = body_json(&route(&e, req("GET", &format!("/v1/billing/invoices/{inv_id}"), &[], ""), PROD));
         assert_eq!(st.get("status").unwrap().as_str(), Some("paid"));
@@ -1810,7 +1866,7 @@ mod tests {
     fn unpaid_signups_are_cleared_after_a_week() {
         let e = engine();
         route(&e, req("POST", "/v1/platforms", &[], r#"{"name":"Ghost"}"#), PROD);
-        let mut g = e.lock().unwrap();
+        let mut g = e.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(g.unpaid_signups(), 1);
         assert_eq!(g.prune_unpaid(now_ms() + 8 * 24 * 60 * 60 * 1000), 1);
         assert_eq!(g.unpaid_signups(), 0);
@@ -1838,6 +1894,65 @@ mod tests {
     }
 
     #[test]
+    fn guessing_the_admin_secret_locks_the_address_out_even_for_the_right_one() {
+        let e = engine();
+        let ip = [("X-Real-IP", "203.0.113.77"), ("X-Admin-Secret", "wrong")];
+        for _ in 0..10 {
+            assert_eq!(route(&e, req("GET", "/v1/customers", &ip, ""), PROD).status, 401);
+        }
+        let right = [("X-Real-IP", "203.0.113.77"), ("X-Admin-Secret", "adm")];
+        assert_eq!(route(&e, req("GET", "/v1/customers", &right, ""), PROD).status, 429);
+        let elsewhere = [("X-Real-IP", "203.0.113.78"), ("X-Admin-Secret", "adm")];
+        assert_eq!(route(&e, req("GET", "/v1/customers", &elsewhere, ""), PROD).status, 200);
+    }
+
+    #[test]
+    fn oversized_and_unsafe_inputs_are_refused() {
+        let e = engine();
+        let bad_ids = [r#"{"parties":["<script>","b"],"secret":"s"}"#, r#"{"parties":["a b","c"],"secret":"s"}"#];
+        for body in bad_ids {
+            assert_eq!(route(&e, req("POST", "/v1/agreements", &[], body), PROD).status, 400, "{body}");
+        }
+        let long = format!(r#"{{"parties":["{}","b"],"secret":"s"}}"#, "x".repeat(65));
+        assert_eq!(route(&e, req("POST", "/v1/agreements", &[], &long), PROD).status, 400);
+        let many = format!(r#"{{"parties":["m1","m2"],"secret":"s","outcomes":[{}]}}"#,
+            (0..17).map(|i| format!("\"o{i}\"")).collect::<Vec<_>>().join(","));
+        assert_eq!(route(&e, req("POST", "/v1/agreements", &[], &many), PROD).status, 400);
+        let r = route(&e, req("POST", "/v1/agreements", &[], r#"{"parties":["ev1","ev2"],"secret":"s"}"#), PROD);
+        let id = body_json(&r).get("agreement_id").unwrap().as_str().unwrap().to_string();
+        let big = format!(r#"{{"agent_id":"ev1","outcome":0,"secret":"s","evidence":"{}"}}"#, "e".repeat(2_001));
+        assert_eq!(route(&e, req("POST", &format!("/v1/agreements/{id}/report"), &[], &big), PROD).status, 400);
+        let deep = "[".repeat(100_000);
+        assert_eq!(route(&e, req("POST", "/v1/register", &[], &deep), PROD).status, 400, "no stack overflow");
+    }
+
+    #[test]
+    fn a_partner_can_only_report_about_its_own_players() {
+        let e = engine();
+        e.lock().unwrap().register_source("arena", 600, 0);
+        source_hash_cache().lock().unwrap().insert("arena".into(), (hash::sha256_hex(b"k"), now_ms()));
+        let b = r#"{"source":"arena","secret":"k","subject":"alice-bot","event":"ghosted"}"#;
+        assert_eq!(route(&e, req("POST", "/v1/attestations", &[], b), PROD).status, 403);
+    }
+
+    #[test]
+    fn the_public_record_comes_in_pages() {
+        let e = engine();
+        for i in 0..3 {
+            let b = format!(r#"{{"parties":["pa{i}","pb{i}"],"secret":"s"}}"#);
+            assert_eq!(route(&e, req("POST", "/v1/agreements", &[("X-Real-IP", "198.51.100.9")], &b), PROD).status, 201);
+        }
+        let p = body_json(&route(&e, req("GET", "/v1/audit", &[], ""), PROD));
+        assert_eq!(p.get("next_since"), Some(&Json::Null), "everything fits in one page");
+        let mut r = req("GET", "/v1/audit", &[], "");
+        r.query.insert("limit".into(), "1".into());
+        let p = body_json(&route(&e, r, PROD));
+        let Some(Json::Array(entries)) = p.get("entries") else { panic!() };
+        assert_eq!(entries.len(), 1);
+        assert!(p.get("next_since").unwrap().as_f().is_some());
+    }
+
+    #[test]
     fn the_agent_guide_names_this_host() {
         let e = engine();
         let r = route(&e, req("GET", "/llms.txt", &[("Host", "trust.example.com")], ""), PROD);
@@ -1849,10 +1964,10 @@ mod tests {
     #[test]
     fn a_trusted_partner_proves_itself_by_its_domain_and_its_player_ids_are_reserved() {
         let e = engine();
-        e.lock().unwrap().reserved_prefixes.push("arena".into());
-        e.lock().unwrap().register_source("arena", 600, 0);
+        e.lock().unwrap_or_else(|e| e.into_inner()).reserved_prefixes.push("arena".into());
+        e.lock().unwrap_or_else(|e| e.into_inner()).register_source("arena", 600, 0);
         let hash = hash::sha256_hex(b"arena-secret");
-        source_hash_cache().lock().unwrap().insert("arena".into(), (hash, now_ms()));
+        source_hash_cache().lock().unwrap_or_else(|e| e.into_inner()).insert("arena".into(), (hash, now_ms()));
         let att = |secret: &str, event: &str| {
             let b = format!(r#"{{"source":"arena","secret":"{secret}","subject":"arena.alice","event":"{event}","domain":"wagering"}}"#);
             route(&e, req("POST", "/v1/attestations", &[], &b), PROD)
@@ -1916,7 +2031,7 @@ mod tests {
     fn a_revoked_key_stops_working() {
         let e = engine();
         let key = new_key(&e);
-        let id = e.lock().unwrap().customer_for_key(&key).unwrap().id.clone();
+        let id = e.lock().unwrap_or_else(|e| e.into_inner()).customer_for_key(&key).unwrap().id.clone();
         let r = route(&e, req("POST", &format!("/v1/customers/{id}/revoke"), &[("X-Admin-Secret", "adm")], ""), PROD);
         assert_eq!(r.status, 200);
         assert_eq!(route(&e, req("GET", "/v1/agents/a", &[("X-Api-Key", &key)], ""), PROD).status, 401);
@@ -1956,7 +2071,7 @@ mod settlement_tests {
     fn a_platform_sees_what_it_owes_and_confirms_paying_it() {
         let e = Mutex::new(Engine::with_admin_secret("adm"));
         let (key, other) = {
-            let mut g = e.lock().unwrap();
+            let mut g = e.lock().unwrap_or_else(|e| e.into_inner());
             g.create_customer("Arena", "k_arena", 0);
             g.create_customer("Other", "k_other", 0);
             ("k_arena", "k_other")
@@ -2070,12 +2185,12 @@ mod settlement_tests {
         assert_eq!(route(&e, from("203.0.113.9", "at_live_nope"), PROD).status, 401);
         // A real key skips the limit and is metered to that customer.
         let key = "at_live_real";
-        let cus = e.lock().unwrap().create_customer("arena", key, 0);
+        let cus = e.lock().unwrap_or_else(|e| e.into_inner()).create_customer("arena", key, 0);
         for _ in 0..3 {
             assert_eq!(route(&e, from("203.0.113.9", key), PROD).status, 200);
         }
         let now = now_ms();
-        let engine = e.lock().unwrap();
+        let engine = e.lock().unwrap_or_else(|e| e.into_inner());
         let used = engine.customer(&cus).unwrap().usage.get(&billing::month_of(now)).unwrap().lookups;
         assert_eq!(used, 3);
     }
@@ -2088,7 +2203,7 @@ mod settlement_tests {
             r.headers.insert("x-admin-secret".into(), "adm".into());
             r
         };
-        let cus = e.lock().unwrap().create_customer("arena", "at_live_k", now_ms());
+        let cus = e.lock().unwrap_or_else(|e| e.into_inner()).create_customer("arena", "at_live_k", now_ms());
         let path = format!("/v1/customers/{cus}/payments");
         assert_eq!(route(&e, req("POST", &path, "", r#"{"amount_usd":29,"reference":"pi_1"}"#), PROD).status, 401);
         assert_eq!(route(&e, admin("POST", &path, r#"{"amount_usd":29}"#), PROD).status, 400);

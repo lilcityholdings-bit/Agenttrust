@@ -131,7 +131,7 @@ fn write_escaped(s: &str, out: &mut String) {
 pub fn parse(input: &str) -> Result<Json, String> {
     let bytes: Vec<char> = input.chars().collect();
     let mut pos = 0usize;
-    let value = parse_value(&bytes, &mut pos)?;
+    let value = parse_value(&bytes, &mut pos, 0)?;
     skip_ws(&bytes, &mut pos);
     if pos != bytes.len() {
         return Err("trailing characters after the JSON value".into());
@@ -145,12 +145,20 @@ fn skip_ws(b: &[char], pos: &mut usize) {
     }
 }
 
-fn parse_value(b: &[char], pos: &mut usize) -> Result<Json, String> {
+/// How deeply arrays and objects may nest. Nothing this service reads needs more than a few
+/// levels; without a ceiling, a body of a million `[` recurses until the stack overflows, and a
+/// stack overflow aborts the whole process, not just the request.
+const MAX_DEPTH: usize = 64;
+
+fn parse_value(b: &[char], pos: &mut usize, depth: usize) -> Result<Json, String> {
+    if depth > MAX_DEPTH {
+        return Err(format!("JSON nested more than {MAX_DEPTH} levels deep"));
+    }
     skip_ws(b, pos);
     let Some(&c) = b.get(*pos) else { return Err("unexpected end of input".into()) };
     match c {
-        '{' => parse_object(b, pos),
-        '[' => parse_array(b, pos),
+        '{' => parse_object(b, pos, depth + 1),
+        '[' => parse_array(b, pos, depth + 1),
         '"' => Ok(Json::Str(parse_string(b, pos)?)),
         't' | 'f' => parse_bool(b, pos),
         'n' => {
@@ -231,7 +239,7 @@ fn parse_string(b: &[char], pos: &mut usize) -> Result<String, String> {
     }
 }
 
-fn parse_array(b: &[char], pos: &mut usize) -> Result<Json, String> {
+fn parse_array(b: &[char], pos: &mut usize, depth: usize) -> Result<Json, String> {
     *pos += 1; // '['
     let mut items = Vec::new();
     skip_ws(b, pos);
@@ -240,7 +248,7 @@ fn parse_array(b: &[char], pos: &mut usize) -> Result<Json, String> {
         return Ok(Json::Array(items));
     }
     loop {
-        items.push(parse_value(b, pos)?);
+        items.push(parse_value(b, pos, depth)?);
         skip_ws(b, pos);
         match b.get(*pos) {
             Some(',') => *pos += 1,
@@ -253,7 +261,7 @@ fn parse_array(b: &[char], pos: &mut usize) -> Result<Json, String> {
     }
 }
 
-fn parse_object(b: &[char], pos: &mut usize) -> Result<Json, String> {
+fn parse_object(b: &[char], pos: &mut usize, depth: usize) -> Result<Json, String> {
     *pos += 1; // '{'
     let mut map = BTreeMap::new();
     skip_ws(b, pos);
@@ -269,7 +277,7 @@ fn parse_object(b: &[char], pos: &mut usize) -> Result<Json, String> {
             return Err("expected `:` after an object key".into());
         }
         *pos += 1;
-        let value = parse_value(b, pos)?;
+        let value = parse_value(b, pos, depth)?;
         map.insert(key, value);
         skip_ws(b, pos);
         match b.get(*pos) {
@@ -285,6 +293,16 @@ fn parse_object(b: &[char], pos: &mut usize) -> Result<Json, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::parse as parse_depth;
+
+    #[test]
+    fn deep_nesting_is_refused_instead_of_overflowing_the_stack() {
+        assert!(parse_depth(&"[".repeat(200_000)).is_err());
+        assert!(parse_depth(&"{\"a\":".repeat(100_000)).is_err());
+        let ok = format!("{}1{}", "[".repeat(60), "]".repeat(60));
+        assert!(parse_depth(&ok).is_ok());
+    }
+
     use super::*;
 
     #[test]

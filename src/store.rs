@@ -563,6 +563,13 @@ pub enum KeyCheck {
     Unknown,
 }
 
+/// Whether a new agent id is acceptable: short, printable, and safe inside a URL path and a
+/// page. Ids claimed before this rule existed keep working.
+pub fn valid_agent_id(id: &str) -> bool {
+    (1..=64).contains(&id.chars().count())
+        && id.chars().all(|c| !c.is_control() && !c.is_whitespace() && !"/?#<>\"'\\%".contains(c))
+}
+
 /// How long one paid period of a self-serve plan lasts.
 pub const PLAN_PERIOD_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
@@ -793,6 +800,9 @@ impl Engine {
     /// Claims `id` on first use, or checks `secret` against what was claimed before. Every write
     /// endpoint that lets a caller assert "I am this agent/source" runs this first.
     pub fn authenticate(&mut self, id: &str, secret: Option<&str>) -> Result<(), &'static str> {
+        if !self.agent_secrets.contains_key(id) && !valid_agent_id(id) {
+            return Err("agent ids are 1-64 characters, with no spaces or / ? # < > \" '");
+        }
         match self.agent_secrets.get(id) {
             Some(stored) => match secret {
                 Some(given) if &sha256_hex(given.as_bytes()) == stored => Ok(()),
@@ -2347,7 +2357,7 @@ impl Engine {
         }
         let score = self.network.lookup(&att.subject).map(|s| s.in_domain(att.domain)).unwrap_or(0);
         let standing = self.network.source_standing(&att.source);
-        if att.subject.protocol_and_id().0 == "local" {
+        if att.subject.protocol_and_id().0 == "local" && standing > 0 {
             self.touch(&att.subject.protocol_and_id().1, now_ms);
         }
         self.append(
