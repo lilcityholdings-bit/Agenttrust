@@ -566,8 +566,10 @@ pub enum KeyCheck {
 /// Whether a new agent id is acceptable: short, printable, and safe inside a URL path and a
 /// page. Ids claimed before this rule existed keep working.
 pub fn valid_agent_id(id: &str) -> bool {
-    (1..=64).contains(&id.chars().count())
-        && id.chars().all(|c| !c.is_control() && !c.is_whitespace() && !"/?#<>\"'\\%".contains(c))
+    // ASCII only: letters from other alphabets that look identical to Latin ones (Cyrillic "а"
+    // for "a") would let a scammer register a name that reads exactly like a trusted bot's.
+    (1..=64).contains(&id.len())
+        && id.chars().all(|c| c.is_ascii_graphic() && !"/?#<>\"'\\%".contains(c))
 }
 
 /// How long one paid period of a self-serve plan lasts.
@@ -711,6 +713,9 @@ pub struct Engine {
     /// authenticated call for an id sets its secret, and every call after that must match. This
     /// is what closes "any caller can claim to be any agent_id" — see [`Engine::authenticate`].
     agent_secrets: HashMap<String, String>,
+    /// Every claimed id, lowercased, so a new id can't differ from an existing one by case alone
+    /// ("Alice-bot" posing as "alice-bot"). Rebuilt from `agent_secrets`, not persisted.
+    claimed_lower: HashSet<String>,
     /// SHA-256 of the operator's admin secret, required to register a reporting source's
     /// standing. Unlike an agent's own secret this cannot be claimed by whoever asks first,
     /// because registering a source is what decides how much *weight* its reports carry against
@@ -775,6 +780,7 @@ impl Engine {
             platforms: HashMap::new(),
             pricing: Pricing::default(),
             agent_secrets: HashMap::new(),
+            claimed_lower: HashSet::new(),
             admin_secret_hash: sha256_hex(admin_secret.as_bytes()),
             network,
             audit: Vec::new(),
@@ -800,8 +806,13 @@ impl Engine {
     /// Claims `id` on first use, or checks `secret` against what was claimed before. Every write
     /// endpoint that lets a caller assert "I am this agent/source" runs this first.
     pub fn authenticate(&mut self, id: &str, secret: Option<&str>) -> Result<(), &'static str> {
-        if !self.agent_secrets.contains_key(id) && !valid_agent_id(id) {
-            return Err("agent ids are 1-64 characters, with no spaces or / ? # < > \" '");
+        if !self.agent_secrets.contains_key(id) {
+            if !valid_agent_id(id) {
+                return Err("agent ids are 1-64 characters: letters, digits and simple punctuation, no spaces or / ? # < > \" '");
+            }
+            if self.claimed_lower.contains(&id.to_ascii_lowercase()) {
+                return Err("that id differs from an existing one only by upper/lower case — pick a clearly different one");
+            }
         }
         match self.agent_secrets.get(id) {
             Some(stored) => match secret {
@@ -815,6 +826,7 @@ impl Engine {
                 }
                 Some(given) => {
                     self.agent_secrets.insert(id.to_string(), sha256_hex(given.as_bytes()));
+                    self.claimed_lower.insert(id.to_ascii_lowercase());
                     Ok(())
                 }
                 None => Err("this id has not been claimed yet — include a secret to claim it"),
@@ -1139,6 +1151,7 @@ impl Engine {
     /// name can never be claimed by whoever happened to ask first.
     pub fn pin_secret_hash(&mut self, id: &str, secret_hash: &str) {
         self.agent_secrets.insert(id.to_string(), secret_hash.to_string());
+        self.claimed_lower.insert(id.to_ascii_lowercase());
     }
 
     /// Turns a key off — for a customer who stopped paying, or a key that leaked.
@@ -2944,6 +2957,7 @@ fn verified_protocols_json(&self, agent_id: &str) -> Json {
                 let hash =
                     item.get("secret_hash").and_then(|v| v.as_str()).ok_or("bad agent_secrets entry")?;
                 engine.agent_secrets.insert(id.to_string(), hash.to_string());
+                engine.claimed_lower.insert(id.to_ascii_lowercase());
             }
         }
         // Absent in snapshots written before billing existed — treated as "no customers yet".

@@ -1927,6 +1927,16 @@ mod tests {
     }
 
     #[test]
+    fn look_alike_names_are_refused() {
+        let e = engine();
+        assert_eq!(route(&e, req("POST", "/v1/register", &[], r#"{"name":"alice-bot"}"#), PROD).status, 201);
+        assert_eq!(route(&e, req("POST", "/v1/register", &[], r#"{"name":"Alice-Bot"}"#), PROD).status, 409, "case only");
+        let cyrillic = "{\"parties\":[\"\u{430}lice-bot\",\"x\"],\"secret\":\"s\"}";
+        assert_eq!(route(&e, req("POST", "/v1/agreements", &[], cyrillic), PROD).status, 400, "look-alike letters");
+        assert_eq!(route(&e, req("POST", "/v1/register", &[], r#"{"name":"alice-bot-2"}"#), PROD).status, 201);
+    }
+
+    #[test]
     fn a_partner_can_only_report_about_its_own_players() {
         let e = engine();
         e.lock().unwrap().register_source("arena", 600, 0);
