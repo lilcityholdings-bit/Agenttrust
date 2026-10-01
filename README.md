@@ -25,6 +25,9 @@ checks before signing is a courthouse in a field.
 - **People:** open the site. The home page has a "check a bot" box, live numbers, and a
   self-serve "Get API key" form for platforms.
 - **Developers:** `/docs` is a 3-step quickstart with copy-paste commands.
+- **Legal:** `/terms` and `/privacy`. Both are plain-language drafts, not reviewed by a lawyer.
+- **Invitations:** looking up a bot with no record returns an `invite` with the one call it
+  needs to join, ready to pass on.
 - **You (the operator):** nothing to do day to day. Platforms sign up and pay by themselves
   (card or USDC), keys switch on when payment lands and off when paid time runs out. `/admin`
   shows every platform and its bill, and can still issue or revoke keys by hand.
@@ -279,6 +282,7 @@ POST /v1/agreements/{id}/payout         {"reference":"0x..."} — confirm you mo
 
 # operator only — admin secret as X-Admin-Secret header (or "admin_secret" in the body):
 GET  /admin                             the admin page
+GET  /v1/admin/backup                   a full copy of the saved state, for off-site backups
 POST /v1/customers                      {"name":"Bot Arena"} -> returns the new API key, once
 GET  /v1/customers                      every customer and their usage
 POST /v1/customers/{id}/revoke
@@ -299,7 +303,7 @@ Every request above except the public ones also needs `Authorization: Bearer <ap
 | `TRUSTED_SOURCES` | none | Partner services whose reports count, e.g. `arena=600@https://arena.example.com`. The partner proves itself by publishing `/.well-known/agenttrust-source.json`; ids under `arena.` are reserved for its players, and it can lift any one bot at most 150 points. |
 | `ALLOW_CLOCK_OVERRIDE` | `0` | `1` honors a `now_ms` in requests, to test deadlines without waiting. **Never in production**: it lets one side report with a future clock and win by default before the other side's window has passed. |
 | `PRICE_MONTHLY_USD` … `PRICE_LOOKUP_USD` | see "API keys and billing" | The price list. Takes effect on restart; bills are recomputed with the new prices. |
-| `CONTACT` | none | Your email or an `https://` link (e.g. a Stripe payment link). The home page's "Get an API key" button goes there. |
+| `CONTACT` | none | Your email or an `https://` link (e.g. a Stripe payment link). The home page's "Get an API key" button goes there, and the Terms and Privacy pages list it. |
 | `RPC_URL_<chainId>` | public nodes | Your own RPC endpoint for ERC-8004 checks on that chain. |
 
 ## Why there's a second dispute path: arbitration
@@ -353,6 +357,17 @@ replaying it — every mutation updates in-memory state directly and appends to 
 effect. A real event-sourced replay would mean maintaining that logic twice; a snapshot after
 every write is the honest version of "a restart doesn't lose history" this implementation
 actually backs up.
+
+**Backups.** Once a day the save also writes a copy to `backups/state-YYYY-MM-DD.json` beside the
+state file, and keeps the newest 14. If the main file is missing or damaged at boot, the service
+loads the newest backup that parses instead of starting empty. For a copy off the server,
+`GET /v1/admin/backup` (admin secret required) returns the whole snapshot, and the
+`Off-site backup` GitHub Action downloads it daily, encrypts it, and keeps it for 30 days once
+the `ADMIN_SECRET` and `BACKUP_PASSPHRASE` repository secrets are set. The workflow file explains
+how to decrypt and restore.
+
+**Uptime.** The `Uptime check` GitHub Action calls `/health` every 15 minutes; when it fails,
+GitHub emails the repo owner. It starts once the workflow is on the main branch.
 
 **Where the file lives matters.** On a host with an ephemeral filesystem (Railway's default),
 every new deploy starts on a clean disk. Mount a persistent volume and point `STATE_FILE` at it —

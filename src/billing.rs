@@ -169,6 +169,12 @@ pub fn month_of(ms: i64) -> String {
     format!("{y:04}-{m:02}")
 }
 
+/// "YYYY-MM-DD" for a unix-ms timestamp, in UTC.
+pub fn day_of(ms: i64) -> String {
+    let (y, m, d) = civil_from_days(ms.div_euclid(86_400_000));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Every month from `from` through `to` inclusive, as "YYYY-MM".
 pub fn months_between(from_ms: i64, to_ms: i64) -> Vec<String> {
     let (mut y, mut m, _) = civil_from_days(from_ms.div_euclid(86_400_000));
@@ -214,6 +220,8 @@ mod tests {
         let jan = 1_767_225_600_000; // 2026-01-01T00:00:00Z
         assert_eq!(month_of(jan - 1), "2025-12");
         assert_eq!(month_of(jan), "2026-01");
+        assert_eq!(day_of(jan - 1), "2025-12-31");
+        assert_eq!(day_of(jan), "2026-01-01");
         assert_eq!(months_between(jan - 1, jan + 40 * 86_400_000), vec!["2025-12", "2026-01", "2026-02"]);
     }
 

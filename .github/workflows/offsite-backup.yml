@@ -1,0 +1,49 @@
+# Once a day, downloads a copy of the live state and keeps it here for 30 days, encrypted.
+# The repo is public, so the copy is encrypted with BACKUP_PASSPHRASE before it is stored;
+# without that passphrase it is unreadable. Needs two repository secrets: ADMIN_SECRET (the
+# same one set in Railway) and BACKUP_PASSPHRASE (a long random phrase kept in a password
+# manager). Until both exist, this job skips itself.
+#
+# To restore: download the artifact, then
+#   openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in state.json.enc -out state.json \
+#     -pass pass:'<BACKUP_PASSPHRASE>'
+# and put state.json at STATE_FILE on the server.
+name: Off-site backup
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download and encrypt
+        id: fetch
+        env:
+          URL: ${{ vars.AGENTTRUST_URL || 'https://agenttrust-production-381e.up.railway.app' }}
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          if [ -z "$ADMIN_SECRET" ] || [ -z "$BACKUP_PASSPHRASE" ]; then
+            echo "ADMIN_SECRET or BACKUP_PASSPHRASE is not set; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          umask 077
+          curl -fsS --max-time 60 --retry 3 -H "X-Admin-Secret: $ADMIN_SECRET" "$URL/v1/admin/backup" -o state.json
+          test -s state.json
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in state.json -out state.json.enc -pass env:BACKUP_PASSPHRASE
+          rm -f state.json
+      - name: Keep the encrypted copy
+        if: steps.fetch.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: agenttrust-state-${{ github.run_id }}
+          path: state.json.enc
+          retention-days: 30

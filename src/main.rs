@@ -44,6 +44,8 @@ const TRUST_PAGE: &str = include_str!("trust.html");
 /// The home page people see at `/`, and the 3-step developer quickstart at `/docs`.
 const HOME_PAGE: &str = include_str!("home.html");
 const DOCS_PAGE: &str = include_str!("docs.html");
+const TERMS_PAGE: &str = include_str!("terms.html");
+const PRIVACY_PAGE: &str = include_str!("privacy.html");
 
 /// The guide for AI agents, served at `/llms.txt` and `/skill.md`: everything a bot needs to
 /// use the service, in the form models read best.
@@ -82,26 +84,79 @@ fn state_path() -> std::path::PathBuf {
 /// or foreign file is a reason to log a warning and boot clean, not a reason to refuse to start
 /// — losing history is recoverable, refusing to serve traffic is not.
 fn load_or_new(path: &std::path::Path, admin_secret: &str) -> Engine {
-    match std::fs::read_to_string(path) {
-        Ok(text) => match json::parse(&text) {
-            Ok(snapshot) => match Engine::from_snapshot(&snapshot) {
-                Ok(engine) => {
-                    println!("agenttrust: restored state from {}", path.display());
-                    return engine;
-                }
-                Err(e) => eprintln!(
-                    "agenttrust: {} did not parse as a valid snapshot ({e}) — starting fresh",
-                    path.display()
-                ),
-            },
-            Err(e) => eprintln!(
-                "agenttrust: {} is not valid JSON ({e}) — starting fresh",
-                path.display()
-            ),
-        },
-        Err(_) => println!("agenttrust: no existing state at {} — starting fresh", path.display()),
+    if let Some(engine) = load_snapshot(path) {
+        return engine;
     }
+    // The main file is missing or damaged. A daily backup loses at most a day; starting empty
+    // loses everything, so try the backups newest first before giving up.
+    for backup in backups_newest_first(path) {
+        if let Some(engine) = load_snapshot(&backup) {
+            eprintln!("agenttrust: recovered state from backup {}", backup.display());
+            return engine;
+        }
+    }
+    println!("agenttrust: no usable state at {} — starting fresh", path.display());
     Engine::with_admin_secret(admin_secret)
+}
+
+fn load_snapshot(path: &std::path::Path) -> Option<Engine> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let parsed = json::parse(&text).map_err(|e| e.to_string()).and_then(|j| Engine::from_snapshot(&j).map_err(|e| e.to_string()));
+    match parsed {
+        Ok(engine) => {
+            println!("agenttrust: restored state from {}", path.display());
+            Some(engine)
+        }
+        Err(e) => {
+            eprintln!("agenttrust: {} is not a valid snapshot ({e})", path.display());
+            None
+        }
+    }
+}
+
+/// How many daily backups to keep next to the state file.
+const BACKUPS_KEPT: usize = 14;
+
+/// Daily copies live in a `backups` folder beside the state file, so they share its volume.
+fn backup_dir(path: &std::path::Path) -> std::path::PathBuf {
+    path.parent().unwrap_or(std::path::Path::new(".")).join("backups")
+}
+
+/// Backup files are named `state-YYYY-MM-DD.json`, so sorting by name sorts by date.
+fn backups_newest_first(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(backup_dir(path))
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    name.starts_with("state-") && name.ends_with(".json")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files.reverse();
+    files
+}
+
+/// Writes today's backup if there isn't one yet, then deletes all but the newest few.
+fn backup_daily(path: &std::path::Path, body: &str, now: i64) {
+    let dir = backup_dir(path);
+    let target = dir.join(format!("state-{}.json", billing::day_of(now)));
+    if target.exists() {
+        return;
+    }
+    let tmp = target.with_extension("json.tmp");
+    let written = std::fs::create_dir_all(&dir)
+        .and_then(|_| std::fs::write(&tmp, body))
+        .and_then(|_| std::fs::rename(&tmp, &target));
+    if let Err(e) = written {
+        eprintln!("agenttrust: could not write backup {}: {e}", target.display());
+        return;
+    }
+    for old in backups_newest_first(path).into_iter().skip(BACKUPS_KEPT) {
+        let _ = std::fs::remove_file(old);
+    }
 }
 
 /// When state was last written, and how long the audit log was then. Writing the whole snapshot
@@ -138,13 +193,38 @@ fn save(engine: &Engine, path: &std::path::Path) {
         f.sync_all()
     })();
     match write_result {
-        Ok(()) => {
-            if let Err(e) = std::fs::rename(&tmp, path) {
-                eprintln!("agenttrust: could not save state to {}: {e}", path.display());
-            }
-        }
+        Ok(()) => match std::fs::rename(&tmp, path) {
+            Ok(()) => backup_daily(path, &body, now_ms()),
+            Err(e) => eprintln!("agenttrust: could not save state to {}: {e}", path.display()),
+        },
         Err(e) => eprintln!("agenttrust: could not write {}: {e}", tmp.display()),
     }
+}
+
+/// The Terms and Privacy pages, with the operator's contact filled in.
+fn legal_page(template: &str) -> String {
+    let contact = contact().unwrap_or_else(|| "the contact address on the home page".to_string());
+    template.replace("{{contact}}", &html_escape(&contact))
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// A bot checking a stranger with no record gets a ready-made invitation to pass on, so every
+/// lookup of an unregistered bot is a chance for it to join.
+fn with_invite(profile: Json, base: &str) -> Json {
+    let Json::Object(mut map) = profile else { return profile };
+    if map.get("known") == Some(&Json::Bool(false)) {
+        map.insert(
+            "invite".to_string(),
+            Json::str(format!(
+                "This bot has no record here yet. Ask it to register free in one call: \
+                 POST {base}/v1/register {{\"name\":\"its-name\"}}. Guide: {base}/llms.txt"
+            )),
+        );
+    }
+    Json::Object(map)
 }
 
 fn now_ms() -> i64 {
@@ -253,6 +333,8 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
         (method, segments),
         ("GET", [])
             | ("GET", ["docs"])
+            | ("GET", ["terms"])
+            | ("GET", ["privacy"])
             | ("GET", ["health"])
             | ("GET", ["admin"])
             | ("GET", ["trust", ..])
@@ -457,7 +539,7 @@ fn badge_svg(score: i64, level: &str, verified: bool) -> String {
 
 /// Operator-only endpoints, gated by the admin secret rather than a customer key.
 fn is_admin_route(segments: &[&str]) -> bool {
-    matches!(segments, ["v1", "customers", ..] | ["v1", "sources"])
+    matches!(segments, ["v1", "customers", ..] | ["v1", "sources"] | ["v1", "admin", ..])
 }
 
 fn body_of(req: &Request) -> Result<Json, Response> {
@@ -572,6 +654,8 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
     match (req.method.as_str(), segments.as_slice()) {
         ("GET", ["admin"]) => Response::html(ADMIN_PAGE.to_string()),
         ("GET", ["docs"]) => Response::html(DOCS_PAGE.to_string()),
+        ("GET", ["terms"]) => Response::html(legal_page(TERMS_PAGE)),
+        ("GET", ["privacy"]) => Response::html(legal_page(PRIVACY_PAGE)),
         // A browser gets the home page; a bot or script asking for JSON gets the status below.
         ("GET", []) if req.header("accept").map(|a| a.contains("text/html")).unwrap_or(false) => {
             let (agents, settled, platforms) = engine.stats();
@@ -652,7 +736,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             ]))
         }
 
-        ("GET", ["v1", "trust", agent_id]) => ok(engine.trust_profile_json(agent_id, now)),
+        ("GET", ["v1", "trust", agent_id]) => ok(with_invite(engine.trust_profile_json(agent_id, now), &base_url(&req))),
 
         ("GET", ["v1", "trust", agent_id, "badge.svg"]) => {
             let p = engine.trust_profile_json(agent_id, now);
@@ -704,6 +788,15 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 ])
                 .to_string(),
             )
+        }
+
+        // A full copy of the saved state, for keeping an off-site backup. It holds hashed
+        // secrets and every customer record, so it is admin-only like the rest of /v1/admin.
+        ("GET", ["v1", "admin", "backup"]) => {
+            if let Err(e) = engine.check_admin(admin_secret_of(&req, &body)) {
+                return err(401, e);
+            }
+            ok(engine.to_snapshot())
         }
 
         ("GET", ["v1", "customers"]) => {
@@ -2059,6 +2152,72 @@ mod tests {
         let r = route(&e, req("POST", &format!("/v1/agreements/{id}/report"), &h, far), PROD);
         let result = json::parse(&r.body).unwrap();
         assert_eq!(result.get("result").unwrap().as_str(), Some("waiting"), "bob still gets his window: {}", r.body);
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("agenttrust-test-{name}-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn saving_writes_one_backup_a_day_and_keeps_only_the_newest() {
+        let dir = scratch_dir("backups");
+        let path = dir.join("state.json");
+        let day = 86_400_000;
+        for i in 0..(BACKUPS_KEPT as i64 + 5) {
+            backup_daily(&path, "{}", 1_767_225_600_000 + i * day);
+            backup_daily(&path, "{}", 1_767_225_600_000 + i * day + 1_000); // same day: no second copy
+        }
+        let kept = backups_newest_first(&path);
+        assert_eq!(kept.len(), BACKUPS_KEPT);
+        assert!(kept[0].to_string_lossy().ends_with("state-2026-01-19.json"), "{:?}", kept[0]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_damaged_state_file_is_recovered_from_the_newest_good_backup() {
+        let dir = scratch_dir("restore");
+        let path = dir.join("state.json");
+        let e = engine();
+        route(&e, req("POST", "/v1/register", &[], r#"{"name":"survivor"}"#), PROD);
+        save(&e.lock().unwrap(), &path);
+        assert_eq!(backups_newest_first(&path).len(), 1, "the first save also makes today's backup");
+        std::fs::write(&path, "{ half-written").unwrap();
+        let restored = load_or_new(&path, "adm");
+        assert!(restored.is_claimed("survivor"), "history came back from the backup");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_admin_backup_download_needs_the_admin_secret() {
+        let e = engine();
+        assert_eq!(route(&e, req("GET", "/v1/admin/backup", &[], ""), PROD).status, 401);
+        let r = route(&e, req("GET", "/v1/admin/backup", &[("X-Admin-Secret", "adm")], ""), PROD);
+        assert_eq!(r.status, 200);
+        assert!(Engine::from_snapshot(&body_json(&r)).is_ok(), "the download is a loadable snapshot");
+    }
+
+    #[test]
+    fn terms_and_privacy_pages_are_served_with_the_contact_filled_in() {
+        let e = engine();
+        for path in ["/terms", "/privacy"] {
+            let r = route(&e, req("GET", path, &[], ""), PROD);
+            assert_eq!(r.status, 200, "{path}");
+            assert!(r.content_type.starts_with("text/html"));
+            assert!(!r.body.contains("{{contact}}"), "{path} left a placeholder");
+        }
+    }
+
+    #[test]
+    fn looking_up_an_unregistered_bot_returns_an_invitation() {
+        let e = engine();
+        let r = route(&e, req("GET", "/v1/trust/stranger-bot", &[("Host", "trust.example.com")], ""), PROD);
+        let invite = body_json(&r).get("invite").and_then(|v| v.as_str()).map(|s| s.to_string()).expect("invite");
+        assert!(invite.contains("https://trust.example.com/v1/register"), "{invite}");
+        route(&e, req("POST", "/v1/register", &[], r#"{"name":"known-bot"}"#), PROD);
+        let r = route(&e, req("GET", "/v1/trust/known-bot", &[], ""), PROD);
+        assert!(body_json(&r).get("invite").is_none(), "a registered bot needs no invitation");
     }
 }
 
