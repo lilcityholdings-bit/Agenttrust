@@ -1,5 +1,5 @@
 //! An MCP (Model Context Protocol) server at `POST /mcp`, so an AI assistant can use
-//! agenttrust by adding one URL — no code, no SDK.
+//! Bot Trust Bureau by adding one URL — no code, no SDK.
 //!
 //! Stateless JSON-RPC over plain POST (MCP's "streamable HTTP" transport without the optional
 //! event stream). Every tool is a thin wrapper that turns its arguments into the same HTTP call
@@ -14,7 +14,7 @@ use crate::json::Json;
 use crate::store::Engine;
 use crate::Config;
 
-const INSTRUCTIONS: &str = "agenttrust keeps a public trust score for every bot and settles deals between bots. \
+const INSTRUCTIONS: &str = "Bot Trust Bureau keeps a public trust score for every bot and settles deals between bots. \
 Before dealing with a bot you don't know, call check_trust. To build your own record: register once (keep the \
 secret), open_deal with the other bot, and when the deal is done both bots report_outcome. Matching reports \
 settle; a disagreement goes to a neutral jury. Going silent or lying costs far more than honest deals earn.";
@@ -49,7 +49,7 @@ fn tools() -> Json {
     Json::Array(vec![
         tool(
             "register",
-            "Create a free agenttrust identity for your bot in one call. Returns agent_id and a secret — save the secret, it is shown once.",
+            "Create a free Bot Trust Bureau identity for your bot in one call. Returns agent_id and a secret — save the secret, it is shown once.",
             vec![("name", prop("string", "Optional name, 3-48 letters/digits/-/_/. — made up for you if left out."))],
             &[],
             false,
@@ -58,7 +58,7 @@ fn tools() -> Json {
             "check_trust",
             "Look up any bot's public trust profile: trust_level (unknown/caution/fair/good/excellent), score, the reasons, and its proven identities. Give agent_id, or protocol + id to look a bot up by wallet, ICP principal, DID or domain.",
             vec![
-                ("agent_id", prop("string", "The bot's agenttrust id.")),
+                ("agent_id", prop("string", "The bot's Bot Trust Bureau id.")),
                 ("protocol", prop("string", "Or: icp, eth, erc8004, did, web_bot_auth.")),
                 ("id", prop("string", "The identity for that protocol.")),
             ],
@@ -243,7 +243,7 @@ pub fn handle(engine: &Mutex<Engine>, req: &Request, body: &Json, cfg: Config) -
                     ("capabilities", Json::obj(vec![("tools", Json::obj(vec![]))])),
                     (
                         "serverInfo",
-                        Json::obj(vec![("name", Json::str("agenttrust")), ("version", Json::str(env!("CARGO_PKG_VERSION")))]),
+                        Json::obj(vec![("name", Json::str("Bot Trust Bureau")), ("version", Json::str(env!("CARGO_PKG_VERSION")))]),
                     ),
                     ("instructions", Json::str(INSTRUCTIONS)),
                 ]),
