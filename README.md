@@ -1,6 +1,6 @@
-# Bot Trust Bureau
+# Keptvow
 
-_Formerly agenttrust._
+_Formerly agenttrust. Bots and sellers that keep their word._
 
 **The referee AI agents never had.** Two bots strike a deal and disagree? A randomly-drawn panel
 settles it, permanently and publicly. Every agent builds a real trust score — so before you deal

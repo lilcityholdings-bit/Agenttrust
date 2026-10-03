@@ -446,11 +446,11 @@ fn badge_svg(score: i64, level: &str, verified: bool) -> String {
         _ => "#6c757d",
     };
     let right = format!("{score} · {level}{}", if verified { " ✓" } else { "" });
-    let lw = 122;
+    let lw = 66;
     let rw = 12 + right.chars().count() as i64 * 7;
     let w = lw + rw;
     format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="20" role="img" aria-label="Bot Trust Bureau: {right}"><title>Bot Trust Bureau: {right}</title><rect width="{lw}" height="20" rx="3" fill="#343a40"/><rect x="{lw}" width="{rw}" height="20" rx="3" fill="{color}"/><rect x="{lw}" width="4" height="20" fill="{color}"/><g fill="#fff" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11"><text x="8" y="14">Bot Trust Bureau</text><text x="{tx}" y="14">{right}</text></g></svg>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="20" role="img" aria-label="Keptvow: {right}"><title>Keptvow: {right}</title><rect width="{lw}" height="20" rx="3" fill="#343a40"/><rect x="{lw}" width="{rw}" height="20" rx="3" fill="{color}"/><rect x="{lw}" width="4" height="20" fill="{color}"/><g fill="#fff" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11"><text x="8" y="14">Keptvow</text><text x="{tx}" y="14">{right}</text></g></svg>"##,
         tx = lw + 6
     )
 }
@@ -616,7 +616,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     ("important", Json::str("Save the secret now — it is shown once and proves you are this bot on every call.")),
                     ("trust_profile", Json::str(format!("{base}/v1/trust/{name}"))),
                     ("profile_page", Json::str(format!("{base}/trust/{name}"))),
-                    ("badge_markdown", Json::str(format!("[![Bot Trust Bureau]({base}/v1/trust/{name}/badge.svg)]({base}/trust/{name})"))),
+                    ("badge_markdown", Json::str(format!("[![Keptvow]({base}/v1/trust/{name}/badge.svg)]({base}/trust/{name})"))),
                     (
                         "next",
                         Json::str(format!(
@@ -799,7 +799,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             None => err(401, "usage is per customer — call this with your API key"),
         },
         ("GET", ["health"]) | ("GET", []) => ok(Json::obj(vec![
-            ("service", Json::str("Bot Trust Bureau")),
+            ("service", Json::str("Keptvow")),
             ("status", Json::str("ok")),
             ("free_tier", Json::str("bots need no key: POST /v1/register, then use every agent endpoint")),
             ("agent_guide", Json::str("/llms.txt")),
@@ -1877,7 +1877,7 @@ mod tests {
         let e = engine();
         let call = |body: &str| body_json(&route(&e, req("POST", "/mcp", &[], body), PROD));
         let init = call(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#);
-        assert_eq!(init.get("result").unwrap().get("serverInfo").unwrap().get("name").unwrap().as_str(), Some("Bot Trust Bureau"));
+        assert_eq!(init.get("result").unwrap().get("serverInfo").unwrap().get("name").unwrap().as_str(), Some("Keptvow"));
         assert_eq!(route(&e, req("POST", "/mcp", &[], r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#), PROD).status, 202);
         let list = call(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
         let Some(Json::Array(tools)) = list.get("result").unwrap().get("tools") else { panic!() };

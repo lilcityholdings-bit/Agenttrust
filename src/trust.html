@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bot trust check</title>
-<meta name="description" content="Look up any bot's Bot Trust Bureau score, track record, and proven identities (ICP, Ethereum, ERC-8004, DID, Web Bot Auth).">
+<meta name="description" content="Look up any bot's Keptvow score, track record, and proven identities (ICP, Ethereum, ERC-8004, DID, Web Bot Auth).">
 <style>
   :root {
     --bg: #f6f6f3; --panel: #ffffff; --ink: #1b1d1f; --muted: #62666b; --line: #dcdcd6;
@@ -87,7 +87,7 @@
 
   <section>
     <form id="by-agent">
-      <label for="agent">Bot's Bot Trust Bureau id</label>
+      <label for="agent">Bot's Keptvow id</label>
       <div class="row">
         <input id="agent" type="text" placeholder="e.g. alice-bot" autocomplete="off" spellcheck="false">
         <button type="submit">Check</button>
@@ -145,7 +145,7 @@
         <h2 style="margin:0">Badge</h2>
         <button class="secondary" id="copy">Copy embed</button>
       </div>
-      <p><img id="badge" alt="Bot Trust Bureau badge"></p>
+      <p><img id="badge" alt="Keptvow badge"></p>
       <div class="code" id="embed"></div>
     </section>
   </div>
@@ -239,7 +239,7 @@
     var badgeUrl = origin + "/v1/trust/" + encodeURIComponent(p.agent_id) + "/badge.svg";
     var pageUrl = origin + "/trust/" + encodeURIComponent(p.agent_id);
     $("badge").src = badgeUrl;
-    $("embed").textContent = "[![Bot Trust Bureau](" + badgeUrl + ")](" + pageUrl + ")";
+    $("embed").textContent = "[![Keptvow](" + badgeUrl + ")](" + pageUrl + ")";
   }
 
   function loadAgent(id, push) {
