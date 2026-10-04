@@ -25,6 +25,7 @@ mod json;
 mod metrics;
 mod jury;
 mod mcp;
+mod payments;
 mod store;
 mod trust;
 mod verify;
@@ -178,6 +179,7 @@ fn saver(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
         }
         if stopping {
             chain::save_now();
+            payments::save_now();
             watch::save_if_dirty();
             metrics::save_if_dirty();
             println!("agenttrust: stop signal — everything saved, exiting");
@@ -353,7 +355,11 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
 fn is_lookup(method: &str, segments: &[&str]) -> bool {
     matches!(
         (method, segments),
-        ("GET", ["v1", "trust", ..]) | ("GET", ["v1", "agents", _]) | ("GET", ["v1", "bots", ..]) | ("GET", ["v1", "check"])
+        ("GET", ["v1", "trust", ..])
+            | ("GET", ["v1", "agents", _])
+            | ("GET", ["v1", "bots", ..])
+            | ("GET", ["v1", "check"])
+            | ("GET", ["v1", "wallets", _])
     )
 }
 
@@ -663,8 +669,31 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
     // The worst record decides: one wallet behind a scam bot and a clean one is still a risk.
     let worst = matches.iter().map(|p| level_of(p)).min_by_key(|l| rank(l));
     let big = amount_usd.map_or(false, |a| a > CAREFUL_ABOVE_USD);
+    // What the chain says about this wallet as a seller. A wallet nobody watched before starts
+    // being watched now: its history is read in the background and the next check has it.
+    let evidence = {
+        let mut l = payments::lock();
+        l.watch_on_demand(&wallet);
+        l.evidence(&wallet)
+    };
     let (verdict, advice) = match worst.as_deref() {
-        Some("caution") => ("stop", "A bot behind this wallet has a bad record. Don't pay it.".to_string()),
+        Some("caution") => ("stop", "A bot behind this wallet broke deals settled here. Don't pay it.".to_string()),
+        _ if evidence.reports_bad() => (
+            "stop",
+            format!(
+                "{} of {} buyers who reported paid this wallet and got nothing. Don't pay it.",
+                evidence.failed, evidence.reporters
+            ),
+        ),
+        Some("good") | Some("excellent") => ("ok", format!("The bot behind this wallet has a {} record from real deals.", worst.as_deref().unwrap_or(""))),
+        _ if evidence.strong() && !big => (
+            "ok",
+            format!("A strong payment record: {}.", evidence.summary()),
+        ),
+        _ if evidence.strong() => (
+            "careful",
+            format!("A strong payment record ({}), but over ${CAREFUL_ABOVE_USD:.0} consider splitting the payment.", evidence.summary()),
+        ),
         None => (
             "careful",
             "No bot Keptvow knows of is behind this wallet — no track record. Pay only what you can afford to lose.".to_string(),
@@ -691,13 +720,29 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
         ),
         Some(level) => ("ok", format!("The bot behind this wallet has a {level} record.")),
     };
+    let history = evidence.summary();
+    let advice = if history.is_empty() || verdict != "careful" { advice } else { format!("{advice} Payment history: {history}.") };
     Ok(Json::obj(vec![
-        ("pay_to", Json::str(wallet)),
+        ("pay_to", Json::str(wallet.clone())),
         ("verdict", Json::str(verdict)),
         ("advice", Json::str(advice)),
         ("amount_usd", amount_usd.map(Json::num).unwrap_or(Json::Null)),
+        ("evidence", evidence.to_json()),
         ("matches", Json::Array(matches)),
+        ("wallet_page", Json::str(format!("/wallets/{wallet}"))),
     ]))
+}
+
+/// Where the paid-service catalog is read from: `CATALOG_URLS` (comma-separated discovery
+/// endpoints), or the two public x402 facilitators.
+fn catalog_urls() -> Vec<String> {
+    match std::env::var("CATALOG_URLS") {
+        Ok(v) if !v.trim().is_empty() => v.split(',').map(|u| u.trim().to_string()).filter(|u| u.starts_with("https://")).collect(),
+        _ => vec![
+            "https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources".into(),
+            "https://x402.org/facilitator/discovery/resources".into(),
+        ],
+    }
 }
 
 /// Whether each moving part is doing its job, and a plain list of what isn't. `/health/deep`
@@ -738,8 +783,20 @@ fn health_checks(now: i64) -> (Json, Vec<String>) {
             problems.push(format!("memory is at {used:.0} MB of {limit:.0} MB — raise the limit or trim stored data soon"));
         }
     }
+    let (watched, services, pay_behind, pay_error) = {
+        let l = payments::lock();
+        (l.sellers.len(), l.services.len(), l.head.saturating_sub(l.cursor), l.last_error.clone())
+    };
+    if pay_behind > 1_800 {
+        problems.push(format!("the payment scanner is {pay_behind} blocks behind"));
+    }
     let checks = Json::obj(vec![
         ("memory_mb", rss_mb.map(|m| Json::num(m.round())).unwrap_or(Json::Null)),
+        ("wallets_watched", Json::num(watched as f64)),
+        ("delivery_reports_waiting", Json::num(payments::report_queue().lock().unwrap_or_else(|e| e.into_inner()).len() as f64)),
+        ("services_catalogued", Json::num(services as f64)),
+        ("payment_scan_blocks_behind", Json::num(pay_behind as f64)),
+        ("payment_last_error", if pay_error.is_empty() { Json::Null } else { Json::str(pay_error) }),
         ("memory_limit_mb", limit_mb.map(|m| Json::num(m.round())).unwrap_or(Json::Null)),
         ("background_seconds_ago", Json::num(age(background))),
         ("saved_seconds_ago", Json::num(age(LAST_SAVE_OK_MS.load(Ordering::SeqCst)))),
@@ -1365,6 +1422,59 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             }
             ok(Json::Object(all))
         }
+        // ---- delivery reports: "I paid, and the result did / didn't arrive" ----------------
+        ("POST", ["v1", "outcomes"]) => {
+            if !rate_ok("outcomes", req.client_ip(), 600, now) {
+                return err(429, "too many reports from this address this hour");
+            }
+            let Some(tx) = body.get("tx").or_else(|| body.get("transaction")).and_then(|v| v.as_str()).map(|t| t.trim().to_ascii_lowercase())
+            else {
+                return err(400, "tx is required: the payment's transaction hash (from the PAYMENT-RESPONSE header)");
+            };
+            if tx.len() != 66 || !tx.starts_with("0x") || !tx[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+                return err(400, "tx must be a 0x transaction hash of 64 hex characters");
+            }
+            let delivered = match (body.get("delivered"), body.get("status").and_then(|v| v.as_f())) {
+                (Some(Json::Bool(d)), _) => *d,
+                (_, Some(code)) => (200.0..300.0).contains(&code),
+                _ => return err(400, "send delivered (true/false) or the HTTP status the paid request got"),
+            };
+            let pay_to = body.get("pay_to").and_then(|v| v.as_str()).and_then(|p| verify::normalize("eth", p).ok());
+            if !payments::queue_report(payments::PendingReport { tx, delivered, pay_to, attempts: 0 }) {
+                return err(503, "the report queue is full or already has this payment — try again later");
+            }
+            Response::json(
+                202,
+                Json::obj(vec![
+                    ("status", Json::str("queued")),
+                    ("note", Json::str("The payment is checked on Base within a minute; only a buyer who really paid that seller is counted, once per payment.")),
+                ])
+                .to_string(),
+            )
+        }
+        ("GET", ["v1", "wallets", wallet]) => match check_payment(&engine, wallet, None, now) {
+            Ok(mut j) => {
+                let services: Vec<Json> = payments::lock()
+                    .services_of(&wallet.to_ascii_lowercase())
+                    .into_iter()
+                    .map(|s| {
+                        Json::obj(vec![
+                            ("url", Json::str(s.url.clone())),
+                            ("price_usd", Json::num(s.price_usd)),
+                            ("description", Json::str(s.description.clone())),
+                            ("provider", Json::str(s.provider.clone())),
+                            ("last_check", Json::str(if s.probe.result.is_empty() { "not checked yet".to_string() } else { s.probe.result.clone() })),
+                            ("latency_ms", Json::num(s.probe.latency_ms as f64)),
+                        ])
+                    })
+                    .collect();
+                if let Json::Object(m) = &mut j {
+                    m.insert("services".into(), Json::Array(services));
+                }
+                ok(j)
+            }
+            Err(e) => err(400, &e),
+        },
         ("GET", ["guard.js"]) => Response {
             status: 200,
             content_type: "text/javascript; charset=utf-8",
@@ -1577,6 +1687,8 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                         "GET  /guard.js                       (drop-in check for x402 fetch clients)",
                         "POST /v1/watch {targets, webhook_url} (plan key: alerts when a bot or wallet changes standing)",
                         "GET  /v1/alerts?since=               (plan key: alerts so far)",
+                        "GET  /v1/wallets/{0x…}               (a seller wallet: payment history, delivery reports, services)",
+                        "POST /v1/outcomes {tx, delivered}    (after paying: did the result arrive? checked on-chain)",
                         "GET  /v1/trust/erc8004:8453:{n}      (any bot in the public ERC-8004 registry on Base)",
                         "GET  /v1/bots?q=&sort=new&offset=    (search every registry bot)",
                         "GET  /bots                           (every bot, rated — for people)",
@@ -2449,6 +2561,19 @@ fn background(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
 
         if tick % 15 == 0 {
             sweep_watches(engine, now);
+            // Payment wallets bots published in the registry get a payment history too.
+            let wallets: Vec<String> = chain::index()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .agents
+                .values()
+                .filter(|a| !a.wallet.is_empty())
+                .map(|a| a.wallet.clone())
+                .collect();
+            let mut l = payments::lock();
+            for w in wallets {
+                l.watch(&w);
+            }
         }
         watch::save_if_dirty();
         metrics::save_if_dirty();
@@ -2522,7 +2647,8 @@ fn main() -> std::io::Result<()> {
     let data_dir = path.parent().map(|d| d.to_path_buf()).unwrap_or_default();
     watch::load(data_dir.clone());
     metrics::load(data_dir.clone());
-    chain::start(data_dir, autopay::base_rpc_urls());
+    chain::start(data_dir.clone(), autopay::base_rpc_urls());
+    payments::start(data_dir, autopay::base_rpc_urls(), catalog_urls());
 
     http::serve(&addr, move |req| {
         // What can change state: any write, anything done with a key (it is metered), and a
@@ -2860,6 +2986,45 @@ mod tests {
         let kept: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().into_string().unwrap()).collect();
         assert!(kept.iter().any(|n| n.starts_with("state.corrupt-")), "the damaged file is kept for inspection: {kept:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_payment_history_and_delivery_reports_decide_payments() {
+        let e = engine();
+        let check = |pay_to: &str, amount: &str| {
+            let mut r = req("GET", "/v1/check", &[], "");
+            r.query.insert("pay_to".into(), pay_to.into());
+            r.query.insert("amount_usd".into(), amount.into());
+            body_json(&route(&e, r, PROD))
+        };
+        let verdict = |j: &Json| j.get("verdict").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (honest, scam) = (payments::tests::addr(0xa11ce), payments::tests::addr(0xbad));
+        {
+            let mut l = payments::lock();
+            payments::tests::strong_seller(&mut l, &honest, payments::STRONG_BUYERS as u64);
+            payments::tests::strong_seller(&mut l, &scam, payments::STRONG_BUYERS as u64);
+            for b in 0..payments::REPORTS_TO_JUDGE as u64 {
+                l.apply_report(&format!("0x{:064x}", 0xfeed00 + b), &payments::tests::addr(0x5000 + b), &scam, 1, false);
+            }
+        }
+        let good = check(&honest, "5");
+        assert_eq!(verdict(&good), "ok", "{}", good.to_string());
+        assert!(good.get("advice").and_then(|v| v.as_str()).unwrap().contains("different buyers"));
+        assert_eq!(verdict(&check(&honest, "500")), "careful", "history alone never clears a big payment");
+        let bad = check(&scam, "5");
+        assert_eq!(verdict(&bad), "stop", "{}", bad.to_string());
+
+        // A wallet nobody watched starts being watched by the first check.
+        let fresh = payments::tests::addr(0xf7e54);
+        let first = check(&fresh, "1");
+        assert_eq!(first.get("evidence").and_then(|e| e.get("history_loading")), Some(&Json::Bool(true)));
+
+        // Reports: the transaction is checked on-chain later; the request itself is validated.
+        assert_eq!(route(&e, req("POST", "/v1/outcomes", &[], r#"{"tx":"0x12","delivered":true}"#), PROD).status, 400);
+        let tx = format!(r#"{{"tx":"0x{:064x}","status":200}}"#, 0xabcdefu64);
+        assert_eq!(route(&e, req("POST", "/v1/outcomes", &[], &tx), PROD).status, 202);
+        let w = body_json(&route(&e, req("GET", &format!("/v1/wallets/{honest}"), &[], ""), PROD));
+        assert!(w.get("evidence").is_some() && matches!(w.get("services"), Some(Json::Array(_))));
     }
 
     fn new_key(e: &Mutex<Engine>) -> String {

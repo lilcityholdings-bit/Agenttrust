@@ -1,0 +1,1256 @@
+//! Real evidence about sellers: who actually pays them, whether buyers come back, whether what
+//! was paid for arrived, and whether the service is even up.
+//!
+//! Four sources, none needing anyone's permission:
+//!
+//! - **Payment history.** x402 payments settle as USDC transfers on Base, so every payment to a
+//!   seller's wallet is public. For each watched seller wallet Keptvow keeps who paid, how often
+//!   and when. A seller that many independent buyers pay — and pay again — is delivering.
+//! - **Delivery reports.** After a payment, the buyer's client (guard.js does it by itself)
+//!   reports whether the result arrived, quoting the payment's transaction. The report is
+//!   checked against the chain: only someone who really paid that seller can report on it.
+//! - **The catalog.** x402 facilitators publish the paid services they settle for (the Bazaar).
+//!   Keptvow lists them and watches their payment wallets.
+//! - **Probes.** Each catalogued service is visited about once a day without paying: is it up,
+//!   does it ask for payment properly, and does it ask to be paid at the wallet it was listed with.
+//!
+//! Faking a payment record is possible — a seller can pay itself from throwaway wallets, and the
+//! money comes straight back — so the bar for "this history is strong" is set where faking it
+//! takes real time and effort: many buyers who also pay other sellers, whose own history began
+//! weeks before they ever paid this one, and who come back.
+
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::Read as _;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use crate::json::{self, Json};
+use crate::verify;
+
+/// USDC on Base.
+pub const USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const CONFIRMATIONS: u64 = 5;
+const BLOCK_SECONDS: u64 = 2;
+const DAY_BLOCKS: u64 = 86_400 / BLOCK_SECONDS;
+/// How far back a newly watched wallet's history is read.
+const BACKFILL_BLOCKS: u64 = 45 * DAY_BLOCKS;
+/// Wallets watched at most, so the scan stays affordable on public nodes.
+const MAX_WATCHED: usize = 60_000;
+/// Buyers remembered per seller; past this a seller's payments are still counted, not itemized.
+const MAX_PAYERS_PER_SELLER: usize = 20_000;
+/// Catalogued services kept.
+const MAX_SERVICES: usize = 50_000;
+const PROBE_EVERY_MS: i64 = 24 * 3_600_000;
+const CATALOG_EVERY: Duration = Duration::from_secs(6 * 3_600);
+
+// The bar for a strong record from payment history alone (see the module notes).
+pub const STRONG_BUYERS: usize = 30;
+pub const STRONG_REPEAT: usize = 10;
+pub const STRONG_SPAN_DAYS: u64 = 14;
+const ESTABLISHED_REACH: u32 = 3;
+const ESTABLISHED_AGE_BLOCKS: u64 = 14 * DAY_BLOCKS;
+/// Distinct buyers who must have reported before reports can say "stop".
+pub const REPORTS_TO_JUDGE: usize = 5;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Payer {
+    pub count: u32,
+    pub first_block: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Probe {
+    pub at_ms: i64,
+    /// "ok" (asked for payment at the listed wallet), "mismatch" (asked to be paid elsewhere),
+    /// "down" (no answer or a server error), "unclear" (answered, but not with a payment request).
+    pub result: String,
+    pub status: u16,
+    pub latency_ms: u32,
+    pub checks: u32,
+    pub ok: u32,
+    pub down: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Seller {
+    pub payments: u64,
+    /// In USDC units (6 decimals).
+    pub volume: u128,
+    pub first_block: u64,
+    pub last_block: u64,
+    pub payers: HashMap<u32, Payer>,
+    /// Latest report per buying wallet: (delivered, block of the payment).
+    pub reports: HashMap<u32, (bool, u64)>,
+    /// History before `backfilled_from` hasn't been read (0 = not yet read at all).
+    pub backfilled_from: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Service {
+    pub url: String,
+    pub pay_to: String,
+    pub price_usd: f64,
+    pub description: String,
+    pub provider: String,
+    pub method: String,
+    pub probe: Probe,
+}
+
+#[derive(Default)]
+pub struct Ledger {
+    /// Every block up to here has been scanned for the wallets that were watched at the time.
+    pub cursor: u64,
+    pub head: u64,
+    pub sellers: HashMap<String, Seller>,
+    payer_ids: HashMap<String, u32>,
+    /// Per payer: distinct watched sellers paid, and the first block it was seen paying.
+    payer_reach: Vec<(u32, u64)>,
+    pub services: BTreeMap<String, Service>,
+    /// Watched wallets whose history still has to be read: (wallet, read up to this block).
+    backfill: VecDeque<(String, u64)>,
+    pub reports_seen: HashSet<String>,
+    pub last_error: String,
+    pub last_ok_ms: i64,
+    pub catalog_at_ms: i64,
+    dirty: bool,
+}
+
+/// What Keptvow knows about one wallet as a seller.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Evidence {
+    pub watched: bool,
+    pub history_loading: bool,
+    pub payments: u64,
+    pub volume_usd: f64,
+    pub buyers: usize,
+    pub repeat_buyers: usize,
+    pub established_buyers: usize,
+    pub first_days_ago: Option<u64>,
+    pub last_days_ago: Option<u64>,
+    pub span_days: u64,
+    pub reporters: usize,
+    pub delivered: usize,
+    pub failed: usize,
+    pub services: usize,
+    pub probes_ok: usize,
+    pub probes_down: usize,
+    pub probes_mismatch: usize,
+}
+
+impl Evidence {
+    /// Strong enough on its own for an ordinary payment.
+    pub fn strong(&self) -> bool {
+        self.established_buyers >= STRONG_BUYERS
+            && self.repeat_buyers >= STRONG_REPEAT
+            && self.span_days >= STRONG_SPAN_DAYS
+            && !self.reports_bad()
+            && self.probes_mismatch == 0
+    }
+
+    /// Enough independent buyers say they paid and got nothing.
+    pub fn reports_bad(&self) -> bool {
+        self.reporters >= REPORTS_TO_JUDGE && self.failed * 2 >= self.reporters
+    }
+
+    pub fn to_json(&self) -> Json {
+        let n = |x: usize| Json::num(x as f64);
+        let days = |d: Option<u64>| d.map(|d| Json::num(d as f64)).unwrap_or(Json::Null);
+        Json::obj(vec![
+            ("watched", Json::Bool(self.watched)),
+            ("history_loading", Json::Bool(self.history_loading)),
+            (
+                "payments",
+                Json::obj(vec![
+                    ("received", Json::num(self.payments as f64)),
+                    ("volume_usd", Json::num((self.volume_usd * 100.0).round() / 100.0)),
+                    ("buyers", n(self.buyers)),
+                    ("repeat_buyers", n(self.repeat_buyers)),
+                    ("established_buyers", n(self.established_buyers)),
+                    ("first_payment_days_ago", days(self.first_days_ago)),
+                    ("last_payment_days_ago", days(self.last_days_ago)),
+                    ("window_days", Json::num((BACKFILL_BLOCKS / DAY_BLOCKS) as f64)),
+                ]),
+            ),
+            (
+                "delivery_reports",
+                Json::obj(vec![("buyers_reporting", n(self.reporters)), ("delivered", n(self.delivered)), ("not_delivered", n(self.failed))]),
+            ),
+            (
+                "services",
+                Json::obj(vec![
+                    ("listed", n(self.services)),
+                    ("answering", n(self.probes_ok)),
+                    ("down", n(self.probes_down)),
+                    ("asks_to_be_paid_elsewhere", n(self.probes_mismatch)),
+                ]),
+            ),
+            ("strong_record", Json::Bool(self.strong())),
+        ])
+    }
+
+    /// One plain sentence of what the evidence says, for advice and pages.
+    pub fn summary(&self) -> String {
+        if self.history_loading && self.payments == 0 {
+            return "payment history is being read — check again in a few minutes".into();
+        }
+        let mut parts = Vec::new();
+        if self.payments > 0 {
+            parts.push(format!(
+                "paid {} times by {} different buyers ({} came back) in the last {} days",
+                self.payments,
+                self.buyers,
+                self.repeat_buyers,
+                BACKFILL_BLOCKS / DAY_BLOCKS
+            ));
+        } else if self.watched {
+            parts.push(format!("no payments received in the last {} days", BACKFILL_BLOCKS / DAY_BLOCKS));
+        }
+        if self.reporters > 0 {
+            parts.push(format!("{} of {} reporting buyers got what they paid for", self.delivered, self.reporters));
+        }
+        if self.probes_mismatch > 0 {
+            parts.push("its listed service asked to be paid at a different wallet".into());
+        } else if self.probes_down > 0 && self.probes_ok == 0 {
+            parts.push("its listed service didn't answer at the last check".into());
+        }
+        parts.join("; ")
+    }
+}
+
+fn hex_u64(s: &str) -> Option<u64> {
+    u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+}
+
+fn word_u128(s: &str) -> Option<u128> {
+    let h = s.trim_start_matches("0x").trim_start_matches('0');
+    if h.is_empty() {
+        return Some(0);
+    }
+    if h.len() > 32 {
+        return None;
+    }
+    u128::from_str_radix(h, 16).ok()
+}
+
+fn topic_address(t: &str) -> Option<String> {
+    let h = t.trim_start_matches("0x");
+    (h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())).then(|| format!("0x{}", h[24..].to_ascii_lowercase()))
+}
+
+fn address_topic(a: &str) -> String {
+    format!("0x{:0>64}", a.trim_start_matches("0x"))
+}
+
+fn is_base(network: &str) -> bool {
+    matches!(network.to_ascii_lowercase().as_str(), "base" | "eip155:8453")
+}
+
+fn clean(s: &str, max: usize) -> String {
+    let s: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    s.chars().take(max).collect()
+}
+
+impl Ledger {
+    fn payer_id(&mut self, addr: &str) -> u32 {
+        if let Some(id) = self.payer_ids.get(addr) {
+            return *id;
+        }
+        let id = self.payer_reach.len() as u32;
+        self.payer_ids.insert(addr.to_string(), id);
+        self.payer_reach.push((0, u64::MAX));
+        id
+    }
+
+    pub fn is_watched(&self, wallet: &str) -> bool {
+        self.sellers.contains_key(wallet)
+    }
+
+    /// Starts watching a seller wallet: its last 45 days are read in the background, and new
+    /// payments to it are picked up from now on. False when the watch list is full.
+    pub fn watch(&mut self, wallet: &str) -> bool {
+        let w = wallet.to_ascii_lowercase();
+        if !verify::normalize("eth", &w).map_or(false, |n| n == w) {
+            return false;
+        }
+        if self.sellers.contains_key(&w) {
+            return true;
+        }
+        if self.sellers.len() >= MAX_WATCHED {
+            return false;
+        }
+        self.sellers.insert(w.clone(), Seller::default());
+        self.backfill.push_back((w, self.cursor));
+        self.dirty = true;
+        true
+    }
+
+    /// Watching asked for by a payment check. Kept below the overall cap, so lookups of random
+    /// wallets can never crowd out the catalog's sellers.
+    pub fn watch_on_demand(&mut self, wallet: &str) -> bool {
+        if self.sellers.contains_key(wallet) {
+            return true;
+        }
+        self.sellers.len() < MAX_WATCHED * 2 / 3 && self.watch(wallet)
+    }
+
+    /// Records one USDC transfer to a watched wallet.
+    pub fn apply_transfer(&mut self, from: &str, to: &str, value: u128, block: u64) {
+        if value == 0 || from == to || from == "0x0000000000000000000000000000000000000000" || !self.sellers.contains_key(to) {
+            return;
+        }
+        let pid = self.payer_id(from);
+        let reach = &mut self.payer_reach[pid as usize];
+        reach.1 = reach.1.min(block);
+        let s = self.sellers.get_mut(to).expect("checked above");
+        s.payments += 1;
+        s.volume = s.volume.saturating_add(value);
+        s.first_block = if s.first_block == 0 { block } else { s.first_block.min(block) };
+        s.last_block = s.last_block.max(block);
+        let known = s.payers.contains_key(&pid);
+        if !known && s.payers.len() >= MAX_PAYERS_PER_SELLER {
+            return;
+        }
+        let p = s.payers.entry(pid).or_insert(Payer { count: 0, first_block: block });
+        p.count += 1;
+        p.first_block = p.first_block.min(block);
+        if !known {
+            self.payer_reach[pid as usize].0 += 1;
+        }
+        self.dirty = true;
+    }
+
+    /// Applies one log from an `eth_getLogs` of USDC transfers.
+    pub fn apply_log(&mut self, log: &Json) {
+        if matches!(log.get("removed"), Some(Json::Bool(true))) {
+            return;
+        }
+        let Some(Json::Array(ts)) = log.get("topics") else { return };
+        let ts: Vec<&str> = ts.iter().filter_map(|t| t.as_str()).collect();
+        if ts.len() != 3 || !ts[0].eq_ignore_ascii_case(TRANSFER_TOPIC) {
+            return;
+        }
+        let (Some(from), Some(to)) = (topic_address(ts[1]), topic_address(ts[2])) else { return };
+        let Some(value) = log.get("data").and_then(|v| v.as_str()).and_then(word_u128) else { return };
+        let block = log.get("blockNumber").and_then(|v| v.as_str()).and_then(hex_u64).unwrap_or(0);
+        self.apply_transfer(&from, &to, value, block);
+    }
+
+    /// Records a delivery report already checked against the chain: `payer` paid `seller` in
+    /// `block`. Each buying wallet's latest report counts once.
+    pub fn apply_report(&mut self, tx: &str, payer: &str, seller: &str, block: u64, delivered: bool) -> bool {
+        if !self.reports_seen.insert(tx.to_ascii_lowercase()) {
+            return false;
+        }
+        if self.reports_seen.len() > 2_000_000 {
+            self.reports_seen.clear();
+        }
+        self.watch(seller);
+        let pid = self.payer_id(payer);
+        if let Some(s) = self.sellers.get_mut(seller) {
+            let newer = s.reports.get(&pid).map_or(true, |(_, b)| block >= *b);
+            if newer {
+                s.reports.insert(pid, (delivered, block));
+            }
+        }
+        self.dirty = true;
+        true
+    }
+
+    pub fn evidence(&self, wallet: &str) -> Evidence {
+        let w = wallet.to_ascii_lowercase();
+        let services: Vec<&Service> = self.services.values().filter(|s| s.pay_to == w).collect();
+        let mut e = Evidence {
+            services: services.len(),
+            probes_ok: services.iter().filter(|s| s.probe.result == "ok").count(),
+            probes_down: services.iter().filter(|s| s.probe.result == "down").count(),
+            probes_mismatch: services.iter().filter(|s| s.probe.result == "mismatch").count(),
+            ..Evidence::default()
+        };
+        let Some(s) = self.sellers.get(&w) else { return e };
+        e.watched = true;
+        e.history_loading = s.backfilled_from == 0;
+        e.payments = s.payments;
+        e.volume_usd = s.volume as f64 / 1e6;
+        e.buyers = s.payers.len();
+        e.repeat_buyers = s.payers.values().filter(|p| p.count >= 2).count();
+        e.established_buyers = s
+            .payers
+            .iter()
+            .filter(|(pid, p)| {
+                let (reach, first) = self.payer_reach[**pid as usize];
+                reach >= ESTABLISHED_REACH && first.saturating_add(ESTABLISHED_AGE_BLOCKS) <= p.first_block
+            })
+            .count();
+        let ago = |b: u64| (b > 0).then(|| self.head.saturating_sub(b) / DAY_BLOCKS);
+        e.first_days_ago = ago(s.first_block);
+        e.last_days_ago = ago(s.last_block);
+        e.span_days = s.last_block.saturating_sub(s.first_block) / DAY_BLOCKS;
+        e.reporters = s.reports.len();
+        e.delivered = s.reports.values().filter(|(d, _)| *d).count();
+        e.failed = e.reporters - e.delivered;
+        e
+    }
+
+    /// Adds or refreshes catalogued services from one page of a facilitator's discovery list.
+    /// Only services paid in USDC on Base are kept; returns how many items the page held.
+    pub fn apply_catalog_page(&mut self, page: &Json) -> usize {
+        let items = match page.get("items").or_else(|| page.get("resources")) {
+            Some(Json::Array(a)) => a.clone(),
+            _ => match page {
+                Json::Array(a) => a.clone(),
+                _ => Vec::new(),
+            },
+        };
+        for it in &items {
+            let Some(url) = it.get("resource").or_else(|| it.get("url")).and_then(|v| v.as_str()) else { continue };
+            if !(url.starts_with("https://") || url.starts_with("http://")) || url.len() > 500 {
+                continue;
+            }
+            let Some(Json::Array(accepts)) = it.get("accepts") else { continue };
+            let Some(base) = accepts.iter().find(|a| {
+                a.get("network").and_then(|v| v.as_str()).map_or(false, is_base)
+                    && a.get("asset").and_then(|v| v.as_str()).map_or(true, |x| x.eq_ignore_ascii_case(USDC))
+            }) else {
+                continue;
+            };
+            let Some(pay_to) = base.get("payTo").and_then(|v| v.as_str()).and_then(|p| verify::normalize("eth", p).ok()) else { continue };
+            let units = base
+                .get("maxAmountRequired")
+                .or_else(|| base.get("amount"))
+                .and_then(|v| v.as_str().map(|s| s.parse::<f64>().ok()).unwrap_or_else(|| v.as_f()))
+                .unwrap_or(0.0);
+            let meta = |k: &str| it.get("metadata").and_then(|m| m.get(k)).and_then(|v| v.as_str()).unwrap_or("");
+            let method = base
+                .get("outputSchema")
+                .and_then(|o| o.get("input"))
+                .and_then(|i| i.get("method"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("GET")
+                .to_ascii_uppercase();
+            if !self.services.contains_key(url) && self.services.len() >= MAX_SERVICES {
+                continue;
+            }
+            let entry = self.services.entry(url.to_string()).or_default();
+            entry.url = url.to_string();
+            if entry.pay_to != pay_to {
+                entry.pay_to = pay_to.clone();
+            }
+            entry.price_usd = units / 1e6;
+            entry.description = clean(base.get("description").and_then(|v| v.as_str()).unwrap_or(meta("description")), 200);
+            entry.provider = clean(meta("provider"), 80);
+            entry.method = if method == "POST" { "POST".into() } else { "GET".into() };
+            self.watch(&pay_to);
+            self.dirty = true;
+        }
+        items.len()
+    }
+
+    fn record_probe(&mut self, url: &str, result: &str, status: u16, latency_ms: u32, now_ms: i64) {
+        if let Some(s) = self.services.get_mut(url) {
+            let p = &mut s.probe;
+            p.at_ms = now_ms;
+            p.result = result.to_string();
+            p.status = status;
+            p.latency_ms = latency_ms;
+            p.checks += 1;
+            match result {
+                "ok" => p.ok += 1,
+                "down" => p.down += 1,
+                _ => {}
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// The next service due a probe, if any.
+    fn next_probe(&self, now_ms: i64) -> Option<(String, String, String)> {
+        self.services
+            .values()
+            .filter(|s| now_ms - s.probe.at_ms > PROBE_EVERY_MS)
+            .min_by_key(|s| s.probe.at_ms)
+            .map(|s| (s.url.clone(), s.method.clone(), s.pay_to.clone()))
+    }
+
+    pub fn services_of(&self, wallet: &str) -> Vec<&Service> {
+        self.services.values().filter(|s| s.pay_to == wallet).take(50).collect()
+    }
+
+    // ---- persistence: one line per record, so neither saving nor loading balloons memory ----
+
+    fn write_lines(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        let payer_names: HashMap<u32, &str> = self.payer_ids.iter().map(|(k, v)| (*v, k.as_str())).collect();
+        writeln!(
+            out,
+            "{}",
+            Json::obj(vec![
+                ("kind", Json::str("header")),
+                ("version", Json::num(1.0)),
+                ("cursor", Json::num(self.cursor as f64)),
+                ("head", Json::num(self.head as f64)),
+                ("catalog_at_ms", Json::num(self.catalog_at_ms as f64)),
+                (
+                    "backfill",
+                    Json::Array(self.backfill.iter().map(|(w, b)| Json::Array(vec![Json::str(w.clone()), Json::num(*b as f64)])).collect()),
+                ),
+            ])
+            .to_string()
+        )?;
+        for (w, s) in &self.sellers {
+            let payers: Vec<Json> = s
+                .payers
+                .iter()
+                .filter_map(|(pid, p)| {
+                    Some(Json::Array(vec![Json::str(*payer_names.get(pid)?), Json::num(p.count as f64), Json::num(p.first_block as f64)]))
+                })
+                .collect();
+            let reports: Vec<Json> = s
+                .reports
+                .iter()
+                .filter_map(|(pid, (d, b))| {
+                    Some(Json::Array(vec![Json::str(*payer_names.get(pid)?), Json::Bool(*d), Json::num(*b as f64)]))
+                })
+                .collect();
+            writeln!(
+                out,
+                "{}",
+                Json::obj(vec![
+                    ("kind", Json::str("seller")),
+                    ("wallet", Json::str(w.clone())),
+                    ("payments", Json::num(s.payments as f64)),
+                    ("volume", Json::str(s.volume.to_string())),
+                    ("first_block", Json::num(s.first_block as f64)),
+                    ("last_block", Json::num(s.last_block as f64)),
+                    ("backfilled_from", Json::num(s.backfilled_from as f64)),
+                    ("payers", Json::Array(payers)),
+                    ("reports", Json::Array(reports)),
+                ])
+                .to_string()
+            )?;
+        }
+        for s in self.services.values() {
+            let p = &s.probe;
+            writeln!(
+                out,
+                "{}",
+                Json::obj(vec![
+                    ("kind", Json::str("service")),
+                    ("url", Json::str(s.url.clone())),
+                    ("pay_to", Json::str(s.pay_to.clone())),
+                    ("price_usd", Json::num(s.price_usd)),
+                    ("description", Json::str(s.description.clone())),
+                    ("provider", Json::str(s.provider.clone())),
+                    ("method", Json::str(s.method.clone())),
+                    (
+                        "probe",
+                        Json::Array(vec![
+                            Json::num(p.at_ms as f64),
+                            Json::str(p.result.clone()),
+                            Json::num(p.status as f64),
+                            Json::num(p.latency_ms as f64),
+                            Json::num(p.checks as f64),
+                            Json::num(p.ok as f64),
+                            Json::num(p.down as f64),
+                        ]),
+                    ),
+                ])
+                .to_string()
+            )?;
+        }
+        Ok(())
+    }
+
+    fn read_lines(input: impl std::io::BufRead) -> Option<Ledger> {
+        let mut l = Ledger::default();
+        let mut payer_first: Vec<(String, u32, u64, String)> = Vec::new();
+        for line in input.lines() {
+            let line = line.ok()?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let j = json::parse(&line).ok()?;
+            let n = |k: &str| j.get(k).and_then(|v| v.as_f()).unwrap_or(0.0);
+            let s = |k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            match j.get("kind").and_then(|v| v.as_str()) {
+                Some("header") => {
+                    l.cursor = n("cursor") as u64;
+                    l.head = n("head") as u64;
+                    l.catalog_at_ms = n("catalog_at_ms") as i64;
+                    if let Some(Json::Array(b)) = j.get("backfill") {
+                        for x in b {
+                            if let Json::Array(p) = x {
+                                if let (Some(w), Some(until)) = (p.first().and_then(|v| v.as_str()), p.get(1).and_then(|v| v.as_f())) {
+                                    l.backfill.push_back((w.to_string(), until as u64));
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("seller") => {
+                    let w = s("wallet");
+                    let mut seller = Seller {
+                        payments: n("payments") as u64,
+                        volume: s("volume").parse().unwrap_or(0),
+                        first_block: n("first_block") as u64,
+                        last_block: n("last_block") as u64,
+                        backfilled_from: n("backfilled_from") as u64,
+                        ..Seller::default()
+                    };
+                    if let Some(Json::Array(ps)) = j.get("payers") {
+                        for p in ps {
+                            let Json::Array(p) = p else { continue };
+                            let (Some(addr), Some(c), Some(fb)) =
+                                (p.first().and_then(|v| v.as_str()), p.get(1).and_then(|v| v.as_f()), p.get(2).and_then(|v| v.as_f()))
+                            else {
+                                continue;
+                            };
+                            let pid = l.payer_id(addr);
+                            seller.payers.insert(pid, Payer { count: c as u32, first_block: fb as u64 });
+                            payer_first.push((addr.to_string(), pid, fb as u64, w.clone()));
+                        }
+                    }
+                    if let Some(Json::Array(rs)) = j.get("reports") {
+                        for r in rs {
+                            let Json::Array(r) = r else { continue };
+                            if let (Some(addr), Some(Json::Bool(d)), Some(b)) = (r.first().and_then(|v| v.as_str()), r.get(1), r.get(2).and_then(|v| v.as_f())) {
+                                let pid = l.payer_id(addr);
+                                seller.reports.insert(pid, (*d, b as u64));
+                            }
+                        }
+                    }
+                    l.sellers.insert(w, seller);
+                }
+                Some("service") => {
+                    let pr = match j.get("probe") {
+                        Some(Json::Array(p)) => p.clone(),
+                        _ => Vec::new(),
+                    };
+                    let pn = |i: usize| pr.get(i).and_then(|v| v.as_f()).unwrap_or(0.0);
+                    let svc = Service {
+                        url: s("url"),
+                        pay_to: s("pay_to"),
+                        price_usd: n("price_usd"),
+                        description: s("description"),
+                        provider: s("provider"),
+                        method: s("method"),
+                        probe: Probe {
+                            at_ms: pn(0) as i64,
+                            result: pr.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            status: pn(2) as u16,
+                            latency_ms: pn(3) as u32,
+                            checks: pn(4) as u32,
+                            ok: pn(5) as u32,
+                            down: pn(6) as u32,
+                        },
+                    };
+                    l.services.insert(svc.url.clone(), svc);
+                }
+                _ => {}
+            }
+        }
+        // Reach (how many sellers each buyer paid) and first sighting are rebuilt from the rows.
+        for (_, pid, fb, _) in payer_first {
+            let r = &mut l.payer_reach[pid as usize];
+            r.0 += 1;
+            r.1 = r.1.min(fb);
+        }
+        Some(l)
+    }
+}
+
+// ---- the shared ledger and its background workers ----------------------------------------------
+
+pub fn ledger() -> &'static Mutex<Ledger> {
+    static L: OnceLock<Mutex<Ledger>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(Ledger::default()))
+}
+
+pub fn lock() -> std::sync::MutexGuard<'static, Ledger> {
+    ledger().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+static SAVE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn save_now() {
+    let Some(path) = SAVE_PATH.get() else { return };
+    let tmp = path.with_extension("jsonl.tmp");
+    let written = {
+        let mut l = lock();
+        if !l.dirty {
+            return;
+        }
+        l.dirty = false;
+        std::fs::File::create(&tmp).and_then(|f| {
+            let mut w = std::io::BufWriter::new(f);
+            l.write_lines(&mut w)?;
+            std::io::Write::flush(&mut w)?;
+            w.get_ref().sync_all()
+        })
+    };
+    if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, path)) {
+        eprintln!("keptvow: could not save the payment ledger: {e}");
+        lock().dirty = true;
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+fn rpc(url: &str, method: &str, params: Json) -> Result<Json, String> {
+    let body = Json::obj(vec![("jsonrpc", Json::str("2.0")), ("id", Json::num(1.0)), ("method", Json::str(method)), ("params", params)]);
+    let resp = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .post(url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .map_err(|e| format!("{method} failed: {e}"))?;
+    let mut text = String::new();
+    resp.into_reader().take(32 * 1024 * 1024).read_to_string(&mut text).map_err(|e| format!("read failed: {e}"))?;
+    let j = json::parse(&text).map_err(|_| format!("{method}: bad JSON"))?;
+    if let Some(e) = j.get("error") {
+        return Err(format!("{method}: {}", e.to_string()));
+    }
+    j.get("result").cloned().ok_or_else(|| format!("{method}: no result"))
+}
+
+struct Nodes {
+    urls: Vec<String>,
+    preferred: usize,
+}
+
+impl Nodes {
+    fn call(&mut self, method: &str, params: Json) -> Result<Json, String> {
+        let mut last = String::from("no Base node configured");
+        for k in 0..self.urls.len() {
+            let i = (self.preferred + k) % self.urls.len();
+            match rpc(&self.urls[i], method, params.clone()) {
+                Ok(j) => {
+                    self.preferred = i;
+                    lock().last_ok_ms = now_ms();
+                    return Ok(j);
+                }
+                Err(e) => last = e,
+            }
+        }
+        lock().last_error = last.clone();
+        Err(last)
+    }
+
+    fn head(&mut self) -> Result<u64, String> {
+        let v = self.call("eth_blockNumber", Json::Array(vec![]))?;
+        v.as_str().and_then(hex_u64).map(|h| h.saturating_sub(CONFIRMATIONS)).ok_or_else(|| "bad block number".into())
+    }
+
+    /// USDC transfers to any of `wallets` in [from, to].
+    fn transfers_to(&mut self, wallets: &[String], from: u64, to: u64) -> Result<Vec<Json>, String> {
+        let filter = Json::obj(vec![
+            ("fromBlock", Json::str(format!("0x{from:x}"))),
+            ("toBlock", Json::str(format!("0x{to:x}"))),
+            ("address", Json::str(USDC)),
+            (
+                "topics",
+                Json::Array(vec![Json::str(TRANSFER_TOPIC), Json::Null, Json::Array(wallets.iter().map(|w| Json::str(address_topic(w))).collect())]),
+            ),
+        ]);
+        match self.call("eth_getLogs", Json::Array(vec![filter]))? {
+            Json::Array(logs) => Ok(logs),
+            _ => Err("eth_getLogs returned something other than a list".into()),
+        }
+    }
+}
+
+/// Loads the saved ledger and starts the workers: live scan, history backfill, catalog, probes
+/// and report checks.
+pub fn start(dir: PathBuf, rpc_urls: Vec<String>, catalog_urls: Vec<String>) {
+    let path = dir.join("payments.jsonl");
+    if let Some(l) = std::fs::File::open(&path).ok().and_then(|f| Ledger::read_lines(std::io::BufReader::new(f))) {
+        *lock() = l;
+    }
+    {
+        let l = lock();
+        println!(
+            "keptvow: payment ledger: {} wallets watched, {} services catalogued, scanned to block {}",
+            l.sellers.len(),
+            l.services.len(),
+            l.cursor
+        );
+    }
+    let _ = SAVE_PATH.set(path);
+    let urls = rpc_urls.clone();
+    crate::supervise("the payment scanner", move || scan_live(&urls));
+    let urls = rpc_urls.clone();
+    crate::supervise("the payment history reader", move || scan_backfill(&urls));
+    crate::supervise("the service catalog reader", move || read_catalog(&catalog_urls));
+    crate::supervise("the service prober", probe_services);
+    crate::supervise("the delivery report checker", move || check_reports(&rpc_urls));
+}
+
+/// How many wallets go into one log query; halved when a node refuses, slowly raised again.
+static TOPIC_CHUNK: Mutex<usize> = Mutex::new(200);
+
+fn chunk_size() -> usize {
+    *TOPIC_CHUNK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn shrink_chunk() {
+    let mut c = TOPIC_CHUNK.lock().unwrap_or_else(|e| e.into_inner());
+    *c = (*c / 2).max(10);
+}
+
+/// New payments to every watched wallet, every minute or so.
+fn scan_live(urls: &[String]) {
+    let mut nodes = Nodes { urls: urls.to_vec(), preferred: 0 };
+    let mut last_save = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+        let Ok(head) = nodes.head() else { continue };
+        let (cursor, wallets) = {
+            let mut l = lock();
+            l.head = l.head.max(head);
+            if l.cursor == 0 {
+                // First start: history comes from the backfill; scanning starts now.
+                l.cursor = head;
+                l.dirty = true;
+            }
+            let mut w: Vec<String> = l.sellers.keys().cloned().collect();
+            w.sort();
+            (l.cursor, w)
+        };
+        if cursor >= head {
+            continue;
+        }
+        let to = head.min(cursor + 1_000);
+        let mut ok = true;
+        let mut i = 0;
+        while i < wallets.len() {
+            let chunk = &wallets[i..(i + chunk_size()).min(wallets.len())];
+            match nodes.transfers_to(chunk, cursor + 1, to) {
+                Ok(logs) => {
+                    let mut l = lock();
+                    for log in &logs {
+                        l.apply_log(log);
+                    }
+                    i += chunk.len();
+                }
+                Err(_) if chunk.len() > 10 => shrink_chunk(),
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        if ok {
+            let mut l = lock();
+            l.cursor = to;
+            l.dirty = true;
+        }
+        if last_save.elapsed() > Duration::from_secs(300) {
+            save_now();
+            last_save = Instant::now();
+        }
+    }
+}
+
+/// The last 45 days of each newly watched wallet, a batch at a time.
+fn scan_backfill(urls: &[String]) {
+    let mut nodes = Nodes { urls: urls.to_vec(), preferred: 0 };
+    loop {
+        let batch: Vec<(String, u64)> = {
+            let mut l = lock();
+            let n = chunk_size().min(l.backfill.len());
+            l.backfill.drain(..n).collect()
+        };
+        if batch.is_empty() {
+            std::thread::sleep(Duration::from_secs(30));
+            continue;
+        }
+        let Ok(head) = nodes.head() else {
+            lock().backfill.extend(batch);
+            std::thread::sleep(Duration::from_secs(30));
+            continue;
+        };
+        // Up to where the live scan had read when each was added (or now, if it hadn't begun).
+        let until = batch.iter().map(|(_, u)| if *u == 0 { head } else { *u }).max().unwrap_or(head);
+        let start = until.saturating_sub(BACKFILL_BLOCKS);
+        let wallets: Vec<String> = batch.iter().map(|(w, _)| w.clone()).collect();
+        let mut from = start;
+        let mut span: u64 = 20_000;
+        let mut failures = 0;
+        while from <= until {
+            let to = until.min(from + span - 1);
+            match nodes.transfers_to(&wallets, from, to) {
+                Ok(logs) => {
+                    let mut l = lock();
+                    for log in &logs {
+                        // Only blocks up to each wallet's own start point; later ones the live
+                        // scan reads.
+                        let block = log.get("blockNumber").and_then(|v| v.as_str()).and_then(hex_u64).unwrap_or(0);
+                        let to_wallet = log
+                            .get("topics")
+                            .and_then(|t| if let Json::Array(t) = t { t.get(2).and_then(|v| v.as_str()).and_then(topic_address) } else { None });
+                        let limit = to_wallet.and_then(|w| batch.iter().find(|(b, _)| *b == w)).map(|(_, u)| if *u == 0 { head } else { *u });
+                        if limit.map_or(true, |u| block <= u) {
+                            l.apply_log(log);
+                        }
+                    }
+                    from = to + 1;
+                    failures = 0;
+                    if logs.len() < 2_000 {
+                        span = (span * 2).min(50_000);
+                    }
+                }
+                Err(_) => {
+                    failures += 1;
+                    if span > 500 {
+                        span /= 2;
+                    } else if failures > 5 {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let mut l = lock();
+        for (w, _) in &batch {
+            if let Some(s) = l.sellers.get_mut(w) {
+                s.backfilled_from = start.max(1);
+            }
+        }
+        l.dirty = true;
+    }
+}
+
+/// Every catalogued service paid on Base, from each facilitator's discovery list, every 6 hours.
+fn read_catalog(urls: &[String]) {
+    loop {
+        let due = now_ms() - lock().catalog_at_ms > CATALOG_EVERY.as_millis() as i64;
+        if due {
+            let mut total = 0;
+            for base in urls {
+                let mut offset = 0;
+                // At most 500 pages of 100 per source.
+                for _ in 0..500 {
+                    let url = format!("{}?type=http&limit=100&offset={offset}", base.trim_end_matches('/'));
+                    let page = ureq::AgentBuilder::new()
+                        .timeout(Duration::from_secs(30))
+                        .build()
+                        .get(&url)
+                        .call()
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| {
+                            let mut s = String::new();
+                            r.into_reader().take(16 * 1024 * 1024).read_to_string(&mut s).map_err(|e| e.to_string())?;
+                            json::parse(&s).map_err(|_| "not JSON".to_string())
+                        });
+                    match page {
+                        Ok(p) => {
+                            let n = lock().apply_catalog_page(&p);
+                            total += n;
+                            if n < 100 {
+                                break;
+                            }
+                            offset += n;
+                        }
+                        Err(e) => {
+                            eprintln!("keptvow: catalog {base}: {e}");
+                            break;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+            let mut l = lock();
+            l.catalog_at_ms = now_ms();
+            l.dirty = true;
+            println!("keptvow: service catalog: read {total} listings; {} services on Base, {} wallets watched", l.services.len(), l.sellers.len());
+        }
+        std::thread::sleep(Duration::from_secs(600));
+    }
+}
+
+/// Visits each catalogued service about once a day, without paying.
+fn probe_services() {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(10))
+        .redirects(2)
+        .resolver(verify::PublicOnly)
+        .user_agent("KeptvowBot/1.0 (+https://keptvow.com/bot; checks that paid bot services answer)")
+        .build();
+    loop {
+        let next = lock().next_probe(now_ms());
+        let Some((url, method, pay_to)) = next else {
+            std::thread::sleep(Duration::from_secs(60));
+            continue;
+        };
+        let started = Instant::now();
+        let req = if method == "POST" { agent.post(&url).set("Content-Type", "application/json") } else { agent.get(&url) };
+        let res = if method == "POST" { req.send_string("{}") } else { req.call() };
+        let latency = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        let (result, status) = match res {
+            Ok(r) => ("unclear", r.status()),
+            Err(ureq::Error::Status(402, r)) => {
+                let header = r.header("payment-required").map(|h| h.to_string());
+                let mut body = String::new();
+                let _ = r.into_reader().take(256 * 1024).read_to_string(&mut body);
+                (if asks_payment_to(&body, header.as_deref(), &pay_to) { "ok" } else { "mismatch" }, 402)
+            }
+            Err(ureq::Error::Status(code, _)) if code >= 500 => ("down", code),
+            Err(ureq::Error::Status(code, _)) => ("unclear", code),
+            Err(ureq::Error::Transport(_)) => ("down", 0),
+        };
+        lock().record_probe(&url, result, status, latency, now_ms());
+        std::thread::sleep(Duration::from_secs(3));
+    }
+}
+
+/// Whether a 402 answer asks to be paid at `pay_to` (in its JSON body, or its v2 header).
+pub fn asks_payment_to(body: &str, header: Option<&str>, pay_to: &str) -> bool {
+    let from_header = header.and_then(|h| verify::base64_decode(h.trim())).and_then(|b| String::from_utf8(b).ok());
+    for text in [Some(body.to_string()), from_header].into_iter().flatten() {
+        if let Ok(j) = json::parse(&text) {
+            if let Some(Json::Array(accepts)) = j.get("accepts") {
+                if accepts.iter().any(|a| a.get("payTo").and_then(|v| v.as_str()).map_or(false, |p| p.eq_ignore_ascii_case(pay_to))) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// ---- delivery reports: queued by the API, checked against the chain here ----------------------
+
+pub struct PendingReport {
+    pub tx: String,
+    pub delivered: bool,
+    pub pay_to: Option<String>,
+    /// Tries so far: a node that's down, or a transaction not yet visible, is tried again later.
+    pub attempts: u8,
+}
+
+pub fn report_queue() -> &'static Mutex<VecDeque<PendingReport>> {
+    static Q: OnceLock<Mutex<VecDeque<PendingReport>>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// Queues a report; false when the queue is full.
+pub fn queue_report(r: PendingReport) -> bool {
+    let mut q = report_queue().lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= 10_000 || q.iter().any(|p| p.tx == r.tx) {
+        return false;
+    }
+    q.push_back(r);
+    true
+}
+
+/// Finds the USDC payment inside a transaction receipt: (payer, seller, block).
+pub fn payment_in_receipt(receipt: &Json, pay_to: Option<&str>) -> Option<(String, String, u64)> {
+    let block = receipt.get("blockNumber").and_then(|v| v.as_str()).and_then(hex_u64)?;
+    if receipt.get("status").and_then(|v| v.as_str()) != Some("0x1") {
+        return None;
+    }
+    let Some(Json::Array(logs)) = receipt.get("logs") else { return None };
+    logs.iter().find_map(|log| {
+        if !log.get("address").and_then(|v| v.as_str()).map_or(false, |a| a.eq_ignore_ascii_case(USDC)) {
+            return None;
+        }
+        let Some(Json::Array(ts)) = log.get("topics") else { return None };
+        let ts: Vec<&str> = ts.iter().filter_map(|t| t.as_str()).collect();
+        if ts.len() != 3 || !ts[0].eq_ignore_ascii_case(TRANSFER_TOPIC) {
+            return None;
+        }
+        let (from, to) = (topic_address(ts[1])?, topic_address(ts[2])?);
+        let value = log.get("data").and_then(|v| v.as_str()).and_then(word_u128)?;
+        (value > 0 && pay_to.map_or(true, |p| p.eq_ignore_ascii_case(&to))).then_some((from, to, block))
+    })
+}
+
+fn check_reports(urls: &[String]) {
+    let mut nodes = Nodes { urls: urls.to_vec(), preferred: 0 };
+    loop {
+        let next = report_queue().lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        let Some(r) = next else {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        };
+        match nodes.call("eth_getTransactionReceipt", Json::Array(vec![Json::str(r.tx.clone())])) {
+            Ok(Json::Null) | Err(_) if r.attempts < 5 => {
+                // Not visible yet, or no node answered: back of the queue, a bit later.
+                let mut q = report_queue().lock().unwrap_or_else(|e| e.into_inner());
+                q.push_back(PendingReport { attempts: r.attempts + 1, ..r });
+                drop(q);
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+            Ok(receipt) => {
+                if let Some((payer, seller, block)) = payment_in_receipt(&receipt, r.pay_to.as_deref()) {
+                    lock().apply_report(&r.tx, &payer, &seller, block, r.delivered);
+                }
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub fn addr(n: u64) -> String {
+        format!("0x{n:040x}")
+    }
+
+    pub fn transfer_log(from: &str, to: &str, units: u128, block: u64) -> Json {
+        Json::obj(vec![
+            ("address", Json::str(USDC)),
+            ("topics", Json::Array(vec![Json::str(TRANSFER_TOPIC), Json::str(address_topic(from)), Json::str(address_topic(to))])),
+            ("data", Json::str(format!("0x{units:064x}"))),
+            ("blockNumber", Json::str(format!("0x{block:x}"))),
+        ])
+    }
+
+    /// A seller with `buyers` established, returning buyers over 30 days — a strong record.
+    pub fn strong_seller(l: &mut Ledger, seller: &str, buyers: u64) {
+        l.watch(seller);
+        l.sellers.get_mut(seller).unwrap().backfilled_from = 1;
+        let start = 10 * DAY_BLOCKS;
+        for b in 0..buyers {
+            let buyer = addr(0x5000 + b);
+            // Each buyer first paid three other sellers weeks earlier.
+            for o in 0..3 {
+                let other = addr(0x9000 + o);
+                l.watch(&other);
+                l.apply_log(&transfer_log(&buyer, &other, 10_000, start));
+            }
+            l.apply_log(&transfer_log(&buyer, seller, 50_000, start + 20 * DAY_BLOCKS));
+            l.apply_log(&transfer_log(&buyer, seller, 50_000, start + 40 * DAY_BLOCKS));
+        }
+        l.head = start + 41 * DAY_BLOCKS;
+    }
+
+    #[test]
+    fn payment_history_counts_buyers_repeats_and_established_buyers() {
+        let mut l = Ledger::default();
+        let seller = addr(1);
+        assert!(l.watch(&seller));
+        l.apply_log(&transfer_log(&addr(2), &seller, 1_500_000, 100));
+        l.apply_log(&transfer_log(&addr(2), &seller, 500_000, 200));
+        l.apply_log(&transfer_log(&addr(3), &seller, 1_000_000, 300));
+        l.apply_log(&transfer_log(&addr(4), &addr(99), 1_000_000, 300)); // not watched
+        let e = l.evidence(&seller);
+        assert_eq!((e.payments, e.buyers, e.repeat_buyers), (3, 2, 1));
+        assert!((e.volume_usd - 3.0).abs() < 1e-9);
+        assert!(!e.strong());
+        assert!(!l.is_watched(&addr(99)));
+    }
+
+    #[test]
+    fn a_strong_record_needs_many_established_returning_buyers() {
+        let mut l = Ledger::default();
+        strong_seller(&mut l, &addr(1), STRONG_BUYERS as u64);
+        let e = l.evidence(&addr(1));
+        assert_eq!(e.established_buyers, STRONG_BUYERS);
+        assert!(e.strong(), "{e:?}");
+
+        // Throwaway wallets that only ever paid this seller don't count as established.
+        let mut fake = Ledger::default();
+        fake.watch(&addr(7));
+        for b in 0..100 {
+            fake.apply_log(&transfer_log(&addr(0x7000 + b), &addr(7), 1, 10));
+            fake.apply_log(&transfer_log(&addr(0x7000 + b), &addr(7), 1, 10 + 20 * DAY_BLOCKS));
+        }
+        fake.head = 21 * DAY_BLOCKS;
+        let e = fake.evidence(&addr(7));
+        assert_eq!((e.buyers, e.repeat_buyers, e.established_buyers), (100, 100, 0));
+        assert!(!e.strong());
+    }
+
+    #[test]
+    fn reports_from_buyers_who_got_nothing_can_flag_a_seller() {
+        let mut l = Ledger::default();
+        strong_seller(&mut l, &addr(1), STRONG_BUYERS as u64);
+        for b in 0..REPORTS_TO_JUDGE as u64 {
+            assert!(l.apply_report(&format!("0xtx{b}"), &addr(0x5000 + b), &addr(1), 900, false));
+        }
+        assert!(!l.apply_report("0xtx0", &addr(0x5000), &addr(1), 900, true), "one report per payment");
+        let e = l.evidence(&addr(1));
+        assert!(e.reports_bad() && !e.strong());
+        assert_eq!(e.failed, REPORTS_TO_JUDGE);
+    }
+
+    #[test]
+    fn catalog_pages_add_services_and_watch_their_wallets() {
+        let mut l = Ledger::default();
+        let page = json::parse(&format!(
+            r#"{{"x402Version":1,"items":[
+              {{"resource":"https://api.example.com/data","type":"http","accepts":[{{"scheme":"exact","network":"base","maxAmountRequired":"10000","payTo":"{}","asset":"{USDC}","description":"Market data"}}],"metadata":{{"provider":"Example"}}}},
+              {{"resource":"https://other.example/x","accepts":[{{"network":"eip155:84532","payTo":"{}","amount":"5"}}]}},
+              {{"resource":"https://v2.example/y","accepts":[{{"network":"eip155:8453","payTo":"{}","amount":"2500","outputSchema":{{"input":{{"method":"post"}}}}}}]}}
+            ]}}"#,
+            addr(0xa),
+            addr(0xb),
+            addr(0xc)
+        ))
+        .unwrap();
+        assert_eq!(l.apply_catalog_page(&page), 3);
+        assert_eq!(l.services.len(), 2, "testnet services are skipped");
+        let s = &l.services["https://api.example.com/data"];
+        assert_eq!((s.pay_to.as_str(), s.price_usd, s.provider.as_str()), (addr(0xa).as_str(), 0.01, "Example"));
+        assert_eq!(l.services["https://v2.example/y"].method, "POST");
+        assert!(l.is_watched(&addr(0xa)) && l.is_watched(&addr(0xc)) && !l.is_watched(&addr(0xb)));
+    }
+
+    #[test]
+    fn probes_recognize_a_payment_request_to_the_listed_wallet() {
+        let body = format!(r#"{{"x402Version":1,"accepts":[{{"payTo":"{}"}}]}}"#, addr(0xa).to_uppercase().replace("0X", "0x"));
+        assert!(asks_payment_to(&body, None, &addr(0xa)));
+        assert!(!asks_payment_to(&body, None, &addr(0xb)));
+        let header = {
+            const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let bytes = format!(r#"{{"accepts":[{{"payTo":"{}"}}]}}"#, addr(0xc)).into_bytes();
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | (*b as u32) << (16 - 8 * i));
+                for i in 0..=chunk.len() {
+                    out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+                }
+            }
+            out
+        };
+        assert!(asks_payment_to("not json", Some(&header), &addr(0xc)));
+    }
+
+    #[test]
+    fn a_receipt_names_who_paid_whom() {
+        let receipt = Json::obj(vec![
+            ("status", Json::str("0x1")),
+            ("blockNumber", Json::str("0x64")),
+            ("logs", Json::Array(vec![transfer_log(&addr(2), &addr(1), 10_000, 100)])),
+        ]);
+        assert_eq!(payment_in_receipt(&receipt, None), Some((addr(2), addr(1), 100)));
+        assert_eq!(payment_in_receipt(&receipt, Some(&addr(9))), None);
+    }
+
+    #[test]
+    fn the_ledger_survives_a_save_and_load() {
+        let mut l = Ledger::default();
+        strong_seller(&mut l, &addr(1), 3);
+        l.apply_report("0xabc", &addr(0x5000), &addr(1), 50, true);
+        l.cursor = 77;
+        let mut buf = Vec::new();
+        l.write_lines(&mut buf).unwrap();
+        let back = Ledger::read_lines(std::io::Cursor::new(buf)).unwrap();
+        assert_eq!(back.cursor, 77);
+        assert_eq!(back.evidence(&addr(1)), {
+            let mut e = l.evidence(&addr(1));
+            e.history_loading = false;
+            e
+        });
+    }
+}

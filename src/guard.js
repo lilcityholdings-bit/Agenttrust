@@ -7,12 +7,17 @@
 //   await pay("https://seller.example/api");   // throws KeptvowStop instead of paying a bad actor
 //
 // When a seller answers 402 Payment Required, every wallet it asks to be paid at is checked at
-// {URL}/v1/check. A wallet tied to a bot with a bad record stops the payment before any money
-// moves. Free: no key needed for the first 1,000 checks a day.
+// {URL}/v1/check. A wallet with a bad record stops the payment before any money moves.
+//
+// After a paid request it also tells Keptvow, in the background, whether the result arrived —
+// quoting the payment's transaction from the PAYMENT-RESPONSE header, so only real buyers are
+// counted. That is what lets honest sellers earn "ok" and lets everyone avoid the ones that
+// take the money and deliver nothing. Free, no key needed.
 //
 // Options: { allowCareful: true }  false also blocks wallets with no track record
 //          { failOpen: true }      false blocks when Keptvow can't be reached
 //          { onCheck: fn }         called with each check result, e.g. for logging
+//          { reportOutcomes: true } false turns off the delivery reports
 //          { apiKey, baseUrl }
 
 const KEPTVOW = "{URL}";
@@ -50,11 +55,41 @@ export function withKeptvow(fetchImpl = globalThis.fetch, options = {}) {
   const allowCareful = options.allowCareful !== false;
   const failOpen = options.failOpen !== false;
   const onCheck = typeof options.onCheck === "function" ? options.onCheck : () => {};
+  const reportOutcomes = options.reportOutcomes !== false;
   const call = (input, init) => fetchImpl.call(globalThis, input, init);
+  const keyOf = (input) => String(input && input.url ? input.url : input);
+  const payToByUrl = new Map();
+
+  // After a paid request: the settlement receipt names the transaction; report whether the
+  // result arrived. Never awaited and never throws, so it can't slow or break the payment.
+  function report(input, res) {
+    if (!reportOutcomes) return;
+    const header = res.headers.get("payment-response") || res.headers.get("x-payment-response");
+    if (!header) return;
+    let receipt;
+    try {
+      receipt = JSON.parse(atob(header));
+    } catch {
+      return;
+    }
+    const tx = receipt && (receipt.transaction || receipt.txHash);
+    if (!tx || receipt.success === false) return;
+    const body = { tx, status: res.status };
+    const payTo = payToByUrl.get(keyOf(input));
+    if (payTo) body.pay_to = payTo;
+    call(`${base}/v1/outcomes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).catch(() => {});
+  }
 
   return async function guardedFetch(input, init) {
     const res = await call(input, init);
-    if (res.status !== 402) return res;
+    if (res.status !== 402) {
+      report(input, res);
+      return res;
+    }
     let body = null;
     try {
       body = await res.clone().json();
@@ -79,6 +114,7 @@ export function withKeptvow(fetchImpl = globalThis.fetch, options = {}) {
       if (check.verdict === "stop" || (!allowCareful && check.verdict === "careful")) {
         throw new KeptvowStop(check);
       }
+      payToByUrl.set(keyOf(input), option.payTo);
     }
     return res;
   };
