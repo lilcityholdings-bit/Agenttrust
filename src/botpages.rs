@@ -25,59 +25,87 @@ pub fn esc(s: &str) -> String {
 
 const STYLE: &str = r#"
   :root {
-    --bg: #f6f6f3; --panel: #ffffff; --ink: #1b1d1f; --muted: #62666b; --line: #dcdcd6;
-    --accent: #3b5bdb; --accent-ink: #ffffff;
-    --excellent: #1f7a4d; --good: #2f9e44; --fair: #9a7400; --caution: #c92a2a; --unknown: #6c757d;
+    --bg: #f6f5f1; --panel: #ffffff; --ink: #15171a; --muted: #5f646b; --line: #e2e0d8;
+    --accent: #3b4fd8; --accent-ink: #ffffff; --soft: #eceffc;
+    --ok-c: #12805c; --ok-bg: #e5f4ed; --careful-c: #a86200; --careful-bg: #fbf0dc; --stop-c: #c4302b; --stop-bg: #fbe7e5;
+    --excellent: #12805c; --good: #2f9e44; --fair: #9a7400; --caution: #c4302b; --unknown: #6c757d;
+    --shadow: 0 1px 2px rgba(20, 20, 30, .04), 0 8px 24px rgba(20, 20, 30, .06);
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #121416; --panel: #1b1e21; --ink: #e8e9ea; --muted: #9aa0a6; --line: #2e3237;
-      --accent: #7c9cff; --accent-ink: #0d1020;
-      --excellent: #7fd6a4; --good: #8ce99a; --fair: #f4d58d; --caution: #ff8a80; --unknown: #adb5bd;
+      --bg: #101215; --panel: #181b1f; --ink: #eceef0; --muted: #9ba1a8; --line: #2a2e34;
+      --accent: #8b9cff; --accent-ink: #0c1024; --soft: #1e2336;
+      --ok-c: #5fd3a2; --ok-bg: #12291f; --careful-c: #f2b45a; --careful-bg: #2c2312; --stop-c: #ff8a80; --stop-bg: #2f1716;
+      --excellent: #5fd3a2; --good: #8ce99a; --fair: #f4d58d; --caution: #ff8a80; --unknown: #adb5bd;
+      --shadow: none;
     }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink);
-    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 16px 16px 48px; }
-  main { max-width: 720px; margin: 0 auto; }
-  nav { display: flex; gap: 16px; align-items: center; margin-bottom: 20px; font-size: .95rem; }
-  nav .brand { font-weight: 700; color: var(--ink); text-decoration: none; margin-right: auto; }
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 0 16px 48px; }
+  main { max-width: 760px; margin: 0 auto; }
+  nav { display: flex; gap: 16px; align-items: center; padding: 16px 0; margin-bottom: 12px; font-size: .95rem; }
+  nav .brand { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 1.1rem; color: var(--ink); text-decoration: none; margin-right: auto; letter-spacing: -.01em; }
+  nav a:not(.brand) { color: var(--muted); text-decoration: none; }
+  nav a:not(.brand):hover { color: var(--ink); }
+  nav form { display: flex; }
+  nav form input { width: 210px; padding: 7px 12px; border-radius: 999px; font-size: .9rem; }
   a { color: var(--accent); }
-  h1 { font-size: 1.5rem; margin: 0 0 4px; overflow-wrap: anywhere; }
-  .sub { color: var(--muted); margin: 0 0 20px; font-size: .95rem; }
-  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
-  h2 { font-size: 1.05rem; margin: 0 0 10px; }
-  .pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-weight: 700; font-size: .8rem;
-    text-transform: uppercase; letter-spacing: .03em; border: 2px solid currentColor; white-space: nowrap; }
+  h1 { font-size: 1.7rem; letter-spacing: -.015em; line-height: 1.2; margin: 0 0 6px; overflow-wrap: anywhere; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: .95rem; overflow-wrap: anywhere; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 18px; margin-bottom: 16px; box-shadow: var(--shadow); }
+  h2 { font-size: 1.08rem; margin: 0 0 10px; }
+  .pill { display: inline-block; padding: 3px 12px; border-radius: 999px; font-weight: 750; font-size: .78rem;
+    text-transform: uppercase; letter-spacing: .05em; border: 1.5px solid currentColor; white-space: nowrap; }
   .excellent { color: var(--excellent); } .good { color: var(--good); } .fair { color: var(--fair); }
   .caution { color: var(--caution); } .unknown { color: var(--unknown); }
+  .verdict { border-radius: 18px; padding: 22px; margin-bottom: 16px; border: 1px solid transparent; }
+  .verdict .word { font-size: 2.4rem; font-weight: 850; letter-spacing: .04em; line-height: 1; margin: 0 0 10px; display: flex; align-items: center; gap: 12px; }
+  .verdict p { margin: 0; font-size: 1.05rem; }
+  .verdict.ok { background: var(--ok-bg); color: var(--ok-c); border-color: var(--ok-c); }
+  .verdict.careful { background: var(--careful-bg); color: var(--careful-c); border-color: var(--careful-c); }
+  .verdict.stop { background: var(--stop-bg); color: var(--stop-c); border-color: var(--stop-c); }
+  .verdict p, .verdict .note { color: var(--ink); }
+  .verdict .note { font-size: .88rem; opacity: .75; margin-top: 8px; }
   ul.reasons { margin: 12px 0 0; padding-left: 20px; }
   .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-  .stat { background: var(--bg); border-radius: 8px; padding: 8px; text-align: center; }
-  .stat b { display: block; font-size: 1.3rem; font-variant-numeric: tabular-nums; }
+  .stat { background: var(--bg); border-radius: 12px; padding: 12px 8px; text-align: center; }
+  .stat b { display: block; font-size: 1.4rem; font-variant-numeric: tabular-nums; }
   .stat span { color: var(--muted); font-size: .8rem; }
   dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 0; }
   dt { color: var(--muted); font-size: .9rem; } dd { margin: 0; overflow-wrap: anywhere; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .82rem; overflow-wrap: anywhere; }
   .code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; overflow-wrap: anywhere;
-    background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 8px 0; white-space: pre-wrap; }
+    background: #12141a; color: #e6e8ee; border-radius: 10px; padding: 12px; margin: 8px 0; white-space: pre-wrap; }
   .muted { color: var(--muted); font-size: .9rem; }
-  input { width: 100%; font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line);
+  input { width: 100%; font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line);
     background: var(--bg); color: var(--ink); }
-  button { font: inherit; font-weight: 600; padding: 10px 16px; border-radius: 8px; border: 0;
+  button { font: inherit; font-weight: 650; padding: 10px 16px; border-radius: 10px; border: 0;
     background: var(--accent); color: var(--accent-ink); cursor: pointer; }
   form.search { display: flex; gap: 8px; } form.search input { flex: 1; min-width: 0; }
   .list a.row { display: flex; gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line);
     text-decoration: none; color: var(--ink); }
   .list a.row:last-child { border-bottom: 0; }
+  .list a.row:hover .nm { color: var(--accent); }
   .row .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
   .row .meta { color: var(--muted); font-size: .85rem; white-space: nowrap; }
   .pager { display: flex; justify-content: space-between; margin-top: 12px; }
   .ok { color: var(--good); } .bad { color: var(--caution); }
+  .formats { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: .85rem; color: var(--muted); margin: -8px 0 16px; }
+  .formats a { background: var(--soft); color: var(--accent); padding: 3px 10px; border-radius: 999px; text-decoration: none; font-weight: 600; }
+  .svc { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .svc:last-child { border-bottom: 0; }
+  .svc .top { display: flex; gap: 10px; align-items: baseline; justify-content: space-between; }
+  .svc .price { font-weight: 700; white-space: nowrap; }
   details summary { cursor: pointer; color: var(--accent); }
   [hidden] { display: none !important; }
-  @media (max-width: 480px) { .row .meta.age { display: none; } dl { grid-template-columns: 1fr; } dt { margin-top: 6px; } }
+  @media (max-width: 600px) { nav form, nav .hide-sm { display: none; } }
+  @media (max-width: 480px) { .row .meta.age { display: none; } dl { grid-template-columns: 1fr; } dt { margin-top: 6px; }
+    .stats { grid-template-columns: repeat(2, 1fr); } .verdict .word { font-size: 2rem; } }
 "#;
+
+/// The shield mark, the same as on the home page.
+const LOGO: &str = r#"<svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3z" fill="currentColor" opacity=".12"/><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m8.5 12 2.4 2.4L15.8 9.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 
 fn page(title: &str, description: &str, canonical: &str, body: &str) -> String {
     format!(
@@ -93,7 +121,7 @@ fn page(title: &str, description: &str, canonical: &str, body: &str) -> String {
 </head>
 <body>
 <main>
-<nav><a class="brand" href="/">Keptvow</a><a href="/bots">All bots</a><a href="/stats">Numbers</a><a href="/docs">Docs</a></nav>
+<nav><a class="brand" href="/">{LOGO}Keptvow</a><form action="/go" method="get" role="search"><input name="q" placeholder="Wallet, bot name or number" aria-label="Check a wallet or bot"></form><a href="/bots">Bots</a><a href="/stats" class="hide-sm">Numbers</a><a href="/docs" class="hide-sm">Docs</a></nav>
 {body}
 </main>
 </body>
@@ -160,6 +188,7 @@ pub fn directory(idx: &Index, q: &str, newest: bool, page_no: usize, base: &str)
     let body = format!(
         r#"<h1>Every AI bot, rated</h1>
 <p class="sub">{all} bots from the public ERC-8004 registry on Base, each with a free score page. Check a bot before you pay it. Own one? Open its page and claim it free.</p>
+<div class="formats">For bots: <a href="/v1/bots?q={qe}">JSON</a><a href="/v1/bots?q={qe}&amp;format=md">Markdown</a></div>
 {syncing}
 <section>
 <form class="search" action="/bots" method="get">
@@ -173,6 +202,7 @@ pub fn directory(idx: &Index, q: &str, newest: bool, page_no: usize, base: &str)
         all = fmt_count(all),
         syncing = syncing_note(idx),
         q = esc(q),
+        qe = esc(&url_encode(q)),
         shown = if q.is_empty() { plural(total, "bot") } else { format!("{} matching", plural(total, "bot")) },
     );
     page(
@@ -326,6 +356,7 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
     let body = format!(
         r#"<h1>{name}</h1>
 <p class="sub">Bot #{id} in the public ERC-8004 registry on Base · registered {age}</p>
+<div class="formats">For bots: <a href="/bots/{chain}/{id}?format=json">JSON</a><a href="/bots/{chain}/{id}?format=md">Markdown</a><a href="/bots/{chain}/{id}?format=text">One line</a></div>
 {syncing}
 <section>
 <span class="pill {level}">{level}</span>
@@ -361,6 +392,7 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
 </section>
 {claim}"#,
         name = esc(&name),
+        chain = chain::CHAIN_NAME,
         age = if days == 0 { "today".to_string() } else { format!("{} ago", plural(days as usize, "day")) },
         syncing = syncing_note(idx),
         reviewers = r.reviewers,
@@ -441,6 +473,169 @@ pub fn stats_page(stats: &Json, base: &str) -> String {
         )
 }
 
+/// `/wallets/{0x…}` — should I pay this wallet? The payment check, as a page: the verdict
+/// first and big, then the evidence behind it. Built from the same JSON as `/v1/wallets/{0x…}`.
+pub fn wallet_page(j: &Json, base: &str) -> String {
+    let st = |v: Option<&Json>| v.and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let num = |v: Option<&Json>| v.and_then(|x| x.as_f()).unwrap_or(0.0);
+    let wallet = st(j.get("pay_to"));
+    let verdict = match st(j.get("verdict")).as_str() {
+        "ok" => "ok",
+        "stop" => "stop",
+        _ => "careful",
+    };
+    let icon = match verdict {
+        "ok" => "✓",
+        "stop" => "✕",
+        _ => "!",
+    };
+    let e = j.get("evidence");
+    let pay = |k: &str| num(e.and_then(|e| e.get("payments")).and_then(|p| p.get(k)));
+    let rep = |k: &str| num(e.and_then(|e| e.get("delivery_reports")).and_then(|p| p.get(k))) as usize;
+    let loading = e.and_then(|e| e.get("history_loading")).map_or(false, |v| matches!(v, Json::Bool(true)));
+    let window = pay("window_days") as usize;
+    let tile = |n: String, label: &str, class: &str| format!(r#"<div class="stat"><b class="{class}">{n}</b><span>{}</span></div>"#, esc(label));
+    let tiles = [
+        tile(fmt_count(pay("received") as usize), "payments received", ""),
+        tile(fmt_count(pay("buyers") as usize), "different buyers", ""),
+        tile(fmt_count(pay("repeat_buyers") as usize), "came back to buy again", ""),
+        tile(fmt_count(pay("established_buyers") as usize), "established buyers", ""),
+        tile(format!("${}", fmt_count(pay("volume_usd").round() as usize)), "paid to it", ""),
+        tile(
+            match pay("last_payment_days_ago") {
+                _ if pay("received") == 0.0 => "—".into(),
+                d if d < 1.0 => "today".into(),
+                d => format!("{}d ago", d as usize),
+            },
+            "last paid",
+            "",
+        ),
+    ]
+    .concat();
+    let loading_note = if loading {
+        r#"<p class="muted">Reading this wallet's payment history now — it's new to Keptvow. Reload in a few minutes for the full picture.</p>"#
+    } else {
+        ""
+    };
+    let reporters = rep("buyers_reporting");
+    let reports = if reporters == 0 {
+        r#"<p class="muted">No buyer has reported yet. Buyers using <a href="/guard.js">guard.js</a> or the <span class="mono">report_delivery</span> tool report automatically after they pay.</p>"#.to_string()
+    } else {
+        format!(
+            r#"<div class="stats"><div class="stat"><b>{reporters}</b><span>buyers reported</span></div><div class="stat"><b class="ok">{}</b><span>got what they paid for</span></div><div class="stat"><b class="bad">{}</b><span>got nothing</span></div></div><p class="muted">Only buyers whose payment to this wallet is on-chain are counted, once each.</p>"#,
+            rep("delivered"),
+            rep("not_delivered")
+        )
+    };
+    let mut services = String::new();
+    if let Some(Json::Array(list)) = j.get("services") {
+        for sv in list.iter().take(20) {
+            let check = st(sv.get("last_check"));
+            let (class, label) = match check.as_str() {
+                "ok" => ("ok", "answering".to_string()),
+                "down" => ("bad", "not answering".to_string()),
+                "mismatch" => ("bad", "asks to be paid at a different wallet".to_string()),
+                "unclear" => ("muted", "answered without asking for payment".to_string()),
+                other => ("muted", other.to_string()),
+            };
+            let desc = st(sv.get("description"));
+            services.push_str(&format!(
+                r#"<div class="svc"><div class="top"><span class="mono">{url}</span><span class="price">${price}</span></div>{desc}<div class="muted">Last check: <span class="{class}">{label}</span></div></div>"#,
+                url = esc(&st(sv.get("url"))),
+                price = esc(&format!("{}", num(sv.get("price_usd")))),
+                desc = if desc.is_empty() { String::new() } else { format!(r#"<div class="muted">{}</div>"#, esc(&desc)) },
+                label = esc(&label),
+            ));
+        }
+    }
+    let services = if services.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<section><h2>Paid services at this wallet</h2>{services}<p class="muted">From the public x402 service catalogs. Keptvow calls each one daily to see that it answers and asks to be paid here.</p></section>"#)
+    };
+    let mut bots = String::new();
+    if let Some(Json::Array(list)) = j.get("matches") {
+        for b in list.iter().take(10) {
+            let id = st(b.get("agent_id"));
+            let href = match b.get("profile_page").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => format!("/trust/{}", url_encode(&id)),
+            };
+            let name = match st(b.get("name")) {
+                n if n.is_empty() => id.clone(),
+                n => n,
+            };
+            let level = match st(b.get("trust_level")).as_str() {
+                l @ ("excellent" | "good" | "fair" | "caution") => l.to_string(),
+                _ => "unknown".to_string(),
+            };
+            bots.push_str(&format!(
+                r#"<a class="row" href="{href}"><span class="nm">{name}</span><span class="meta age mono">{id}</span><span class="pill {level}">{level}</span></a>"#,
+                href = esc(&href),
+                name = esc(&name),
+                id = esc(&id),
+            ));
+        }
+    }
+    let bots = if bots.is_empty() {
+        r#"<p class="muted">No bot Keptvow knows of says it is paid at this wallet.</p>"#.to_string()
+    } else {
+        format!(r#"<div class="list">{bots}</div>"#)
+    };
+    let body = format!(
+        r#"<h1>Should I pay this wallet?</h1>
+<p class="sub mono">{wallet}</p>
+<div class="formats">For bots: <a href="/v1/wallets/{wallet}">JSON</a><a href="/wallets/{wallet}?format=md">Markdown</a><a href="/wallets/{wallet}?format=text">One line</a></div>
+<div class="verdict {verdict}" role="status"><div class="word"><span aria-hidden="true">{icon}</span>{word}</div><p>{advice}</p><p class="note">Checked just now, from USDC payments on Base read every minute.</p></div>
+<section>
+<h2>Payment history, last {window} days</h2>
+{loading_note}
+<div class="stats">{tiles}</div>
+<p class="muted">Read straight from USDC payments on Base. <b>Established</b> buyers have paid at least three different sellers for two weeks or more — hard to fake with fresh wallets.</p>
+</section>
+<section><h2>Did buyers get what they paid for?</h2>{reports}</section>
+{services}
+<section><h2>Bots paid at this wallet</h2>{bots}</section>
+<section>
+<h2>Check it from code, before every payment</h2>
+<div class="code">curl "{base}/v1/check?pay_to={wallet}&amp;amount_usd=5"</div>
+<p class="muted">Free. Or wrap your x402 fetch with <a href="/guard.js">guard.js</a> and it checks every seller for you. <a href="/docs">All the ways to connect</a>.</p>
+</section>"#,
+        wallet = esc(&wallet),
+        word = verdict.to_uppercase(),
+        advice = esc(&st(j.get("advice"))),
+        base = esc(base),
+    );
+    let title = format!("{} — wallet {}… | Keptvow", verdict.to_uppercase(), wallet.get(..10).unwrap_or(&wallet));
+    let summary = format!("Should you pay {wallet}? Keptvow says {}: {}", verdict.to_uppercase(), st(j.get("advice")));
+    page(&title, &summary, &format!("{base}/wallets/{wallet}"), &body)
+}
+
+/// The home page's board of sellers with a strong payment record: `(wallet, name, buyers,
+/// repeat buyers)`, best first. Empty when there are none yet, so the section stays hidden.
+pub fn leaders_section(rows: &[(String, String, usize, usize)]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let list: String = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (wallet, name, buyers, repeat))| {
+            format!(
+                r#"<a class="row" href="/wallets/{w}"><span class="rank">{n}</span><span class="nm">{name}</span><span class="meta">{b} buyers · {r} came back</span><span class="pill ok">OK</span></a>"#,
+                w = esc(wallet),
+                n = i + 1,
+                name = esc(name),
+                b = fmt_count(*buyers),
+                r = fmt_count(*repeat),
+            )
+        })
+        .collect();
+    format!(
+        r#"<section class="block"><h2>Most trusted sellers right now</h2><p class="lead">Paid by the most established buyers — who keep coming back.</p><div class="leaders">{list}</div></section>"#
+    )
+}
+
 /// Bot pages per sitemap file (the format allows 50,000).
 const PER_SITEMAP: usize = 40_000;
 
@@ -454,7 +649,20 @@ pub fn sitemap_index(idx: &Index, base: &str) -> String {
     for n in 0..=parts {
         s.push_str(&format!("<sitemap><loc>{}/sitemaps/{n}.xml</loc></sitemap>\n", esc(base)));
     }
+    s.push_str(&format!("<sitemap><loc>{}/sitemaps/wallets.xml</loc></sitemap>\n", esc(base)));
     s.push_str("</sitemapindex>\n");
+    s
+}
+
+/// `/sitemaps/wallets.xml` — the page of every wallet that sells a paid service.
+pub fn sitemap_wallets(wallets: &[String], base: &str) -> String {
+    let mut s = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+"#);
+    for w in wallets.iter().take(PER_SITEMAP) {
+        s.push_str(&format!("<url><loc>{}/wallets/{}</loc></url>\n", esc(base), esc(w)));
+    }
+    s.push_str("</urlset>\n");
     s
 }
 
@@ -486,7 +694,7 @@ fn url_encode(s: &str) -> String {
         .collect()
 }
 
-fn fmt_count(n: usize) -> String {
+pub fn fmt_count(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {

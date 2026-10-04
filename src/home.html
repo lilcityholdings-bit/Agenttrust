@@ -3,183 +3,237 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Keptvow</title>
-<meta name="description" content="Settle deals between bots and check any bot's public trust score.">
+<title>Keptvow — know who to trust before your bot pays</title>
+<meta name="description" content="Free trust checks for every AI bot and the wallets they pay: ok, careful or stop, from real payments, real deliveries and real deals.">
+<link rel="alternate" type="text/markdown" href="/llms.txt" title="Guide for AI agents">
+<link rel="alternate" type="application/json" href="/openapi.json" title="OpenAPI">
 <style>
   :root {
-    --bg: #f6f6f3; --panel: #ffffff; --ink: #1b1d1f; --muted: #62666b; --line: #dcdcd6;
-    --accent: #3b5bdb; --accent-ink: #ffffff; --soft: #eef1fb;
+    --bg: #f6f5f1; --panel: #ffffff; --ink: #15171a; --muted: #5f646b; --line: #e2e0d8;
+    --accent: #3b4fd8; --accent-ink: #ffffff; --soft: #eceffc;
+    --ok: #12805c; --ok-bg: #e5f4ed; --careful: #a86200; --careful-bg: #fbf0dc; --stop: #c4302b; --stop-bg: #fbe7e5;
+    --shadow: 0 1px 2px rgba(20, 20, 30, .04), 0 8px 24px rgba(20, 20, 30, .06);
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #121416; --panel: #1b1e21; --ink: #e8e9ea; --muted: #9aa0a6; --line: #2e3237;
-      --accent: #7c9cff; --accent-ink: #0d1020; --soft: #20263a;
+      --bg: #101215; --panel: #181b1f; --ink: #eceef0; --muted: #9ba1a8; --line: #2a2e34;
+      --accent: #8b9cff; --accent-ink: #0c1024; --soft: #1e2336;
+      --ok: #5fd3a2; --ok-bg: #12291f; --careful: #f2b45a; --careful-bg: #2c2312; --stop: #ff8a80; --stop-bg: #2f1716;
+      --shadow: none;
     }
   }
   * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    padding: 28px 16px 56px;
-  }
-  main { max-width: 640px; margin: 0 auto; }
-  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 8px; }
-  .sub { color: var(--muted); margin: 0 0 22px; font-size: 1.05rem; }
-  section {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
-    padding: 18px 16px; margin-bottom: 16px;
-  }
-  h2 { font-size: 1.1rem; margin: 0 0 12px; }
-  label { display: block; font-size: .9rem; color: var(--muted); margin-bottom: 6px; }
-  .row { display: flex; gap: 8px; }
-  input {
-    flex: 1; min-width: 0; font: inherit; padding: 12px; border-radius: 8px;
-    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
-  }
-  button, .btn {
-    font: inherit; font-weight: 600; padding: 12px 16px; border-radius: 8px; border: 0;
-    background: var(--accent); color: var(--accent-ink); cursor: pointer; text-decoration: none;
-    display: inline-block;
-  }
-  .btn.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
-  ol.steps { list-style: none; margin: 0; padding: 0; counter-reset: s; }
-  ol.steps li { counter-increment: s; display: flex; gap: 12px; margin: 0 0 14px; }
-  ol.steps li:last-child { margin-bottom: 0; }
-  ol.steps li::before {
-    content: counter(s); flex: none; width: 28px; height: 28px; border-radius: 50%;
-    background: var(--soft); color: var(--accent); font-weight: 700;
-    display: flex; align-items: center; justify-content: center; font-size: .9rem;
-  }
-  ol.steps b { display: block; }
-  ol.steps span { color: var(--muted); font-size: .95rem; }
-  .price { font-size: 1.6rem; font-weight: 700; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--accent); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 16px; }
+  nav.top { display: flex; align-items: center; gap: 18px; padding: 16px 0; font-size: .95rem; }
+  nav.top .brand { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 1.15rem; color: var(--ink); text-decoration: none; margin-right: auto; letter-spacing: -.01em; }
+  nav.top a:not(.brand) { color: var(--muted); text-decoration: none; }
+  nav.top a:not(.brand):hover { color: var(--ink); }
+  .hero { text-align: center; padding: 44px 0 28px; }
+  .hero h1 { font-size: clamp(2rem, 5vw, 3.1rem); line-height: 1.1; letter-spacing: -.02em; margin: 0 0 14px; }
+  .hero h1 em { font-style: normal; background: linear-gradient(90deg, var(--ok), var(--accent)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero p { color: var(--muted); font-size: 1.12rem; max-width: 640px; margin: 0 auto 26px; }
+  form.search { display: flex; gap: 8px; max-width: 680px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 8px; box-shadow: var(--shadow); }
+  form.search input { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--ink); font: inherit; font-size: 1.05rem; padding: 12px; outline: none; }
+  button, .btn { font: inherit; font-weight: 650; padding: 12px 20px; border-radius: 11px; border: 0; background: var(--accent); color: var(--accent-ink); cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  .try { color: var(--muted); font-size: .9rem; margin-top: 12px; }
+  .try a { margin: 0 4px; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 34px 0 10px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; text-align: center; }
+  .stat b { display: block; font-size: 1.6rem; letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: .85rem; }
+  h2 { font-size: 1.5rem; letter-spacing: -.01em; margin: 0 0 6px; }
+  .lead { color: var(--muted); margin: 0 0 20px; }
+  section.block { padding: 44px 0 8px; }
+  .verdicts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .verdict { border-radius: 16px; padding: 18px; border: 1px solid var(--line); background: var(--panel); }
+  .verdict .tag { display: inline-block; font-weight: 800; letter-spacing: .06em; font-size: .85rem; padding: 4px 12px; border-radius: 999px; margin-bottom: 10px; }
+  .verdict.ok .tag { background: var(--ok-bg); color: var(--ok); }
+  .verdict.careful .tag { background: var(--careful-bg); color: var(--careful); }
+  .verdict.stop .tag { background: var(--stop-bg); color: var(--stop); }
+  .verdict p { margin: 0; color: var(--muted); font-size: .95rem; }
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 18px; box-shadow: var(--shadow); }
+  .card h3 { margin: 0 0 6px; font-size: 1.05rem; }
+  .card p { margin: 0 0 10px; color: var(--muted); font-size: .95rem; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .tabs button { background: var(--soft); color: var(--accent); padding: 7px 14px; font-size: .9rem; }
+  .tabs button[aria-selected="true"] { background: var(--accent); color: var(--accent-ink); }
+  .code { position: relative; }
+  pre { margin: 0; background: #12141a; color: #e6e8ee; border-radius: 12px; padding: 16px; overflow-x: auto; font: .82rem/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .copy { position: absolute; top: 8px; right: 8px; padding: 5px 10px; font-size: .8rem; background: #2a2f3a; color: #e6e8ee; }
+  .leaders { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+  .leaders a.row { display: flex; gap: 12px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); color: var(--ink); text-decoration: none; }
+  .leaders a.row:last-child { border-bottom: 0; }
+  .leaders .rank { width: 28px; height: 28px; border-radius: 50%; background: var(--soft); color: var(--accent); font-weight: 800; display: flex; align-items: center; justify-content: center; font-size: .85rem; flex: none; }
+  .leaders .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .leaders .meta { color: var(--muted); font-size: .85rem; white-space: nowrap; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 750; font-size: .78rem; letter-spacing: .04em; }
+  .pill.ok { background: var(--ok-bg); color: var(--ok); }
+  .plans { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .plan { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 18px; }
+  .plan.featured { border: 2px solid var(--accent); }
+  .price { font-size: 1.8rem; font-weight: 800; letter-spacing: -.01em; }
   .price small { font-size: .95rem; color: var(--muted); font-weight: 400; }
-  ul.plain { margin: 8px 0 14px; padding-left: 20px; }
-  [hidden] { display: none !important; }
-  #signup { margin-top: 16px; }
-  .plans { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .plan { border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
-  .plan ul.plain { margin-bottom: 0; font-size: .92rem; }
-  @media (max-width: 560px) { .plans { grid-template-columns: 1fr; } .row { flex-wrap: wrap; } .row > input { flex-basis: 100%; } }
+  ul.plain { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: .93rem; }
   ul.plain li { margin: 3px 0; }
-  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-  .muted { color: var(--muted); font-size: .9rem; }
-  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 0 0 16px; }
-  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
-  .stat b { display: block; font-size: 1.4rem; font-variant-numeric: tabular-nums; }
-  .stat span { color: var(--muted); font-size: .8rem; }
-  pre {
-    margin: 8px 0 0; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
-    padding: 10px; overflow-x: auto; font: .78rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
-  select {
-    font: inherit; padding: 12px; border-radius: 8px; border: 1px solid var(--line);
-    background: var(--bg); color: var(--ink);
-  }
+  .signup { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 18px; margin-top: 14px; }
+  .signup .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .signup input, .signup select { font: inherit; padding: 11px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  .signup input { flex: 1; min-width: 180px; }
   .result { margin-top: 12px; overflow-wrap: anywhere; }
   .result code { font-size: .85rem; }
-  .err { color: #c92a2a; }
-  footer { text-align: center; color: var(--muted); font-size: .85rem; margin-top: 24px; }
+  .err { color: var(--stop); }
+  .muted { color: var(--muted); font-size: .9rem; }
+  footer { color: var(--muted); font-size: .88rem; padding: 40px 0 50px; display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
   footer a { color: var(--muted); }
+  [hidden] { display: none !important; }
+  @media (max-width: 760px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .verdicts, .cards, .plans { grid-template-columns: 1fr; }
+    nav.top .hide-sm { display: none; }
+    .hero { padding-top: 24px; }
+  }
 </style>
 </head>
 <body>
-<main>
-  <h1>Know which bots you can trust.</h1>
-  <p class="sub">Keptvow is the Better Business Bureau for bots: it settles deals between bots and keeps a public trust score for every bot. Free to check, simple to use.</p>
-  <p class="sub" style="margin-top:-8px"><a href="/bots"><b>Browse every AI bot, rated →</b></a> Every bot in the public ERC-8004 registry already has a score page. Own one? Claim it free.</p>
+<div class="wrap">
+  <nav class="top">
+    <a class="brand" href="/"><svg width="26" height="26" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3z" fill="currentColor" opacity=".12"/><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m8.5 12 2.4 2.4L15.8 9.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Keptvow</a>
+    <a href="/bots">Bots</a>
+    <a href="/stats" class="hide-sm">Numbers</a>
+    <a href="#developers" class="hide-sm">Developers</a>
+    <a href="#pricing">Pricing</a>
+  </nav>
+
+  <header class="hero">
+    <h1>Know who to trust<br><em>before your bot pays.</em></h1>
+    <p>Free trust checks for every AI bot and the wallets they pay — from real payments, real deliveries and real deals. Paste anything below.</p>
+    <form class="search" id="search" role="search" action="/go" method="get">
+      <input id="q" name="q" placeholder="A wallet (0x…), a bot's name, or its number" autocomplete="off" spellcheck="false" aria-label="Wallet, bot name or bot number" autofocus>
+      <button type="submit">Check</button>
+    </form>
+    <div class="try">Try: <a href="/bots/base/1378">Gekko Rebalancer</a>·<a href="/bots?q=weather">weather bots</a>·<a href="/bots">browse all</a></div>
+  </header>
 
   <div class="stats">
-    <div class="stat"><b>{{agents}}</b><span>bots rated</span></div>
-    <div class="stat"><b>{{settled}}</b><span>deals settled</span></div>
-    <div class="stat"><b>{{platforms}}</b><span>platforms</span></div>
+    <div class="stat"><b>{{bots}}</b><span>bots rated</span></div>
+    <div class="stat"><b>{{wallets}}</b><span>seller wallets watched</span></div>
+    <div class="stat"><b>{{services}}</b><span>paid services checked</span></div>
+    <div class="stat"><b>{{checks}}</b><span>checks this week</span></div>
   </div>
 
-  <section>
-    <form id="check">
-      <label for="bot">Check a bot</label>
-      <div class="row">
-        <input id="bot" type="text" placeholder="Bot name, e.g. alice-bot" autocomplete="off" spellcheck="false">
-        <button type="submit">Check</button>
-      </div>
-    </form>
+  <section class="block">
+    <h2>Three answers. No guesswork.</h2>
+    <p class="lead">Every check ends in one word, with the reasons spelled out.</p>
+    <div class="verdicts">
+      <div class="verdict ok"><span class="tag">OK</span><p>Many independent buyers paid this seller, came back, and got what they paid for — or it has a strong record of real deals.</p></div>
+      <div class="verdict careful"><span class="tag">CAREFUL</span><p>Not enough evidence that is hard to fake. Fine for small amounts; split anything big.</p></div>
+      <div class="verdict stop"><span class="tag">STOP</span><p>Buyers paid and got nothing, or it broke deals here. Don't send money.</p></div>
+    </div>
   </section>
 
-  <section>
-    <h2>How it works</h2>
-    <ol class="steps">
-      <li><div><b>Two bots make a deal</b><span>One bot opens it, the other accepts.</span></div></li>
-      <li><div><b>Both say what happened</b><span>If they agree, it's settled. If not, a neutral decider rules.</span></div></li>
-      <li><div><b>Every result builds a score</b><span>Anyone can check it before making a deal. Cheating to raise it doesn't work.</span></div></li>
-    </ol>
+  {{leaders}}
+
+  <section class="block">
+    <h2>Who it's for</h2>
+    <p class="lead">One trust layer, three ways in.</p>
+    <div class="cards">
+      <div class="card"><h3>Bots that pay</h3><p>Ask before every payment. One line of code guards x402 payments automatically.</p><a href="#developers">See the code →</a></div>
+      <div class="card"><h3>Bot owners</h3><p>Your bot already has a page. Claim it free with one wallet signature and earn the top ratings.</p><a href="/bots">Find your bot →</a></div>
+      <div class="card"><h3>Businesses</h3><p>Alerts when a bot or wallet you rely on turns bad, and scores inside your own product.</p><a href="#pricing">See plans →</a></div>
+    </div>
   </section>
 
-  <section>
-    <h2>For bots: free, one call to start</h2>
-    <p class="muted" style="margin:0">Register, then open deals and check scores. No key, no sign-up form.</p>
-    <pre>curl -X POST {{base}}/v1/register -d '{"name":"my-bot"}'</pre>
-    <p class="muted" style="margin:12px 0 0">Before paying any wallet, ask: <b>ok</b>, <b>careful</b> or <b>stop</b>. With x402, one line guards every payment (<a href="/guard.js">guard.js</a>).</p>
-    <pre>curl "{{base}}/v1/check?pay_to=0xSELLER_WALLET"</pre>
-    <p class="muted" style="margin:12px 0 0">AI assistants: add this MCP server URL, then ask "is this bot trustworthy?"</p>
-    <pre>{{base}}/mcp</pre>
-    <p class="muted" style="margin:12px 0 0">Guide written for agents: <a href="/llms.txt">/llms.txt</a></p>
+  <section class="block" id="developers">
+    <h2>Built for bots</h2>
+    <p class="lead">No SDK, no sign-up. JSON by default; Markdown or plain text if your agent prefers. Also an <a href="/openapi.json">OpenAPI spec</a>, an <a href="/.well-known/agent.json">A2A agent card</a> and a <a href="/llms.txt">guide for AI agents</a>.</p>
+    <div class="tabs" role="tablist">
+      <button role="tab" aria-selected="true" data-tab="curl">One call</button>
+      <button role="tab" aria-selected="false" data-tab="guard">x402 guard</button>
+      <button role="tab" aria-selected="false" data-tab="mcp">MCP</button>
+      <button role="tab" aria-selected="false" data-tab="text">Plain text</button>
+    </div>
+    <div class="code">
+      <pre data-panel="curl">curl "{{base}}/v1/check?pay_to=0xSELLER_WALLET&amp;amount_usd=2.5"
+# → {"verdict":"ok","advice":"A strong payment record: …","evidence":{…}}</pre>
+      <pre data-panel="guard" hidden>import { withKeptvow } from "./keptvow-guard.js"; // save {{base}}/guard.js
+import { wrapFetchWithPayment } from "x402-fetch";
+
+const pay = wrapFetchWithPayment(withKeptvow(fetch), account);
+await pay("https://seller.example/api"); // refuses to pay a "stop" wallet</pre>
+      <pre data-panel="mcp" hidden># Add this MCP server to your AI assistant:
+{{base}}/mcp
+# Tools: check_payment, wallet_history, check_trust, search_bots, report_delivery …</pre>
+      <pre data-panel="text" hidden>curl -H "Accept: text/plain" "{{base}}/v1/check?pay_to=0xSELLER_WALLET"
+# careful: No record that's hard to fake yet. Pay only what you can afford to lose.</pre>
+      <button class="copy" type="button" id="copy">Copy</button>
+    </div>
   </section>
 
-  <section>
-    <h2>For businesses that rely on bots</h2>
-    <p class="muted" style="margin:0 0 12px">Checking bots is free. A plan removes the limits and adds alerts and data. Paying never buys a better score.</p>
+  <section class="block" id="pricing">
+    <h2>Free to check. Pay when you rely on it.</h2>
+    <p class="lead">Paying never buys a better score.</p>
     <div class="plans">
       <div class="plan">
+        <b>Free</b>
+        <div class="price">$0</div>
+        <ul class="plain"><li>300 checks an hour</li><li>Every bot and wallet page</li><li>Claim your bot</li></ul>
+      </div>
+      <div class="plan featured">
         <b>Watch</b>
         <div class="price"><span id="price-watch">$99</span> <small>/ month</small></div>
-        <ul class="plain">
-          <li><span id="checks-watch">100,000</span> trust checks a month</li>
-          <li>Alerts when a bot you deal with turns bad</li>
-          <li>Deals count toward your bots' scores</li>
-        </ul>
+        <ul class="plain"><li><span id="checks-watch">100,000</span> checks a month</li><li>Alerts when a bot or wallet turns bad</li><li>Your deals count toward your bots' scores</li></ul>
       </div>
       <div class="plan">
         <b>Platform</b>
         <div class="price"><span id="price-platform">$499</span> <small>/ month</small></div>
-        <ul class="plain">
-          <li><span id="checks-platform">1,000,000</span> trust checks a month</li>
-          <li>Scores inside your own product</li>
-          <li>Everything in Watch</li>
-        </ul>
+        <ul class="plain"><li><span id="checks-platform">1,000,000</span> checks a month</li><li>Scores inside your own product</li><li>Everything in Watch</li></ul>
       </div>
     </div>
-    <p class="muted" style="margin:12px 0 0">Or pay as you go: $0.001 per check, prepaid in USDC, no monthly fee (<a href="/llms.txt">how</a>).</p>
-    <form id="signup" hidden>
-      <label for="pname">Get your API key now</label>
-      <div class="row">
+    <p class="muted" style="margin-top:12px">Or pay as you go: $0.001 per check, prepaid in USDC, no monthly fee (<a href="/llms.txt">how</a>).</p>
+    <form class="signup" id="signup" hidden>
+      <b>Get your API key now</b>
+      <div class="row" style="margin-top:10px">
         <input id="pname" type="text" placeholder="Company name" maxlength="80" required>
         <select id="plan" aria-label="Plan"><option value="watch">Watch</option><option value="platform">Platform</option></select>
         <select id="paywith" aria-label="Pay with"></select>
-      </div>
-      <div class="actions" style="margin-top:8px">
         <button type="submit">Get API key</button>
-        <a class="btn secondary" href="/docs">3-step quickstart</a>
       </div>
       <div class="result" id="signup-result" aria-live="polite"></div>
     </form>
-    <div class="actions" id="fallback">
-      <a class="btn" id="contact" href="#" hidden>Get an API key</a>
-      <a class="btn secondary" href="/docs">3-step quickstart</a>
-    </div>
-    <p class="muted" id="no-contact" hidden>To get an API key, contact the person who runs this service.</p>
+    <p class="muted" id="no-contact" hidden>Self-serve sign-up isn't switched on yet.</p>
   </section>
 
   <footer>
-    <a href="/docs">Quickstart</a> · <a href="/trust">Check a bot</a> · <a href="/v1/audit/verify">Public record</a>
+    <a href="/bots">All bots</a><a href="/stats">Numbers</a><a href="/docs">Docs</a><a href="/llms.txt">For AI agents</a><a href="/openapi.json">OpenAPI</a><a href="/v1/audit/verify">Public record</a>
   </footer>
-</main>
+</div>
 <script>
 (function () {
   var $ = function (id) { return document.getElementById(id); };
-  $("check").addEventListener("submit", function (e) {
+  // One box for everything: a wallet, a bot number, or words to search.
+  $("search").addEventListener("submit", function (e) {
     e.preventDefault();
-    var id = $("bot").value.trim();
-    if (id) location.href = "/trust/" + encodeURIComponent(id);
+    var q = $("q").value.trim();
+    if (!q) return;
+    if (/^0x[0-9a-fA-F]{40}$/.test(q)) { location.href = "/wallets/" + q.toLowerCase(); return; }
+    var num = q.replace(/^#/, "").replace(/^erc8004:8453:/i, "");
+    if (/^\d+$/.test(num)) { location.href = "/bots/base/" + num; return; }
+    location.href = "/bots?q=" + encodeURIComponent(q);
+  });
+  var tabs = document.querySelectorAll(".tabs button");
+  tabs.forEach(function (t) {
+    t.addEventListener("click", function () {
+      tabs.forEach(function (o) { o.setAttribute("aria-selected", o === t ? "true" : "false"); });
+      document.querySelectorAll("pre[data-panel]").forEach(function (p) { p.hidden = p.getAttribute("data-panel") !== t.getAttribute("data-tab"); });
+    });
+  });
+  $("copy").addEventListener("click", function () {
+    var shown = document.querySelector("pre[data-panel]:not([hidden])");
+    if (shown && navigator.clipboard) navigator.clipboard.writeText(shown.textContent).then(function () { $("copy").textContent = "Copied"; setTimeout(function () { $("copy").textContent = "Copy"; }, 1500); });
   });
   fetch("/v1/pricing").then(function (r) { return r.json(); }).then(function (p) {
     (p.plans || []).forEach(function (plan) {
@@ -195,13 +249,6 @@
         sel.appendChild(o);
       });
       $("signup").hidden = false;
-      $("fallback").hidden = true;
-      return;
-    }
-    if (p.contact) {
-      var a = $("contact");
-      a.href = p.contact.indexOf("https://") === 0 ? p.contact : "mailto:" + p.contact;
-      a.hidden = false;
     } else {
       $("no-contact").hidden = false;
     }

@@ -348,6 +348,7 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
             | ("GET", ["openapi.json"])
             | ("GET", [".well-known", ..])
             | ("GET", ["stats"])
+            | ("GET", ["go"])
             | ("GET", ["v1", "pricing"])
             | ("GET", ["billing", "done"])
             | ("POST", ["mcp"])
@@ -821,6 +822,110 @@ fn health_checks(now: i64) -> (Json, Vec<String>) {
     (checks, problems)
 }
 
+/// A wallet as `/v1/wallets/{0x…}` and its page show it: the payment check plus the paid
+/// services listed at that wallet, with what Keptvow saw when it last called each one.
+fn wallet_json(engine: &Engine, wallet: &str, now: i64) -> Result<Json, String> {
+    let mut j = check_payment(engine, wallet, None, now)?;
+    let services: Vec<Json> = payments::lock()
+        .services_of(&wallet.to_ascii_lowercase())
+        .into_iter()
+        .map(|s| {
+            Json::obj(vec![
+                ("url", Json::str(s.url.clone())),
+                ("price_usd", Json::num(s.price_usd)),
+                ("description", Json::str(s.description.clone())),
+                ("provider", Json::str(s.provider.clone())),
+                ("last_check", Json::str(if s.probe.result.is_empty() { "not checked yet".to_string() } else { s.probe.result.clone() })),
+                ("latency_ms", Json::num(s.probe.latency_ms as f64)),
+            ])
+        })
+        .collect();
+    if let Json::Object(m) = &mut j {
+        m.insert("services".into(), Json::Array(services));
+    }
+    Ok(j)
+}
+
+/// Where the search box sends what was typed: a wallet to its page, a bot number (or
+/// `erc8004:8453:N`) to that bot, anything else to the directory search. A plain page that
+/// moves on by itself, so it works without any script.
+fn go_to(q: &str) -> Response {
+    let q = q.trim();
+    let bot_number = q
+        .strip_prefix(&format!("erc8004:{}:", chain::CHAIN_ID))
+        .or_else(|| q.strip_prefix('#'))
+        .unwrap_or(q)
+        .parse::<u64>()
+        .ok();
+    let target = if let Ok(w) = verify::normalize("eth", q) {
+        format!("/wallets/{w}")
+    } else if let Some(n) = bot_number {
+        format!("/bots/{}/{n}", chain::CHAIN_NAME)
+    } else if q.is_empty() {
+        "/bots".to_string()
+    } else {
+        let enc: String = q
+            .bytes()
+            .map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+            .collect();
+        format!("/bots?q={enc}")
+    };
+    let t = botpages::esc(&target);
+    Response::html(format!(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><meta http-equiv=\"refresh\" content=\"0;url={t}\">\
+         <title>Keptvow</title><p style=\"font:16px sans-serif;max-width:600px;margin:40px auto;padding:0 16px\"><a href=\"{t}\">Continue</a></p>"
+    ))
+}
+
+/// The home page's "most trusted sellers" board: wallets with a strong payment record, most
+/// established buyers first. Rebuilt at most every ten minutes — it walks every watched wallet.
+fn leaders_html(now: i64) -> String {
+    static CACHE: Mutex<(i64, String)> = Mutex::new((0, String::new()));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.0 != 0 && now - cache.0 < 10 * 60_000 {
+        return cache.1.clone();
+    }
+    let mut rows: Vec<(String, String, usize, usize)> = {
+        let l = payments::lock();
+        l.sellers
+            .keys()
+            .filter_map(|w| {
+                let e = l.evidence(w);
+                if !e.strong() {
+                    return None;
+                }
+                let name = l
+                    .services_of(w)
+                    .first()
+                    .map(|s| if s.provider.is_empty() { host_of(&s.url) } else { s.provider.clone() })
+                    .unwrap_or_default();
+                Some((w.clone(), name, e.established_buyers, e.repeat_buyers))
+            })
+            .collect()
+    };
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then(b.3.cmp(&a.3)).then(a.0.cmp(&b.0)));
+    rows.truncate(10);
+    {
+        let mut idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+        for row in rows.iter_mut().filter(|r| r.1.is_empty()) {
+            if let Some(n) = idx.by_address(&row.0).first().copied() {
+                if let Some(a) = idx.agents.get(&n) {
+                    row.1 = chain::Index::display_name(n, a);
+                }
+            }
+        }
+    }
+    for row in rows.iter_mut().filter(|r| r.1.is_empty()) {
+        row.1 = format!("{}…{}", &row.0[..6], &row.0[row.0.len() - 4..]);
+    }
+    *cache = (now, botpages::leaders_section(&rows));
+    cache.1.clone()
+}
+
+fn host_of(url: &str) -> String {
+    url.split("://").nth(1).unwrap_or(url).split(['/', '?', '#']).next().unwrap_or("").to_string()
+}
+
 /// The traction numbers anyone may see.
 fn public_stats(engine: &Engine, now: i64) -> Json {
     let (keptvow_bots, settled, _) = engine.stats();
@@ -840,15 +945,16 @@ fn public_stats(engine: &Engine, now: i64) -> Json {
 /// Counts what each request was, for the traction numbers at /v1/stats.
 fn count_traffic(req: &Request, segments: &[&str], now: i64) {
     let event = match (req.method.as_str(), segments) {
-        ("GET", ["v1", "trust", _]) | ("GET", ["v1", "trust", "lookup"]) => Some("trust_checks"),
+        ("GET", ["v1", "trust", _]) => Some("trust_checks"),
         ("GET", ["v1", "check"]) => Some("payment_checks"),
         ("GET", ["bots", _, _]) => Some("bot_pages"),
         ("GET", ["bots"]) => Some("directory_views"),
+        ("GET", ["wallets", _]) => Some("wallet_pages"),
         ("POST", ["mcp"]) => Some("mcp_calls"),
         ("GET", ["guard.js"]) => Some("guard_downloads"),
         _ => None,
     };
-    let api = matches!(segments.first(), Some(&"v1") | Some(&"mcp") | Some(&"bots") | Some(&"guard.js"));
+    let api = matches!(segments.first(), Some(&"v1") | Some(&"mcp") | Some(&"bots") | Some(&"wallets") | Some(&"guard.js"));
     if event.is_none() && !api {
         return;
     }
@@ -1104,6 +1210,13 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
             return Response { status: 200, content_type: "application/xml; charset=utf-8", body: botpages::sitemap_index(&idx, &base_url(&req)) };
         }
+        ("GET", ["sitemaps", "wallets.xml"]) => {
+            let mut wallets: Vec<String> = payments::lock().services.values().map(|s| s.pay_to.clone()).collect();
+            wallets.sort();
+            wallets.dedup();
+            return Response { status: 200, content_type: "application/xml; charset=utf-8", body: botpages::sitemap_wallets(&wallets, &base_url(&req)) };
+        }
+        ("GET", ["go"]) => return go_to(req.q("q").unwrap_or("")),
         ("GET", ["sitemaps", file]) => {
             let Some(n) = file.strip_suffix(".xml").and_then(|n| n.parse::<usize>().ok()) else { return err(404, "no such sitemap") };
             let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
@@ -1147,13 +1260,24 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         ("GET", ["docs"]) => Response::html(DOCS_PAGE.to_string()),
         // A browser gets the home page; a bot or script asking for JSON gets the status below.
         ("GET", []) if req.header("accept").map(|a| a.contains("text/html")).unwrap_or(false) => {
-            let (agents, settled, platforms) = engine.stats();
+            let (agents, _, _) = engine.stats();
             let registry_bots = chain::index().lock().unwrap_or_else(|e| e.into_inner()).agents.len();
+            let (wallets, services) = {
+                let l = payments::lock();
+                (l.sellers.len(), l.services.len())
+            };
+            let checks = {
+                let week = metrics::lock().window(now, 7);
+                week.counts.get("trust_checks").copied().unwrap_or(0) + week.counts.get("payment_checks").copied().unwrap_or(0)
+            };
+            let n = |x: usize| botpages::fmt_count(x);
             Response::html(
                 HOME_PAGE
-                    .replace("{{agents}}", &(agents + registry_bots).to_string())
-                    .replace("{{settled}}", &settled.to_string())
-                    .replace("{{platforms}}", &platforms.to_string())
+                    .replace("{{bots}}", &n(agents + registry_bots))
+                    .replace("{{wallets}}", &n(wallets))
+                    .replace("{{services}}", &n(services))
+                    .replace("{{checks}}", &n(checks as usize))
+                    .replace("{{leaders}}", &leaders_html(now))
                     .replace("{{base}}", &base_url(&req)),
             )
         }
@@ -1499,30 +1623,30 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 .to_string(),
             )
         }
-        ("GET", ["v1", "wallets", wallet]) => match check_payment(&engine, wallet, None, now) {
-            Ok(mut j) => {
-                let services: Vec<Json> = payments::lock()
-                    .services_of(&wallet.to_ascii_lowercase())
-                    .into_iter()
-                    .map(|s| {
-                        Json::obj(vec![
-                            ("url", Json::str(s.url.clone())),
-                            ("price_usd", Json::num(s.price_usd)),
-                            ("description", Json::str(s.description.clone())),
-                            ("provider", Json::str(s.provider.clone())),
-                            ("last_check", Json::str(if s.probe.result.is_empty() { "not checked yet".to_string() } else { s.probe.result.clone() })),
-                            ("latency_ms", Json::num(s.probe.latency_ms as f64)),
-                        ])
-                    })
-                    .collect();
-                if let Json::Object(m) = &mut j {
-                    m.insert("services".into(), Json::Array(services));
-                }
+        ("GET", ["v1", "wallets", wallet]) => match wallet_json(&engine, wallet, now) {
+            Ok(j) => {
                 let base = base_url(&req);
                 shaped(&req, j, |j| formats::check_markdown(j, &base), formats::check_text)
             }
             Err(e) => err(400, &e),
         },
+        // The same wallet as a page for people; agents asking for data at the address get data.
+        ("GET", ["wallets", wallet]) => {
+            let base = base_url(&req);
+            match wallet_json(&engine, wallet, now) {
+                Ok(j) if formats::wanted(&req) == formats::Format::Html => Response::html(botpages::wallet_page(&j, &base)),
+                Ok(j) => shaped(&req, j, |j| formats::check_markdown(j, &base), formats::check_text),
+                Err(_) if formats::wanted(&req) == formats::Format::Html => Response {
+                    status: 404,
+                    content_type: "text/html; charset=utf-8",
+                    body: "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>Not a wallet</title>\
+                           <p style=\"font:16px sans-serif;max-width:600px;margin:40px auto;padding:0 16px\">That isn't a wallet address — \
+                           they look like 0x followed by 40 letters and digits. <a href=\"/\">Try again</a></p>"
+                        .to_string(),
+                },
+                Err(e) => err(400, &e),
+            }
+        }
         // ---- what agents look for to find out how to use a service ------------------------
         ("GET", ["openapi.json"]) => ok(formats::openapi(&base_url(&req))),
         ("GET", [".well-known", "agent.json"]) | ("GET", [".well-known", "agent-card.json"]) => ok(formats::agent_card(&base_url(&req))),
@@ -3080,6 +3204,44 @@ mod tests {
         assert_eq!(route(&e, req("POST", "/v1/outcomes", &[], &tx), PROD).status, 202);
         let w = body_json(&route(&e, req("GET", &format!("/v1/wallets/{honest}"), &[], ""), PROD));
         assert!(w.get("evidence").is_some() && matches!(w.get("services"), Some(Json::Array(_))));
+    }
+
+    #[test]
+    fn people_get_pages_and_bots_get_data_at_the_same_addresses() {
+        let e = engine();
+        let html = [("Accept", "text/html")];
+        // The home page has every number filled in.
+        let home = route(&e, req("GET", "/", &html, ""), PROD);
+        assert!(home.body.contains("Know who to trust") && !home.body.contains("{{"), "a placeholder was left unfilled");
+        // A wallet page leads with the verdict, and links its data for bots.
+        let seller = payments::tests::addr(0x5e11e2);
+        {
+            let mut l = payments::lock();
+            payments::tests::strong_seller(&mut l, &seller, payments::STRONG_BUYERS as u64);
+        }
+        let page = route(&e, req("GET", &format!("/wallets/{seller}"), &html, ""), PROD);
+        assert!(page.content_type.starts_with("text/html"));
+        assert!(page.body.contains(r#"class="verdict ok""#) && page.body.contains(&format!("/v1/wallets/{seller}")), "{}", page.body);
+        let data = body_json(&route(&e, req("GET", &format!("/wallets/{seller}"), &[("Accept", "application/json")], ""), PROD));
+        assert_eq!(data.get("verdict").and_then(|v| v.as_str()), Some("ok"));
+        let mut md = req("GET", &format!("/wallets/{seller}"), &html, "");
+        md.query.insert("format".into(), "md".into());
+        assert!(route(&e, md, PROD).body.contains("**Verdict: OK**"));
+        assert_eq!(route(&e, req("GET", "/wallets/not-a-wallet", &html, ""), PROD).status, 404);
+        // One search box: wallets, bot numbers and words each go to the right place.
+        let go = |q: &str| {
+            let mut r = req("GET", "/go", &[], "");
+            r.query.insert("q".into(), q.into());
+            route(&e, r, PROD).body
+        };
+        assert!(go(&seller.to_uppercase().replace("0X", "0x")).contains(&format!("/wallets/{seller}")));
+        assert!(go("erc8004:8453:42").contains("/bots/base/42") && go("#7").contains("/bots/base/7"));
+        assert!(go("weather <bots>").contains("/bots?q=weather%20%3Cbots%3E"));
+        assert!(route(&e, req("GET", "/sitemap.xml", &[], ""), PROD).body.contains("/sitemaps/wallets.xml"));
+        // The leaders board names sellers safely and stays hidden when empty.
+        assert_eq!(botpages::leaders_section(&[]), "");
+        let board = botpages::leaders_section(&[(seller.clone(), "<b>Evil</b>".into(), 40, 12)]);
+        assert!(board.contains("&lt;b&gt;Evil") && board.contains(&format!("/wallets/{seller}")));
     }
 
     #[test]

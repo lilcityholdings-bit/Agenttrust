@@ -20,7 +20,7 @@ GET {URL}/v1/check?pay_to=0xSELLER_WALLET&amount_usd=2.5
 
 Several sellers at once: `POST {URL}/v1/check {"pay_to":["0x…","0x…"]}` (up to 25). One line instead of JSON: add `&format=text`.
 
-The evidence is real: USDC payments the wallet received on Base (different buyers, buyers who came back), reports from buyers who paid it, and checks that its listed services answer. A full wallet profile: `GET {URL}/v1/wallets/0xWALLET`.
+The evidence is real: USDC payments the wallet received on Base (different buyers, buyers who came back), reports from buyers who paid it, and checks that its listed services answer. A full wallet profile: `GET {URL}/v1/wallets/0xWALLET`. Every page a person sees answers bots too: `{URL}/wallets/0xWALLET` and `{URL}/bots/base/N` return JSON, Markdown (`?format=md`) or one line (`?format=text`) when you ask for it.
 
 **After you pay, report what happened** (it makes the verdicts better for everyone):
 
