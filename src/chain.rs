@@ -55,7 +55,7 @@ pub struct Agent {
     pub description: String,
     pub services: Vec<(String, String)>,
     pub x402: bool,
-    /// 0 = registration file not read yet, 1 = read, 2 = unreadable.
+    /// 0 = registration file not read yet, 1 = read, 2 = unreadable, 3 = being read now.
     pub meta: u8,
     pub tries: u8,
     /// reviewer wallet -> feedback index -> (rating 0-100 if it is a rating, revoked).
@@ -407,20 +407,26 @@ impl Index {
         (total, hits.into_iter().skip(offset).take(limit).map(|(id, a, _)| (id, a)).collect())
     }
 
-    /// Bots whose registration file still needs reading.
-    fn needs_meta(&self, n: usize) -> Vec<(u64, String)> {
-        self.agents
-            .iter()
-            .filter(|(_, a)| a.meta == 0 && !a.uri.is_empty() && a.tries < 3)
-            .take(n)
-            .map(|(id, a)| (*id, a.uri.clone()))
-            .collect()
+    /// Hands out up to `n` bots whose registration file still needs reading, marking them taken
+    /// so several readers never fetch the same one.
+    fn needs_meta(&mut self, n: usize) -> Vec<(u64, String)> {
+        let mut out = Vec::new();
+        for (id, a) in self.agents.iter_mut() {
+            if out.len() >= n {
+                break;
+            }
+            if a.meta == 0 && !a.uri.is_empty() && a.tries < 3 {
+                a.meta = 3;
+                out.push((*id, a.uri.clone()));
+            }
+        }
+        out
     }
 
     fn set_meta(&mut self, id: u64, uri: &str, meta: Result<Meta, String>) {
         let Some(a) = self.agents.get_mut(&id) else { return };
         if a.uri != uri {
-            return; // changed while we were fetching; the new one is queued
+            return; // changed while we were fetching; the new one is queued (meta was reset to 0)
         }
         match meta {
             Ok(m) => {
@@ -432,9 +438,7 @@ impl Index {
             }
             Err(_) => {
                 a.tries += 1;
-                if a.tries >= 3 {
-                    a.meta = 2;
-                }
+                a.meta = if a.tries >= 3 { 2 } else { 0 };
             }
         }
         self.dirty = true;
@@ -508,7 +512,8 @@ impl Index {
                     name: s(aj, "name"),
                     description: s(aj, "description"),
                     x402: matches!(aj.get("x402"), Some(Json::Bool(true))),
-                    meta: n(aj, "meta") as u8,
+                    // A read cut short by a restart is simply read again.
+                    meta: match n(aj, "meta") as u8 { 3 => 0, m => m },
                     tries: n(aj, "tries") as u8,
                     ..Agent::default()
                 };
@@ -710,7 +715,10 @@ pub fn start(dir: PathBuf, rpc_url: String) {
     }
     let logs_url = rpc_url.clone();
     std::thread::spawn(move || read_logs(logs_url, path));
-    std::thread::spawn(read_registration_files);
+    // Most of the wait is on other people's servers, so several readers share the queue.
+    for _ in 0..4 {
+        std::thread::spawn(read_registration_files);
+    }
 }
 
 fn read_logs(url: String, path: PathBuf) {
@@ -798,7 +806,7 @@ fn read_logs(url: String, path: PathBuf) {
 
 fn read_registration_files() {
     loop {
-        let batch = lock().needs_meta(25);
+        let batch = lock().needs_meta(10);
         if batch.is_empty() {
             std::thread::sleep(Duration::from_secs(30));
             continue;
@@ -891,6 +899,9 @@ pub(crate) mod tests {
         assert_eq!(a.uri, "https://example.com/agent.json");
         assert_eq!(a.block, 1_000);
         assert_eq!(idx.needs_meta(10), vec![(42, "https://example.com/agent.json".to_string())]);
+        assert!(idx.needs_meta(10).is_empty(), "a bot being read is not handed out twice");
+        idx.set_meta(42, "https://example.com/agent.json", Err("timeout".into()));
+        assert_eq!(idx.needs_meta(10).len(), 1, "a failed read is retried");
 
         idx.apply(&feedback(42, &client(1), 1, 90, 0, "starred"));
         idx.apply(&feedback(42, &client(2), 1, 9977, 2, "uptime"));
