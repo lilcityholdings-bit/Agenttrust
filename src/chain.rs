@@ -679,6 +679,15 @@ fn save(path: &PathBuf) {
             return;
         }
         idx.dirty = false;
+        let named = idx.agents.values().filter(|a| a.meta == 1).count();
+        let reviewed = idx.agents.values().filter(|a| !a.reviews.is_empty()).count();
+        println!(
+            "keptvow: bot registry: {} bots ({named} with a registration file read, {reviewed} reviewed), read to block {} of {}{}",
+            idx.agents.len(),
+            idx.cursor,
+            idx.head,
+            if idx.last_error.is_empty() { String::new() } else { format!(" — last error: {}", idx.last_error) }
+        );
         idx.to_json().to_string()
     };
     let tmp = path.with_extension("json.tmp");
@@ -718,6 +727,7 @@ fn read_logs(url: String, path: PathBuf) {
         let head = match rpc(&url, "eth_blockNumber", Json::Array(vec![])) {
             Ok(v) => v.as_str().and_then(hex_u64).unwrap_or(0).saturating_sub(CONFIRMATIONS),
             Err(e) => {
+                eprintln!("keptvow: bot registry: {e}");
                 lock().last_error = e;
                 std::thread::sleep(Duration::from_secs(30));
                 continue;
@@ -760,6 +770,7 @@ fn read_logs(url: String, path: PathBuf) {
                 if span > 50 {
                     span /= 2;
                 } else {
+                    eprintln!("keptvow: bot registry: {e}");
                     lock().last_error = e;
                     std::thread::sleep(Duration::from_secs(30));
                 }
