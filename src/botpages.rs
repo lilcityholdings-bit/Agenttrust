@@ -128,7 +128,7 @@ pub fn directory(idx: &Index, q: &str, newest: bool, page_no: usize, base: &str)
     let mut rows = String::new();
     for (id, a) in &hits {
         let level = level_of(idx, a);
-        let reviewers = Index::reviews(a).reviewers;
+        let reviewers = idx.reviews(a).reviewers;
         rows.push_str(&format!(
             r#"<a class="row" href="/bots/{chain}/{id}"><span class="nm">{name}</span><span class="meta">{reviews}</span><span class="meta age">#{id}</span><span class="pill {level}">{level}</span></a>"#,
             chain = chain::CHAIN_NAME,
@@ -189,7 +189,7 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
     let a = idx.agents.get(&id)?;
     let name = Index::display_name(id, a);
     let (chain_level, chain_reasons) = idx.assess(a);
-    let r = Index::reviews(a);
+    let r = idx.reviews(a);
     let days = idx.age_days(a);
 
     let (level, reasons) = match claimed {
@@ -339,7 +339,7 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
 <div class="stat"><b class="ok">{positive}</b><span>rated it well</span></div>
 <div class="stat"><b class="bad">{negative}</b><span>rated it badly</span></div>
 </div>
-<p class="muted">One vote per reviewing wallet. Anyone can post a review on-chain, so these count for little until the bot settles real deals.</p>
+<p class="muted">One vote per reviewing wallet{mass}. Anyone can post a review on-chain, so these count for little until the bot settles real deals.</p>
 </section>
 <section>
 <h2>About this bot</h2>
@@ -364,6 +364,16 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
         age = if days == 0 { "today".to_string() } else { format!("{} ago", plural(days as usize, "day")) },
         syncing = syncing_note(idx),
         reviewers = r.reviewers,
+        mass = if r.mass > 0 {
+            format!(
+                "; {} that each reviewed {}+ bots {} not counted",
+                plural(r.mass, "wallet"),
+                chain::MASS_REVIEWER_BOTS,
+                if r.mass == 1 { "is" } else { "are" }
+            )
+        } else {
+            String::new()
+        },
         positive = r.positive,
         negative = r.negative,
         owner = opt(&a.owner),

@@ -955,7 +955,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     Json::Array(
                         hits.iter()
                             .map(|(id, a)| {
-                                let r = chain::Index::reviews(a);
+                                let r = idx.reviews(a);
                                 Json::obj(vec![
                                     ("agent_id", Json::str(format!("erc8004:{}:{id}", chain::CHAIN_ID))),
                                     ("name", Json::str(chain::Index::display_name(*id, a))),

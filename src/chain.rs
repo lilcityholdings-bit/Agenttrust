@@ -42,6 +42,9 @@ const MAX_REVIEWERS: usize = 5_000;
 /// Reviewers needed before reviews move a bot off `unknown`.
 const MIN_REVIEWERS: usize = 5;
 const MIN_AGE_DAYS_FOR_FAIR: u64 = 14;
+/// A wallet that has reviewed this many bots is a mass reviewer: its reviews say little about
+/// any one bot, so they are shown but never counted toward a rating.
+pub const MASS_REVIEWER_BOTS: u32 = 50;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Agent {
@@ -68,6 +71,8 @@ pub struct Reviews {
     pub positive: usize,
     pub negative: usize,
     pub total: usize,
+    /// Reviewing wallets left out because they review almost everything.
+    pub mass: usize,
 }
 
 #[derive(Default)]
@@ -78,6 +83,8 @@ pub struct Index {
     pub head: u64,
     pub agents: BTreeMap<u64, Agent>,
     pub last_error: String,
+    /// How many bots each reviewing wallet has reviewed.
+    reach: std::collections::HashMap<String, u32>,
     dirty: bool,
 }
 
@@ -242,8 +249,11 @@ impl Index {
                 };
                 let tag = abi_string(&data, 3).unwrap_or_default();
                 let a = self.agents.entry(id).or_default();
-                if !a.reviews.contains_key(&client) && a.reviews.len() >= MAX_REVIEWERS {
-                    return;
+                if !a.reviews.contains_key(&client) {
+                    if a.reviews.len() >= MAX_REVIEWERS {
+                        return;
+                    }
+                    *self.reach.entry(client.clone()).or_insert(0) += 1;
                 }
                 let r = a.reviews.entry(client).or_default();
                 r.insert(index, (rating(value, decimals.min(255) as u8, &tag), false));
@@ -265,9 +275,13 @@ impl Index {
         self.dirty = true;
     }
 
-    pub fn reviews(a: &Agent) -> Reviews {
+    pub fn reviews(&self, a: &Agent) -> Reviews {
         let mut out = Reviews::default();
-        for per in a.reviews.values() {
+        for (client, per) in &a.reviews {
+            if self.reach.get(client).copied().unwrap_or(0) >= MASS_REVIEWER_BOTS {
+                out.mass += 1;
+                continue;
+            }
             let live: Vec<f32> = per.values().filter(|(_, revoked)| !revoked).filter_map(|(r, _)| *r).collect();
             out.total += per.values().filter(|(_, revoked)| !revoked).count();
             if live.is_empty() {
@@ -290,7 +304,7 @@ impl Index {
 
     /// The trust level public reviews alone can support, and why.
     pub fn assess(&self, a: &Agent) -> (&'static str, Vec<String>) {
-        let r = Index::reviews(a);
+        let r = self.reviews(a);
         let days = self.age_days(a);
         let mut reasons = Vec::new();
         let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
@@ -316,6 +330,12 @@ impl Index {
         if r.reviewers >= MIN_REVIEWERS && r.positive * 10 >= r.reviewers * 8 && days < MIN_AGE_DAYS_FOR_FAIR {
             reasons.push(format!("registered only {} ago", plural(days as usize, "day")));
         }
+        if r.mass > 0 {
+            reasons.push(format!(
+                "{} not counted: they each reviewed {MASS_REVIEWER_BOTS}+ bots",
+                plural(r.mass, "reviewing wallet")
+            ));
+        }
         reasons.push(
             "public reviews cost almost nothing to post, so they count for little — good and excellent take real deals settled through Keptvow"
                 .into(),
@@ -335,7 +355,7 @@ impl Index {
     pub fn profile_json(&self, id: u64) -> Option<Json> {
         let a = self.agents.get(&id)?;
         let (level, reasons) = self.assess(a);
-        let r = Index::reviews(a);
+        let r = self.reviews(a);
         let opt = |s: &str| if s.is_empty() { Json::Null } else { Json::str(s) };
         Some(Json::obj(vec![
             ("agent_id", Json::str(format!("erc8004:{CHAIN_ID}:{id}"))),
@@ -366,6 +386,7 @@ impl Index {
                     ("positive", Json::num(r.positive as f64)),
                     ("negative", Json::num(r.negative as f64)),
                     ("total", Json::num(r.total as f64)),
+                    ("mass_reviewers_not_counted", Json::num(r.mass as f64)),
                 ]),
             ),
             (
@@ -682,6 +703,9 @@ impl Index {
                         let revoked = matches!(p.get(3), Some(Json::Bool(true)));
                         a.reviews.entry(client.to_string()).or_default().insert(i as u64, (r, revoked));
                     }
+                }
+                for client in a.reviews.keys() {
+                    *idx.reach.entry(client.clone()).or_insert(0) += 1;
                 }
                 idx.agents.insert(n(aj, "id"), a);
             }
@@ -1059,7 +1083,7 @@ pub(crate) mod tests {
         idx.apply(&feedback(42, &client(2), 1, 9977, 2, "uptime"));
         idx.apply(&feedback(42, &client(3), 1, 560, 0, "responseTime")); // a measurement, not a rating
         idx.apply(&feedback(42, &client(4), 1, -5, 0, ""));
-        let r = Index::reviews(&idx.agents[&42]);
+        let r = idx.reviews(&idx.agents[&42]);
         assert_eq!((r.reviewers, r.positive, r.negative, r.total), (3, 2, 1, 4));
     }
 
@@ -1077,7 +1101,7 @@ pub(crate) mod tests {
         for i in 2..40 {
             idx.apply(&feedback(7, &client(0), i, 100, 0, "starred"));
         }
-        assert_eq!(Index::reviews(&idx.agents[&7]).reviewers, 4);
+        assert_eq!(idx.reviews(&idx.agents[&7]).reviewers, 4);
         for n in 4..20 {
             idx.apply(&feedback(7, &client(n), 1, 100, 0, "starred"));
         }
@@ -1089,6 +1113,28 @@ pub(crate) mod tests {
             bad.apply(&feedback(8, &client(n), 1, 10, 0, "starred"));
         }
         assert_eq!(bad.assess(&bad.agents[&8]).0, "caution");
+    }
+
+    #[test]
+    fn wallets_that_review_almost_everything_are_not_counted() {
+        let mut idx = Index::starting_at(0);
+        idx.head = 1 + 30 * 86_400 / BLOCK_SECONDS;
+        for id in 0..60u64 {
+            idx.apply(&registered(id, "0x00000000000000000000000000000000000000aa", "", 1));
+        }
+        // Six wallets praise all 60 bots: enough for "fair" if they counted.
+        for c in 0..6u64 {
+            for id in 0..60u64 {
+                idx.apply(&feedback(id, &client(100 + c), 1, 100, 0, "starred"));
+            }
+        }
+        let r = idx.reviews(&idx.agents[&3]);
+        assert_eq!((r.reviewers, r.mass), (0, 6));
+        let (level, reasons) = idx.assess(&idx.agents[&3]);
+        assert_eq!(level, "unknown");
+        assert!(reasons.iter().any(|x| x.contains("not counted")));
+        let back = Index::from_json(&json::parse(&idx.to_json().to_string()).unwrap()).unwrap();
+        assert_eq!(back.reviews(&back.agents[&3]).mass, 6, "who is a mass reviewer survives a restart");
     }
 
     #[test]
