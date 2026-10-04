@@ -18,6 +18,7 @@ mod attest;
 mod autopay;
 mod botpages;
 mod chain;
+mod formats;
 mod billing;
 mod hash;
 mod http;
@@ -344,6 +345,8 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
             | ("GET", ["sitemaps", _])
             | ("GET", ["robots.txt"])
             | ("GET", ["guard.js"])
+            | ("GET", ["openapi.json"])
+            | ("GET", [".well-known", ..])
             | ("GET", ["stats"])
             | ("GET", ["v1", "pricing"])
             | ("GET", ["billing", "done"])
@@ -745,6 +748,16 @@ fn catalog_urls() -> Vec<String> {
     }
 }
 
+/// Answers in the format the caller asked for (see formats.rs): JSON by default, Markdown or
+/// plain text for agents that prefer reading.
+fn shaped(req: &Request, j: Json, md: impl FnOnce(&Json) -> String, text: impl FnOnce(&Json) -> String) -> Response {
+    match formats::wanted(req) {
+        formats::Format::Markdown => Response { status: 200, content_type: "text/markdown; charset=utf-8", body: md(&j) },
+        formats::Format::Text => Response { status: 200, content_type: "text/plain; charset=utf-8", body: text(&j) },
+        _ => ok(j),
+    }
+}
+
 /// Whether each moving part is doing its job, and a plain list of what isn't. `/health/deep`
 /// answers 503 when the list isn't empty, so an uptime monitor can raise the alarm.
 fn health_checks(now: i64) -> (Json, Vec<String>) {
@@ -1062,7 +1075,8 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             let offset = req.q("offset").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
             let limit = req.q("limit").and_then(|p| p.parse::<usize>().ok()).unwrap_or(50).clamp(1, 100);
             let (total, hits) = idx.search(req.q("q").unwrap_or(""), req.q("sort") == Some("new"), offset, limit);
-            return ok(Json::obj(vec![
+            let base = base_url(&req);
+            return shaped(&req, Json::obj(vec![
                 ("total", Json::num(total as f64)),
                 ("offset", Json::num(offset as f64)),
                 (
@@ -1084,7 +1098,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 ),
                 ("registry_read_to_block", Json::num(idx.cursor as f64)),
                 ("registry_head_block", Json::num(idx.head as f64)),
-            ]));
+            ]), |j| formats::bots_markdown(j, &base), |j| formats::bots_markdown(j, &base));
         }
         ("GET", ["sitemap.xml"]) => {
             let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
@@ -1229,6 +1243,14 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         ("GET", ["bots", chain_name, n]) if *chain_name == chain::CHAIN_NAME => {
             let Ok(n) = n.parse::<u64>() else { return err(404, "no such bot") };
             let agent_ref = format!("erc8004:{}:{n}", chain::CHAIN_ID);
+            // Agents asking for data at a page address get the data.
+            if formats::wanted(&req) != formats::Format::Html {
+                let base = base_url(&req);
+                return match registry_profile(&engine, &agent_ref, now) {
+                    Some(p) => shaped(&req, p, |p| formats::profile_markdown(p, &base), formats::profile_text),
+                    None => err(404, "no bot with that number in the registry yet"),
+                };
+            }
             let owner = registry_owner(&engine, &agent_ref).map(|o| o.to_string());
             let owner_profile = owner.as_deref().map(|o| engine.trust_profile_json(o, now));
             let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
@@ -1261,10 +1283,35 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 Some(Ok(a)) if a.is_finite() && a >= 0.0 => Some(a),
                 Some(_) => return err(400, "amount_usd must be a number like 2.5"),
             };
+            let base = base_url(&req);
             match check_payment(&engine, pay_to, amount, now) {
-                Ok(j) => ok(j),
+                Ok(j) => shaped(&req, j, |j| formats::check_markdown(j, &base), formats::check_text),
                 Err(e) => err(400, &e),
             }
+        }
+        // Several wallets in one call — for an agent comparing sellers before choosing one.
+        ("POST", ["v1", "check"]) => {
+            let Some(Json::Array(wallets)) = body.get("pay_to") else {
+                return err(400, "send {\"pay_to\": [\"0x…\", \"0x…\"]} (up to 25), optionally with amount_usd");
+            };
+            if wallets.len() > 25 {
+                return err(400, "at most 25 wallets per call");
+            }
+            let amount = body.get("amount_usd").and_then(|v| v.as_f()).filter(|a| a.is_finite() && *a >= 0.0);
+            let results: Vec<Json> = wallets
+                .iter()
+                .map(|w| match w.as_str().map(|w| check_payment(&engine, w, amount, now)) {
+                    Some(Ok(j)) => j,
+                    Some(Err(e)) => Json::obj(vec![("pay_to", w.clone()), ("error", Json::str(e))]),
+                    None => Json::obj(vec![("pay_to", w.clone()), ("error", Json::str("not a string"))]),
+                })
+                .collect();
+            for _ in 1..results.len() {
+                if let Some(cid) = &customer_id {
+                    engine.meter_lookup(cid, now);
+                }
+            }
+            ok(Json::obj(vec![("results", Json::Array(results))]))
         }
         // ---- prepaid credits: pay per check, no monthly fee ------------------------------
         ("POST", ["v1", "credits"]) => {
@@ -1471,10 +1518,15 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 if let Json::Object(m) = &mut j {
                     m.insert("services".into(), Json::Array(services));
                 }
-                ok(j)
+                let base = base_url(&req);
+                shaped(&req, j, |j| formats::check_markdown(j, &base), formats::check_text)
             }
             Err(e) => err(400, &e),
         },
+        // ---- what agents look for to find out how to use a service ------------------------
+        ("GET", ["openapi.json"]) => ok(formats::openapi(&base_url(&req))),
+        ("GET", [".well-known", "agent.json"]) | ("GET", [".well-known", "agent-card.json"]) => ok(formats::agent_card(&base_url(&req))),
+        ("GET", [".well-known", "mcp.json"]) => ok(formats::mcp_pointer(&base_url(&req))),
         ("GET", ["guard.js"]) => Response {
             status: 200,
             content_type: "text/javascript; charset=utf-8",
@@ -1486,7 +1538,10 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             body: format!("User-agent: *\nAllow: /\nDisallow: /admin\nSitemap: {}/sitemap.xml\n", base_url(&req)),
         },
 
-        ("GET", ["v1", "trust", agent_id]) => ok(any_profile(&engine, agent_id, now)),
+        ("GET", ["v1", "trust", agent_id]) => {
+            let base = base_url(&req);
+            shaped(&req, any_profile(&engine, agent_id, now), |p| formats::profile_markdown(p, &base), formats::profile_text)
+        }
 
         ("GET", ["v1", "trust", agent_id, "badge.svg"]) => {
             let p = any_profile(&engine, agent_id, now);
@@ -2706,10 +2761,10 @@ mod tests {
         let badge = route(&e, req("GET", "/v1/trust/erc8004:8453:900001/badge.svg", &[], ""), PROD);
         assert_eq!(badge.content_type, "image/svg+xml");
 
-        let page = route(&e, req("GET", "/bots/base/900001", &[], ""), PROD);
+        let page = route(&e, req("GET", "/bots/base/900001", &[("Accept", "text/html")], ""), PROD);
         assert_eq!(page.status, 200);
         assert!(page.body.contains("Forecast Bot") && page.body.contains("Claim with my wallet"));
-        assert_eq!(route(&e, req("GET", "/bots/base/999999999", &[], ""), PROD).status, 404);
+        assert_eq!(route(&e, req("GET", "/bots/base/999999999", &[("Accept", "text/html")], ""), PROD).status, 404);
         assert_eq!(route(&e, req("GET", "/bots/base/nope", &[], ""), PROD).status, 404);
         let mut search = req("GET", "/bots", &[], "");
         search.query.insert("q".into(), "forecast".into());
@@ -2731,7 +2786,7 @@ mod tests {
         r.query.insert("q".into(), "x".into());
         assert_eq!(route(&e, r, PROD).status, 429);
         assert_eq!(route(&e, req("GET", "/bots", &searcher, ""), PROD).status, 429, "the directory ranks everything too");
-        assert_eq!(route(&e, req("GET", "/bots/base/900001", &searcher, ""), PROD).status, 200, "single bot pages stay open");
+        assert_eq!(route(&e, req("GET", "/bots/base/900001", &[searcher[0], ("Accept", "text/html")], ""), PROD).status, 200, "single bot pages stay open");
         assert!(route(&e, req("GET", "/robots.txt", &[], ""), PROD).body.contains("Sitemap:"));
 
         // Once an account proves it owns the bot, the bot's profile is that account's record.
@@ -2742,7 +2797,7 @@ mod tests {
         let p = body_json(&route(&e, req("GET", "/v1/trust/erc8004:8453:900001", &[], ""), PROD));
         assert_eq!(p.get("claimed_by").and_then(|v| v.as_str()), Some("forecast-bot"));
         assert!(p.get("onchain").and_then(|o| o.get("registry")).is_some());
-        let page = route(&e, req("GET", "/bots/base/900001", &[], ""), PROD);
+        let page = route(&e, req("GET", "/bots/base/900001", &[("Accept", "text/html")], ""), PROD);
         assert!(page.body.contains("Claimed.") && !page.body.contains("Claim with my wallet"));
         let mut lookup = req("GET", "/v1/trust/lookup", &[], "");
         lookup.query.insert("protocol".into(), "erc8004".into());
@@ -2779,7 +2834,7 @@ mod tests {
             sold_at_block,
         ));
         assert_eq!(claimed(&e), None, "a sold bot isn't the seller's any more");
-        assert!(route(&e, req("GET", "/bots/base/900301", &[], ""), PROD).body.contains("Claim with my wallet"));
+        assert!(route(&e, req("GET", "/bots/base/900301", &[("Accept", "text/html")], ""), PROD).body.contains("Claim with my wallet"));
         // The new owner proves control afterwards and takes the page.
         e.lock().unwrap().record_verified("buyer-bot", "erc8004", &ext, "test", 2, chain::Index::block_ms(sold_at_block) + 1_000).unwrap();
         assert_eq!(claimed(&e).as_deref(), Some("buyer-bot"));
@@ -3025,6 +3080,39 @@ mod tests {
         assert_eq!(route(&e, req("POST", "/v1/outcomes", &[], &tx), PROD).status, 202);
         let w = body_json(&route(&e, req("GET", &format!("/v1/wallets/{honest}"), &[], ""), PROD));
         assert!(w.get("evidence").is_some() && matches!(w.get("services"), Some(Json::Array(_))));
+    }
+
+    #[test]
+    fn every_answer_comes_in_the_format_the_caller_prefers() {
+        let e = engine();
+        let wallet = "0x00000000000000000000000000000000000000c4";
+        let mut text = req("GET", "/v1/check", &[], "");
+        text.query.insert("pay_to".into(), wallet.into());
+        text.query.insert("format".into(), "text".into());
+        let r = route(&e, text, PROD);
+        assert!(r.content_type.starts_with("text/plain") && r.body.starts_with("careful: "), "{}", r.body);
+        let mut md = req("GET", "/v1/check", &[("Accept", "text/markdown")], "");
+        md.query.insert("pay_to".into(), wallet.into());
+        let r = route(&e, md, PROD);
+        assert!(r.content_type.starts_with("text/markdown") && r.body.contains("**Verdict: CAREFUL**"), "{}", r.body);
+        // A page address asked for data returns data.
+        {
+            chain::index().lock().unwrap().apply(&chain::tests::registered(900_401, "0x00000000000000000000000000000000000000aa", "", 10));
+        }
+        let r = route(&e, req("GET", "/bots/base/900401", &[("Accept", "application/json")], ""), PROD);
+        assert_eq!(body_json(&r).get("agent_id").and_then(|v| v.as_str()), Some("erc8004:8453:900401"));
+        let r = route(&e, req("GET", "/bots/base/900401", &[("Accept", "text/html")], ""), PROD);
+        assert!(r.content_type.starts_with("text/html"));
+        // Batch, discovery documents.
+        let batch = body_json(&route(&e, req("POST", "/v1/check", &[], &format!(r#"{{"pay_to":["{wallet}","nope"]}}"#)), PROD));
+        let Some(Json::Array(results)) = batch.get("results") else { panic!() };
+        assert_eq!(results.len(), 2);
+        assert!(results[1].get("error").is_some());
+        let api = body_json(&route(&e, req("GET", "/openapi.json", &[], ""), PROD));
+        assert!(api.get("paths").and_then(|p| p.get("/v1/check")).is_some());
+        let card = body_json(&route(&e, req("GET", "/.well-known/agent.json", &[], ""), PROD));
+        assert!(matches!(card.get("skills"), Some(Json::Array(s)) if s.len() >= 4));
+        assert!(route(&e, req("GET", "/.well-known/mcp.json", &[], ""), PROD).body.contains("/mcp"));
     }
 
     fn new_key(e: &Mutex<Engine>) -> String {

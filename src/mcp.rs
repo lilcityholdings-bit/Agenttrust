@@ -76,6 +76,34 @@ fn tools() -> Json {
             true,
         ),
         tool(
+            "wallet_history",
+            "A seller wallet's record: payments it received on Base (buyers, returning buyers), delivery reports from buyers, and the paid services listed at it.",
+            vec![("wallet", prop("string", "The 0x wallet address."))],
+            &["wallet"],
+            true,
+        ),
+        tool(
+            "search_bots",
+            "Search every rated AI bot by name, registry number or 0x wallet. Returns names, trust levels and profile links.",
+            vec![
+                ("query", prop("string", "Name fragment, bot number, or 0x address.")),
+                ("newest_first", prop("boolean", "Sort by newest instead of most reviewed.")),
+            ],
+            &[],
+            true,
+        ),
+        tool(
+            "report_delivery",
+            "After paying a seller (x402 or any USDC payment on Base): say whether the result arrived. Quote the payment transaction; it is checked on-chain, so only real buyers count.",
+            vec![
+                ("tx", prop("string", "The payment's transaction hash (0x…).")),
+                ("delivered", prop("boolean", "true if you got what you paid for.")),
+                ("pay_to", prop("string", "Optional: the wallet you paid.")),
+            ],
+            &["tx", "delivered"],
+            false,
+        ),
+        tool(
             "open_deal",
             "Open a deal between your bot and another. The other bot must accept (or report) within 6 hours or it cancels with no penalty.",
             vec![
@@ -181,6 +209,24 @@ fn call_tool(engine: &Mutex<Engine>, outer: &Request, cfg: Config, name: &str, a
             }
             ("GET", "/v1/check".into(), Json::Null)
         }
+        "wallet_history" => {
+            let w = s("wallet").ok_or("wallet is required")?;
+            if !(w.len() == 42 && w.starts_with("0x") && w[2..].chars().all(|c| c.is_ascii_hexdigit())) {
+                return Err("wallet must be a 0x address".into());
+            }
+            ("GET", format!("/v1/wallets/{w}"), Json::Null)
+        }
+        "search_bots" => {
+            if let Some(q) = s("query") {
+                query.insert("q".to_string(), q);
+            }
+            if matches!(args.get("newest_first"), Some(Json::Bool(true))) {
+                query.insert("sort".to_string(), "new".to_string());
+            }
+            query.insert("limit".to_string(), "20".to_string());
+            ("GET", "/v1/bots".into(), Json::Null)
+        }
+        "report_delivery" => ("POST", "/v1/outcomes".into(), pick(args, &["tx", "delivered", "pay_to"])),
         "open_deal" => {
             let (me, partner) = (id_arg("agent_id")?, id_arg("partner")?);
             let mut b = pick(args, &["secret", "outcomes", "stake", "domain"]);
