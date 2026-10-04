@@ -203,7 +203,7 @@ pub fn decode_bytes(s: &str) -> Option<Vec<u8>> {
     base64_decode(s)
 }
 
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = 0u32;
     let mut bits = 0;
@@ -234,7 +234,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn keccak(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn keccak(bytes: &[u8]) -> [u8; 32] {
     Keccak256::digest(bytes).into()
 }
 
@@ -494,7 +494,7 @@ fn is_public_ip(ip: IpAddr) -> bool {
 
 /// Only lets the Web Bot Auth fetch connect to public addresses, so a bot can't aim this server
 /// at its own private network by registering a domain that resolves to 10.x or 127.0.0.1.
-struct PublicOnly;
+pub(crate) struct PublicOnly;
 
 impl ureq::Resolver for PublicOnly {
     fn resolve(&self, netloc: &str) -> std::io::Result<Vec<SocketAddr>> {

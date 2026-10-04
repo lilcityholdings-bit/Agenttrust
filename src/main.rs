@@ -16,6 +16,8 @@
 
 mod attest;
 mod autopay;
+mod botpages;
+mod chain;
 mod billing;
 mod hash;
 mod http;
@@ -256,6 +258,9 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
             | ("GET", ["health"])
             | ("GET", ["admin"])
             | ("GET", ["trust", ..])
+            | ("GET", ["bots", ..])
+            | ("GET", ["sitemap.xml"])
+            | ("GET", ["robots.txt"])
             | ("GET", ["v1", "pricing"])
             | ("GET", ["billing", "done"])
             | ("POST", ["mcp"])
@@ -264,7 +269,7 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
 
 /// Reads metered to a platform's bill when it calls with its key.
 fn is_lookup(method: &str, segments: &[&str]) -> bool {
-    matches!((method, segments), ("GET", ["v1", "trust", ..]) | ("GET", ["v1", "agents", _]))
+    matches!((method, segments), ("GET", ["v1", "trust", ..]) | ("GET", ["v1", "agents", _]) | ("GET", ["v1", "bots", ..]))
 }
 
 /// Endpoints that act for a platform, so they need its key.
@@ -435,6 +440,78 @@ fn verify_registration(engine: &Mutex<Engine>, agent_id: &str, body: &Json, now:
     }
 }
 
+/// `erc8004:8453:<n>` → the registry number, for the chain Keptvow reads.
+fn registry_ref_number(agent_ref: &str) -> Option<u64> {
+    let rest = agent_ref.strip_prefix("erc8004:")?;
+    let (chain_id, n) = rest.split_once(':')?;
+    if chain_id != chain::CHAIN_ID.to_string() {
+        return None;
+    }
+    n.parse().ok()
+}
+
+/// `eip155:8453:<registry>:<n>` (a normalized ERC-8004 id) → `erc8004:8453:<n>`.
+fn registry_ref(external_id: &str) -> Option<String> {
+    let parts: Vec<&str> = external_id.split(':').collect();
+    match parts.as_slice() {
+        ["eip155", c, reg, n] if *c == chain::CHAIN_ID.to_string() && reg.eq_ignore_ascii_case(chain::IDENTITY) => {
+            Some(format!("erc8004:{c}:{n}"))
+        }
+        _ => None,
+    }
+}
+
+/// The Keptvow account that proved it owns this registry bot, if any.
+fn registry_owner<'a>(engine: &'a Engine, agent_ref: &str) -> Option<&'a str> {
+    let n = registry_ref_number(agent_ref)?;
+    let ext = verify::normalize("erc8004", &format!("{}:{n}", chain::CHAIN_ID)).ok()?;
+    engine.verified_owner_of("erc8004", &ext)
+}
+
+/// The profile for a bot in the on-chain registry: once claimed, the Keptvow record of the
+/// account that proved it owns the bot, with the registry data alongside; unclaimed, what the
+/// registry alone supports. `None` when the registry has no such bot.
+fn registry_profile(engine: &Engine, agent_ref: &str, now: i64) -> Option<Json> {
+    let n = registry_ref_number(agent_ref)?;
+    let onchain = chain::index().lock().unwrap_or_else(|e| e.into_inner()).profile_json(n);
+    let mut p = match registry_owner(engine, agent_ref) {
+        Some(owner) => {
+            let mut p = engine.trust_profile_json(owner, now);
+            if let Json::Object(m) = &mut p {
+                m.insert("onchain".into(), onchain.unwrap_or(Json::Null));
+                m.insert("claimed_by".into(), Json::str(owner));
+            }
+            p
+        }
+        None => onchain?,
+    };
+    if let Json::Object(m) = &mut p {
+        m.entry("claimed_by".into()).or_insert(Json::Null);
+        m.insert("profile_page".into(), Json::str(format!("/bots/{}/{n}", chain::CHAIN_NAME)));
+    }
+    Some(p)
+}
+
+/// Any bot's profile: a Keptvow id, or `erc8004:8453:<n>` for a bot in the on-chain registry.
+fn any_profile(engine: &Engine, agent_id: &str, now: i64) -> Json {
+    if agent_id.get(..8).map_or(false, |p| p.eq_ignore_ascii_case("erc8004:")) {
+        return registry_profile(engine, agent_id, now).unwrap_or_else(|| {
+            Json::obj(vec![
+                ("agent_id", Json::str(agent_id)),
+                ("trust_level", Json::str("unknown")),
+                ("score", Json::num(trust::STARTING_SCORE as f64)),
+                (
+                    "reasons",
+                    Json::Array(vec![Json::str(
+                        "no such bot in the registry Keptvow reads (ERC-8004 on Base, chain 8453) — or it registered in the last few minutes",
+                    )]),
+                ),
+            ])
+        });
+    }
+    engine.trust_profile_json(agent_id, now)
+}
+
 /// A shields-style SVG badge. Only numbers and fixed words go into it — never the agent id — so
 /// nothing a caller controls ends up inside markup.
 fn badge_svg(score: i64, level: &str, verified: bool) -> String {
@@ -575,9 +652,10 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         // A browser gets the home page; a bot or script asking for JSON gets the status below.
         ("GET", []) if req.header("accept").map(|a| a.contains("text/html")).unwrap_or(false) => {
             let (agents, settled, platforms) = engine.stats();
+            let registry_bots = chain::index().lock().unwrap_or_else(|e| e.into_inner()).agents.len();
             Response::html(
                 HOME_PAGE
-                    .replace("{{agents}}", &agents.to_string())
+                    .replace("{{agents}}", &(agents + registry_bots).to_string())
                     .replace("{{settled}}", &settled.to_string())
                     .replace("{{platforms}}", &platforms.to_string())
                     .replace("{{base}}", &base_url(&req)),
@@ -648,14 +726,96 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     "claimed_by",
                     Json::Array(engine.claimants_of(protocol, &external_id).into_iter().map(Json::str).collect()),
                 ),
-                ("profile", owner.map(|a| engine.trust_profile_json(&a, now)).unwrap_or(Json::Null)),
+                (
+                    "profile",
+                    match owner {
+                        Some(a) => engine.trust_profile_json(&a, now),
+                        // Unclaimed, a bot in the on-chain registry still has a profile.
+                        None if protocol == "erc8004" => registry_ref(&external_id)
+                            .and_then(|r| registry_profile(&engine, &r, now))
+                            .unwrap_or(Json::Null),
+                        None => Json::Null,
+                    },
+                ),
             ]))
         }
 
-        ("GET", ["v1", "trust", agent_id]) => ok(engine.trust_profile_json(agent_id, now)),
+        // ---- every bot in the public on-chain registry ----------------------------------
+        ("GET", ["bots"]) => {
+            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            let page = req.q("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0).min(10_000);
+            Response::html(botpages::directory(&idx, req.q("q").unwrap_or("").trim(), req.q("sort") == Some("new"), page, &base_url(&req)))
+        }
+        ("GET", ["bots", chain_name, n]) if *chain_name == chain::CHAIN_NAME => {
+            let Ok(n) = n.parse::<u64>() else { return err(404, "no such bot") };
+            let agent_ref = format!("erc8004:{}:{n}", chain::CHAIN_ID);
+            let owner = registry_owner(&engine, &agent_ref).map(|o| o.to_string());
+            let owner_profile = owner.as_deref().map(|o| engine.trust_profile_json(o, now));
+            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            let claimed = owner.as_deref().zip(owner_profile.as_ref());
+            match botpages::bot_page(&idx, n, claimed, &base_url(&req)) {
+                Some(html) => Response::html(html),
+                None => Response {
+                    status: 404,
+                    content_type: "text/html; charset=utf-8",
+                    body: format!(
+                        "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>Bot not found</title>\
+                         <p style=\"font:16px sans-serif;max-width:600px;margin:40px auto;padding:0 16px\">No bot #{n} in the registry yet. \
+                         New bots appear a few minutes after they register. <a href=\"/bots\">See all bots</a></p>"
+                    ),
+                },
+            }
+        }
+        ("GET", ["v1", "bots"]) => {
+            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            let offset = req.q("offset").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
+            let limit = req.q("limit").and_then(|p| p.parse::<usize>().ok()).unwrap_or(50).clamp(1, 100);
+            let (total, hits) = idx.search(req.q("q").unwrap_or(""), req.q("sort") == Some("new"), offset, limit);
+            ok(Json::obj(vec![
+                ("total", Json::num(total as f64)),
+                ("offset", Json::num(offset as f64)),
+                (
+                    "bots",
+                    Json::Array(
+                        hits.iter()
+                            .map(|(id, a)| {
+                                let r = chain::Index::reviews(a);
+                                Json::obj(vec![
+                                    ("agent_id", Json::str(format!("erc8004:{}:{id}", chain::CHAIN_ID))),
+                                    ("name", Json::str(chain::Index::display_name(*id, a))),
+                                    ("trust_level", Json::str(idx.assess(a).0)),
+                                    ("reviewers", Json::num(r.reviewers as f64)),
+                                    ("profile_page", Json::str(format!("/bots/{}/{id}", chain::CHAIN_NAME))),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                ("registry_read_to_block", Json::num(idx.cursor as f64)),
+                ("registry_head_block", Json::num(idx.head as f64)),
+            ]))
+        }
+        ("GET", ["v1", "bots", chain_name, n]) if *chain_name == chain::CHAIN_NAME => {
+            match n.parse::<u64>().ok().and_then(|n| registry_profile(&engine, &format!("erc8004:{}:{n}", chain::CHAIN_ID), now)) {
+                Some(p) => ok(p),
+                None => err(404, "no bot with that number in the registry (new bots appear a few minutes after they register)"),
+            }
+        }
+        ("GET", ["sitemap.xml"]) => Response {
+            status: 200,
+            content_type: "application/xml; charset=utf-8",
+            body: botpages::sitemap(&chain::index().lock().unwrap_or_else(|e| e.into_inner()), &base_url(&req)),
+        },
+        ("GET", ["robots.txt"]) => Response {
+            status: 200,
+            content_type: "text/plain; charset=utf-8",
+            body: format!("User-agent: *\nAllow: /\nDisallow: /admin\nSitemap: {}/sitemap.xml\n", base_url(&req)),
+        },
+
+        ("GET", ["v1", "trust", agent_id]) => ok(any_profile(&engine, agent_id, now)),
 
         ("GET", ["v1", "trust", agent_id, "badge.svg"]) => {
-            let p = engine.trust_profile_json(agent_id, now);
+            let p = any_profile(&engine, agent_id, now);
             let score = p.get("score").and_then(|v| v.as_f()).unwrap_or(0.0) as i64;
             let level = p.get("trust_level").and_then(|v| v.as_str()).unwrap_or("unknown");
             let verified = matches!(p.get("verified_protocols"), Some(Json::Array(a)) if !a.is_empty());
@@ -824,6 +984,9 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                         "POST /v1/register                   (free, one call: name -> agent_id + secret)",
                         "POST /mcp                            (MCP server for AI assistants)",
                         "GET  /llms.txt                       (guide for AI agents)",
+                        "GET  /v1/trust/erc8004:8453:{n}      (any bot in the public ERC-8004 registry on Base)",
+                        "GET  /v1/bots?q=&sort=new&offset=    (search every registry bot)",
+                        "GET  /bots                           (every bot, rated — for people)",
                         "POST /v1/agreements",
                         "POST /v1/agreements/{id}/accept",
                         "POST /v1/agreements/{id}/report",
@@ -1732,6 +1895,7 @@ fn main() -> std::io::Result<()> {
     let path: &'static std::path::Path = Box::leak(path.into_boxed_path());
 
     std::thread::spawn(move || background(engine, path));
+    chain::start(path.parent().map(|d| d.to_path_buf()).unwrap_or_default(), pay.base_rpc.clone());
 
     http::serve(&addr, move |req| {
         // Reads can change state too (a status check that finds a payment), so every request
@@ -1765,6 +1929,58 @@ mod tests {
 
     fn body_json(r: &Response) -> Json {
         json::parse(&r.body).unwrap_or_else(|e| panic!("{e}: {}", r.body))
+    }
+
+    #[test]
+    fn every_registry_bot_has_a_profile_page_and_badge() {
+        let e = engine();
+        // Numbers far from any other test's, since the registry index is shared.
+        {
+            let mut idx = chain::index().lock().unwrap();
+            idx.apply(&chain::tests::registered(900_001, "0x00000000000000000000000000000000000000aa", "", 10));
+            idx.agents.get_mut(&900_001).unwrap().name = "Forecast Bot".into();
+        }
+        let p = body_json(&route(&e, req("GET", "/v1/trust/erc8004:8453:900001", &[], ""), PROD));
+        assert_eq!(p.get("trust_level").and_then(|v| v.as_str()), Some("unknown"));
+        assert_eq!(p.get("name").and_then(|v| v.as_str()), Some("Forecast Bot"));
+        assert_eq!(p.get("claimed_by"), Some(&Json::Null));
+        let missing = body_json(&route(&e, req("GET", "/v1/trust/erc8004:8453:999999999", &[], ""), PROD));
+        assert_eq!(missing.get("trust_level").and_then(|v| v.as_str()), Some("unknown"));
+        let badge = route(&e, req("GET", "/v1/trust/erc8004:8453:900001/badge.svg", &[], ""), PROD);
+        assert_eq!(badge.content_type, "image/svg+xml");
+
+        let page = route(&e, req("GET", "/bots/base/900001", &[], ""), PROD);
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("Forecast Bot") && page.body.contains("Claim with my wallet"));
+        assert_eq!(route(&e, req("GET", "/bots/base/999999999", &[], ""), PROD).status, 404);
+        assert_eq!(route(&e, req("GET", "/bots/base/nope", &[], ""), PROD).status, 404);
+        let mut search = req("GET", "/bots", &[], "");
+        search.query.insert("q".into(), "forecast".into());
+        assert!(route(&e, search, PROD).body.contains("/bots/base/900001"));
+        let mut api = req("GET", "/v1/bots", &[], "");
+        api.query.insert("q".into(), "forecast".into());
+        assert_eq!(body_json(&route(&e, api, PROD)).get("total").and_then(|v| v.as_f()), Some(1.0));
+        assert!(route(&e, req("GET", "/sitemap.xml", &[], ""), PROD).body.contains("/bots/base/900001"));
+        assert!(route(&e, req("GET", "/robots.txt", &[], ""), PROD).body.contains("Sitemap:"));
+
+        // Once an account proves it owns the bot, the bot's profile is that account's record.
+        let r = route(&e, req("POST", "/v1/register", &[], r#"{"name":"forecast-bot"}"#), PROD);
+        let ext = verify::normalize("erc8004", "8453:900001").unwrap();
+        e.lock().unwrap().record_verified("forecast-bot", "erc8004", &ext, "test", 0, 0).unwrap();
+        assert_eq!(r.status, 201);
+        let p = body_json(&route(&e, req("GET", "/v1/trust/erc8004:8453:900001", &[], ""), PROD));
+        assert_eq!(p.get("claimed_by").and_then(|v| v.as_str()), Some("forecast-bot"));
+        assert!(p.get("onchain").and_then(|o| o.get("registry")).is_some());
+        let page = route(&e, req("GET", "/bots/base/900001", &[], ""), PROD);
+        assert!(page.body.contains("Claimed.") && !page.body.contains("Claim with my wallet"));
+        let mut lookup = req("GET", "/v1/trust/lookup", &[], "");
+        lookup.query.insert("protocol".into(), "erc8004".into());
+        lookup.query.insert("id".into(), "8453:900001".into());
+        assert_eq!(body_json(&route(&e, lookup, PROD)).get("verified_agent").and_then(|v| v.as_str()), Some("forecast-bot"));
+
+        // No account can take a registry bot's name.
+        let fake = r#"{"parties":["erc8004:8453:900001","someone"],"secret":"s"}"#;
+        assert_eq!(route(&e, req("POST", "/v1/agreements", &[], fake), PROD).status, 400);
     }
 
     fn new_key(e: &Mutex<Engine>) -> String {

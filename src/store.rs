@@ -570,6 +570,8 @@ pub fn valid_agent_id(id: &str) -> bool {
     // for "a") would let a scammer register a name that reads exactly like a trusted bot's.
     (1..=64).contains(&id.len())
         && id.chars().all(|c| c.is_ascii_graphic() && !"/?#<>\"'\\%".contains(c))
+        // "erc8004:…" names a bot in the public on-chain registry; no account may pose as one.
+        && !id.get(..8).map_or(false, |p| p.eq_ignore_ascii_case("erc8004:"))
 }
 
 /// How long one paid period of a self-serve plan lasts.
