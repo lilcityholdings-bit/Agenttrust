@@ -27,6 +27,7 @@ mod mcp;
 mod store;
 mod trust;
 mod verify;
+mod watch;
 
 use std::io::Write as _;
 use std::sync::Mutex;
@@ -283,6 +284,8 @@ fn needs_platform_key(method: &str, segments: &[&str]) -> bool {
         (method, segments),
         ("GET", ["v1", "usage"]) | ("GET", ["v1", "payouts", "pending"]) | ("POST", ["v1", "agreements", _, "payout"])
             | ("POST", ["v1", "billing", "renew"])
+            | ("GET", ["v1", "watch"]) | ("POST", ["v1", "watch"]) | ("POST", ["v1", "watch", "remove"])
+            | ("GET", ["v1", "alerts"])
     )
 }
 
@@ -571,6 +574,65 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
         ("amount_usd", amount_usd.map(Json::num).unwrap_or(Json::Null)),
         ("matches", Json::Array(matches)),
     ]))
+}
+
+/// Where a watched target stands now: a wallet's payment verdict (ok, careful, stop) or a
+/// bot's trust level, with the reasons.
+fn target_level(engine: &Engine, target: &str, now: i64) -> (String, Vec<String>) {
+    let text = |j: &Json, k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    if target.starts_with("0x") {
+        return match check_payment(engine, target, None, now) {
+            Ok(j) => (text(&j, "verdict"), vec![text(&j, "advice")]),
+            Err(e) => ("unknown".into(), vec![e]),
+        };
+    }
+    let p = any_profile(engine, target, now);
+    let reasons = match p.get("reasons") {
+        Some(Json::Array(rs)) => rs.iter().filter_map(|r| r.as_str().map(|s| s.to_string())).collect(),
+        _ => Vec::new(),
+    };
+    (text(&p, "trust_level"), reasons)
+}
+
+/// How many bots and wallets a customer's plan may watch.
+fn watch_limit(engine: &Engine, customer_id: &str) -> usize {
+    match engine.customer(customer_id).map(|c| c.tier.as_str()) {
+        Some("platform") => 10_000,
+        _ => 100,
+    }
+}
+
+/// Re-checks every watched target and turns each change of level into an alert, delivered to
+/// the customer's webhook if it has one. Only customers whose key is live are checked.
+fn sweep_watches(engine: &Mutex<Engine>, now: i64) {
+    let targets = watch::lock().all_targets();
+    if targets.is_empty() {
+        return;
+    }
+    let levels: Vec<(String, String, String, Vec<String>)> = {
+        let e = engine.lock().unwrap_or_else(|e| e.into_inner());
+        targets
+            .into_iter()
+            .filter(|(c, _)| e.customer(c).map_or(false, |c| c.active && c.paid_until_ms.map_or(true, |t| now < t)))
+            .map(|(c, t)| {
+                let (level, reasons) = target_level(&e, &t, now);
+                (c, t, level, reasons)
+            })
+            .collect()
+    };
+    let deliveries: Vec<(String, watch::Alert, String)> = {
+        let mut w = watch::lock();
+        levels
+            .into_iter()
+            .filter_map(|(c, t, level, reasons)| match w.observe(&c, &t, &level, reasons, now)? {
+                (alert, Some((url, secret))) => Some((url, alert, secret)),
+                _ => None,
+            })
+            .collect()
+    };
+    for (url, alert, secret) in deliveries.iter().take(200) {
+        watch::deliver(url, alert, secret);
+    }
 }
 
 /// A shields-style SVG badge. Only numbers and fixed words go into it — never the agent id — so
@@ -876,6 +938,84 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 Err(e) => err(400, &e),
             }
         }
+        // ---- Watch: alerts when what a customer depends on changes standing -------------
+        ("GET", ["v1", "watch"]) => {
+            let cid = customer_id.clone().unwrap_or_default();
+            let w = watch::lock();
+            let list = w.lists.get(&cid).cloned().unwrap_or_default();
+            ok(Json::obj(vec![
+                (
+                    "watching",
+                    Json::Array(
+                        list.targets
+                            .iter()
+                            .map(|(t, lv)| Json::obj(vec![("target", Json::str(t.clone())), ("level", Json::str(lv.clone()))]))
+                            .collect(),
+                    ),
+                ),
+                ("limit", Json::num(watch_limit(&engine, &cid) as f64)),
+                ("webhook", list.webhook.map(Json::str).unwrap_or(Json::Null)),
+                ("alerts", Json::str("GET /v1/alerts?since=<last alert_id you saw>")),
+            ]))
+        }
+        ("POST", ["v1", "watch"]) => {
+            let cid = customer_id.clone().unwrap_or_default();
+            let mut targets = Vec::new();
+            if let Some(Json::Array(ts)) = body.get("targets") {
+                if ts.len() > 1_000 {
+                    return err(400, "add at most 1,000 targets per call");
+                }
+                for t in ts {
+                    let Some(t) = t.as_str() else { return err(400, "targets must be strings") };
+                    match watch::normalize_target(t) {
+                        Ok(t) => targets.push(t),
+                        Err(e) => return err(400, &e),
+                    }
+                }
+            }
+            let webhook = match body.get("webhook_url") {
+                None => None,
+                Some(Json::Null) => Some(None),
+                Some(Json::Str(u)) if watch::valid_webhook(u) => Some(Some(u.clone())),
+                Some(_) => return err(400, "webhook_url must be an https:// address (up to 300 characters), or null to remove it"),
+            };
+            if targets.is_empty() && webhook.is_none() {
+                return err(400, "send targets (bot ids, erc8004:8453:N, or 0x wallets) and/or webhook_url");
+            }
+            let with_levels: Vec<(String, String)> = targets.into_iter().map(|t| {
+                let level = target_level(&engine, &t, now).0;
+                (t, level)
+            }).collect();
+            let limit = watch_limit(&engine, &cid);
+            let mut w = watch::lock();
+            let count = match w.add(&cid, with_levels, limit) {
+                Ok(n) => n,
+                Err(e) => return err(409, &e),
+            };
+            let secret = webhook.and_then(|hook| w.set_webhook(&cid, hook, format!("whsec_{}", random_hex())));
+            let mut out = vec![("watching", Json::num(count as f64)), ("limit", Json::num(limit as f64))];
+            if let Some(sec) = secret {
+                out.push(("webhook_secret", Json::str(sec)));
+                out.push((
+                    "important",
+                    Json::str("Save webhook_secret now — it is shown once. Each alert is POSTed with X-Keptvow-Signature: sha256=HMAC-SHA256(secret, body)."),
+                ));
+            }
+            ok(Json::obj(out))
+        }
+        ("POST", ["v1", "watch", "remove"]) => {
+            let cid = customer_id.clone().unwrap_or_default();
+            let targets: Vec<String> = match body.get("targets") {
+                Some(Json::Array(ts)) => ts.iter().filter_map(|t| t.as_str()).filter_map(|t| watch::normalize_target(t).ok()).collect(),
+                _ => return err(400, "targets is required"),
+            };
+            ok(Json::obj(vec![("watching", Json::num(watch::lock().remove(&cid, &targets) as f64))]))
+        }
+        ("GET", ["v1", "alerts"]) => {
+            let cid = customer_id.clone().unwrap_or_default();
+            let since = req.q("since").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            ok(Json::obj(vec![("alerts", Json::Array(watch::lock().alerts_since(&cid, since)))]))
+        }
         ("GET", ["guard.js"]) => Response {
             status: 200,
             content_type: "text/javascript; charset=utf-8",
@@ -1069,6 +1209,8 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                         "GET  /llms.txt                       (guide for AI agents)",
                         "GET  /v1/check?pay_to=0x…&amount_usd= (before paying a wallet: ok, careful or stop)",
                         "GET  /guard.js                       (drop-in check for x402 fetch clients)",
+                        "POST /v1/watch {targets, webhook_url} (plan key: alerts when a bot or wallet changes standing)",
+                        "GET  /v1/alerts?since=               (plan key: alerts so far)",
                         "GET  /v1/trust/erc8004:8453:{n}      (any bot in the public ERC-8004 registry on Base)",
                         "GET  /v1/bots?q=&sort=new&offset=    (search every registry bot)",
                         "GET  /bots                           (every bot, rated — for people)",
@@ -1932,6 +2074,11 @@ fn background(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
             }
         }
 
+        if tick % 15 == 0 {
+            sweep_watches(engine, now);
+        }
+        watch::save_if_dirty();
+
         if tick % 180 == 0 && engine.lock().unwrap_or_else(|e| e.into_inner()).prune_unpaid(now) > 0 {
             dirty = true;
         }
@@ -1993,7 +2140,9 @@ fn main() -> std::io::Result<()> {
     let path: &'static std::path::Path = Box::leak(path.into_boxed_path());
 
     std::thread::spawn(move || background(engine, path));
-    chain::start(path.parent().map(|d| d.to_path_buf()).unwrap_or_default(), pay.base_rpc.clone());
+    let data_dir = path.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    watch::load(data_dir.clone());
+    chain::start(data_dir, pay.base_rpc.clone());
 
     http::serve(&addr, move |req| {
         // Reads can change state too (a status check that finds a payment), so every request
@@ -2119,6 +2268,51 @@ mod tests {
         assert_eq!(route(&e, req("GET", "/v1/check", &[], ""), PROD).status, 400);
         let js = route(&e, req("GET", "/guard.js", &[("Host", "trust.example.com")], ""), PROD);
         assert!(js.content_type.starts_with("text/javascript") && js.body.contains("https://trust.example.com"));
+    }
+
+    #[test]
+    fn watch_turns_a_change_of_standing_into_an_alert() {
+        let e = engine();
+        assert_eq!(route(&e, req("GET", "/v1/watch", &[], ""), PROD).status, 401, "plans only");
+        assert_eq!(route(&e, req("GET", "/v1/alerts", &[], ""), PROD).status, 401);
+        let key = new_key(&e);
+        let k = [("X-Api-Key", key.as_str())];
+        let wallet = format!("0x{:040x}", 0xbeef_0000u64 + 900_201);
+        {
+            let mut idx = chain::index().lock().unwrap();
+            idx.apply(&chain::tests::registered(900_201, "0x00000000000000000000000000000000000000aa", "", 10));
+            idx.agents.get_mut(&900_201).unwrap().wallet = wallet.clone();
+        }
+        let body = format!(r#"{{"targets":["{wallet}","erc8004:8453:900201"],"webhook_url":"https://hooks.example/keptvow"}}"#);
+        let r = body_json(&route(&e, req("POST", "/v1/watch", &k, &body), PROD));
+        assert_eq!(r.get("watching").and_then(|v| v.as_f()), Some(2.0), "{}", r.to_string());
+        assert!(r.get("webhook_secret").and_then(|v| v.as_str()).unwrap().starts_with("whsec_"));
+        assert_eq!(route(&e, req("POST", "/v1/watch", &k, r#"{"targets":["<x>"]}"#), PROD).status, 400);
+        assert_eq!(route(&e, req("POST", "/v1/watch", &k, r#"{"webhook_url":"http://plain.example"}"#), PROD).status, 400);
+
+        // The seller's bot collects bad reviews from many wallets.
+        {
+            let mut idx = chain::index().lock().unwrap();
+            for c in 0..8u64 {
+                idx.apply(&chain::tests::feedback(900_201, &format!("0x{:040x}", 0xdead_0000u64 + c), 1, 3, 0, "starred"));
+            }
+        }
+        sweep_watches(&e, now_ms());
+        let alerts = body_json(&route(&e, req("GET", "/v1/alerts", &k, ""), PROD));
+        let Some(Json::Array(list)) = alerts.get("alerts") else { panic!("{}", alerts.to_string()) };
+        let to: Vec<(String, String)> = list
+            .iter()
+            .map(|a| (a.get("target").unwrap().as_str().unwrap().to_string(), a.get("to").unwrap().as_str().unwrap().to_string()))
+            .collect();
+        assert!(to.contains(&(wallet.clone(), "stop".to_string())), "{to:?}");
+        assert!(to.contains(&("erc8004:8453:900201".to_string(), "caution".to_string())), "{to:?}");
+        assert!(list.iter().all(|a| a.get("worse") == Some(&Json::Bool(true))));
+        let last = list.iter().filter_map(|a| a.get("alert_id").and_then(|v| v.as_f())).fold(0.0, f64::max);
+        let mut since = req("GET", "/v1/alerts", &k, "");
+        since.query.insert("since".into(), (last as u64).to_string());
+        assert!(matches!(body_json(&route(&e, since, PROD)).get("alerts"), Some(Json::Array(a)) if a.is_empty()));
+        let r = body_json(&route(&e, req("POST", "/v1/watch/remove", &k, &format!(r#"{{"targets":["{wallet}"]}}"#)), PROD));
+        assert_eq!(r.get("watching").and_then(|v| v.as_f()), Some(1.0));
     }
 
     fn new_key(e: &Mutex<Engine>) -> String {

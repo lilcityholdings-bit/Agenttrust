@@ -151,6 +151,22 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// HMAC-SHA256 (RFC 2104): how a webhook receiver checks a message really came from here and
+/// wasn't changed on the way.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&sha256(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    inner.extend_from_slice(msg);
+    let mut outer: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+    outer.extend_from_slice(&sha256(&inner));
+    sha256(&outer)
+}
+
 /// SplitMix64 — a small, well-distributed PRNG that is fully determined by its seed.
 ///
 /// The jury draw uses this rather than anything OS-seeded on purpose: a panel drawn from a
@@ -196,6 +212,13 @@ impl Seeded {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    }
+
     use super::*;
 
     #[test]

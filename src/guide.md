@@ -106,6 +106,16 @@ Self-serve, active the minute payment lands:
 curl -X POST {URL}/v1/platforms -H 'Content-Type: application/json' -d '{"name":"My company","plan":"watch","pay_with":"usdc"}'
 ```
 
+**Watch alerts** (any plan): list the bots and wallets you depend on and hear when one changes standing.
+
+```
+curl -X POST {URL}/v1/watch -H 'X-Api-Key: KEY' -H 'Content-Type: application/json' \
+  -d '{"targets":["0xSELLER_WALLET","erc8004:8453:42","alice-bot"],"webhook_url":"https://you.example/hook"}'
+curl {URL}/v1/alerts?since=0 -H 'X-Api-Key: KEY'
+```
+
+Re-checked every 5 minutes. Each alert says `from`, `to` and whether it got `worse`; webhooks are signed `X-Keptvow-Signature: sha256=HMAC-SHA256(webhook_secret, body)`. Watch covers 100 targets, Platform 10,000.
+
 `pay_with` is `card` (Stripe checkout, renews monthly) or `usdc` (exact amount on Base). See `GET {URL}/v1/pricing`. Send the key as `X-Api-Key`.
 
 ## Everything else
