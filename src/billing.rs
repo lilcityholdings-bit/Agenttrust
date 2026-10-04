@@ -77,6 +77,72 @@ impl Pricing {
     }
 }
 
+/// The plans a customer can sign up for today. Customers from before plans existed keep the
+/// price list they signed up under (`Pricing::from_env`, the original $29 plan).
+pub const TIERS: [&str; 2] = ["watch", "platform"];
+
+impl Pricing {
+    /// A plan's price list. Monthly fees can be overridden with `PRICE_WATCH_USD` and
+    /// `PRICE_PLATFORM_USD`.
+    pub fn for_tier(tier: &str) -> Option<Pricing> {
+        let monthly = |name: &str, default: i64| -> i64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|v| (v * 1000.0).round() as i64)
+                .unwrap_or(default)
+        };
+        match tier {
+            // Bot builders and small businesses: checks before paying, alerts, a few deals.
+            "watch" => Some(Pricing {
+                monthly_mills: monthly("PRICE_WATCH_USD", 99_000),
+                included_agreements: 1_000,
+                agreement_mills: 20,
+                dispute_mills: 500,
+                included_lookups: 100_000,
+                lookup_mills: 1,
+            }),
+            // Wallets, marketplaces, payment companies: scores inside their own product.
+            "platform" => Some(Pricing {
+                monthly_mills: monthly("PRICE_PLATFORM_USD", 499_000),
+                included_agreements: 20_000,
+                agreement_mills: 10,
+                dispute_mills: 500,
+                included_lookups: 1_000_000,
+                lookup_mills: 1,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn tier_label(tier: &str) -> &'static str {
+        match tier {
+            "watch" => "Keptvow Watch",
+            "platform" => "Keptvow Platform",
+            _ => "Keptvow plan",
+        }
+    }
+}
+
+/// Every plan on sale, for the pricing endpoint and the home page.
+pub fn tiers_json() -> Json {
+    Json::Array(
+        TIERS
+            .iter()
+            .filter_map(|t| {
+                let p = Pricing::for_tier(t)?;
+                let mut j = p.to_json();
+                if let Json::Object(m) = &mut j {
+                    m.insert("plan".into(), Json::str(*t));
+                    m.insert("name".into(), Json::str(Pricing::tier_label(t)));
+                }
+                Some(j)
+            })
+            .collect(),
+    )
+}
+
 /// Mills as a dollar amount, for display. Display only — sums are always done in mills.
 pub fn usd(mills: i64) -> Json {
     Json::num(mills as f64 / 1000.0)

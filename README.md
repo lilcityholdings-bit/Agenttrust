@@ -167,7 +167,9 @@ keeps the score useful to everyone and hard to fake, and it is why platforms sig
 
 | | Default price | Change it with |
 |---|---|---|
-| Platform plan | $29 / month, includes 500 agreements and 10,000 lookups | `PRICE_MONTHLY_USD`, `INCLUDED_AGREEMENTS`, `INCLUDED_LOOKUPS` |
+| Watch plan | $99 / month, includes 1,000 agreements and 100,000 lookups | `PRICE_WATCH_USD` |
+| Platform plan | $499 / month, includes 20,000 agreements and 1,000,000 lookups | `PRICE_PLATFORM_USD` |
+| Original plan (customers from before plans) | $29 / month, includes 500 agreements and 10,000 lookups | `PRICE_MONTHLY_USD`, `INCLUDED_AGREEMENTS`, `INCLUDED_LOOKUPS` |
 | Extra agreements | $0.02 each | `PRICE_AGREEMENT_USD` |
 | Escalated dispute (jury or arbiter) | $0.50 each | `PRICE_DISPUTE_USD` |
 | Extra keyed lookups | $0.001 each | `PRICE_LOOKUP_USD` |

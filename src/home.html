@@ -55,6 +55,12 @@
   .price { font-size: 1.6rem; font-weight: 700; }
   .price small { font-size: .95rem; color: var(--muted); font-weight: 400; }
   ul.plain { margin: 8px 0 14px; padding-left: 20px; }
+  [hidden] { display: none !important; }
+  #signup { margin-top: 16px; }
+  .plans { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .plan { border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .plan ul.plain { margin-bottom: 0; font-size: .92rem; }
+  @media (max-width: 560px) { .plans { grid-template-columns: 1fr; } .row { flex-wrap: wrap; } .row > input { flex-basis: 100%; } }
   ul.plain li { margin: 3px 0; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .muted { color: var(--muted); font-size: .9rem; }
@@ -120,17 +126,33 @@
   </section>
 
   <section>
-    <h2>For platforms that run bots</h2>
-    <div class="price" id="price">$29 <small>/ month</small></div>
-    <ul class="plain" id="includes">
-      <li>500 deals and 10,000 score checks included</li>
-      <li>Disputes settled for you</li>
-      <li>Your bots' scores follow them everywhere</li>
-    </ul>
+    <h2>For businesses that rely on bots</h2>
+    <p class="muted" style="margin:0 0 12px">Checking bots is free. A plan removes the limits and adds alerts and data. Paying never buys a better score.</p>
+    <div class="plans">
+      <div class="plan">
+        <b>Watch</b>
+        <div class="price"><span id="price-watch">$99</span> <small>/ month</small></div>
+        <ul class="plain">
+          <li><span id="checks-watch">100,000</span> trust checks a month</li>
+          <li>Alerts when a bot you deal with turns bad</li>
+          <li>Deals count toward your bots' scores</li>
+        </ul>
+      </div>
+      <div class="plan">
+        <b>Platform</b>
+        <div class="price"><span id="price-platform">$499</span> <small>/ month</small></div>
+        <ul class="plain">
+          <li><span id="checks-platform">1,000,000</span> trust checks a month</li>
+          <li>Scores inside your own product</li>
+          <li>Everything in Watch</li>
+        </ul>
+      </div>
+    </div>
     <form id="signup" hidden>
       <label for="pname">Get your API key now</label>
       <div class="row">
-        <input id="pname" type="text" placeholder="Platform name" maxlength="80" required>
+        <input id="pname" type="text" placeholder="Company name" maxlength="80" required>
+        <select id="plan" aria-label="Plan"><option value="watch">Watch</option><option value="platform">Platform</option></select>
         <select id="paywith" aria-label="Pay with"></select>
       </div>
       <div class="actions" style="margin-top:8px">
@@ -159,11 +181,11 @@
     if (id) location.href = "/trust/" + encodeURIComponent(id);
   });
   fetch("/v1/pricing").then(function (r) { return r.json(); }).then(function (p) {
-    var price = $("price");
-    price.firstChild.nodeValue = "$" + Number(p.monthly_usd).toFixed(0) + " ";
-    $("includes").firstElementChild.textContent =
-      Number(p.included_agreements).toLocaleString() + " deals and " +
-      Number(p.included_lookups).toLocaleString() + " score checks included";
+    (p.plans || []).forEach(function (plan) {
+      var price = $("price-" + plan.plan), checks = $("checks-" + plan.plan);
+      if (price) price.textContent = "$" + Number(plan.monthly_usd).toFixed(0);
+      if (checks) checks.textContent = Number(plan.included_lookups).toLocaleString();
+    });
     if (p.pay_with && p.pay_with.length) {
       var sel = $("paywith");
       p.pay_with.forEach(function (m) {
@@ -197,7 +219,7 @@
     fetch("/v1/platforms", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: $("pname").value.trim(), pay_with: $("paywith").value })
+      body: JSON.stringify({ name: $("pname").value.trim(), plan: $("plan").value, pay_with: $("paywith").value })
     }).then(function (r) { return r.json(); }).then(function (j) {
       out.textContent = "";
       if (j.error) { out.appendChild(text("p", j.error, "err")); return; }

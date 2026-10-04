@@ -1007,7 +1007,10 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         }
 
         ("GET", ["v1", "pricing"]) => {
-            let mut j = engine.pricing.to_json();
+            let mut j = Json::obj(vec![
+                ("plans", billing::tiers_json()),
+                ("free", Json::str("no key: 300 trust checks and 120 writes an hour per address, every page and badge, claiming your bot")),
+            ]);
             if let Json::Object(m) = &mut j {
                 if let Some(c) = contact() {
                     m.insert("contact".into(), Json::str(c));
@@ -1019,7 +1022,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     Json::str(if methods.is_empty() {
                         "self-serve sign-up is not switched on yet"
                     } else {
-                        "POST /v1/platforms {\"name\": \"Your platform\", \"pay_with\": \"card\" or \"usdc\"} — the key works as soon as the payment lands"
+                        "POST /v1/platforms {\"name\": \"Your company\", \"plan\": \"watch\" or \"platform\", \"pay_with\": \"card\" or \"usdc\"} — the key works as soon as the payment lands"
                     }),
                 );
                 m.insert("bots".into(), Json::str("free: POST /v1/register, then deals and trust checks with no key"));
@@ -1663,9 +1666,15 @@ fn pay_instructions(engine: &Engine, inv: &store::Invoice, now: i64) -> Json {
 /// Attaches a Stripe Checkout page to a card bill — a network call, so made with the engine
 /// unlocked.
 fn attach_checkout(engine: &Mutex<Engine>, req: &Request, invoice_id: &str) -> Result<(), Response> {
-    let (inv, plan_mills) = {
+    let (inv, plan_mills, tier) = {
         let e = engine.lock().unwrap_or_else(|e| e.into_inner());
-        (e.invoice(invoice_id).cloned(), e.pricing.monthly_mills)
+        let inv = e.invoice(invoice_id).cloned();
+        let customer = inv.as_ref().and_then(|i| e.customer(&i.customer_id));
+        (
+            inv.clone(),
+            customer.map(|c| e.pricing_of(c).monthly_mills).unwrap_or(e.pricing.monthly_mills),
+            customer.map(|c| c.tier.clone()).unwrap_or_default(),
+        )
     };
     let Some(inv) = inv else { return Err(err(404, "no such invoice")) };
     if inv.method != "card" || inv.checkout_url.is_some() {
@@ -1679,6 +1688,7 @@ fn attach_checkout(engine: &Mutex<Engine>, req: &Request, invoice_id: &str) -> R
         &inv.customer_id,
         plan_mills / 10,
         extra_cents,
+        billing::Pricing::tier_label(&tier),
     )
     .map_err(|e| err(502, &e))?;
     engine.lock().unwrap_or_else(|e| e.into_inner()).set_checkout(&inv.id, &session, &url);
@@ -1714,6 +1724,11 @@ fn signup_platform(engine: &Mutex<Engine>, req: &Request, body: &Json, now: i64)
     else {
         return err(400, "name is required — your platform's name, up to 80 characters");
     };
+    let tier = match body.get("plan").and_then(|v| v.as_str()).map(|p| p.trim().to_ascii_lowercase()) {
+        None => "watch".to_string(),
+        Some(p) if billing::TIERS.contains(&p.as_str()) => p,
+        Some(_) => return err(400, "plan must be \"watch\" ($99/month) or \"platform\" ($499/month) — see GET /v1/pricing"),
+    };
     if !rate_ok("signup", req.client_ip(), 5, now) {
         return err(429, "too many sign-ups from this address — try again in an hour");
     }
@@ -1723,7 +1738,7 @@ fn signup_platform(engine: &Mutex<Engine>, req: &Request, body: &Json, now: i64)
         if e.unpaid_signups() >= 500 {
             return err(503, "too many unpaid sign-ups right now — try again later");
         }
-        let cid = e.create_self_serve(name, &key, now);
+        let cid = e.create_self_serve(name, &key, &tier, now);
         match e.open_invoice(&cid, method, now) {
             Ok(inv) => (cid, inv),
             Err(m) => return err(503, m),
@@ -1743,6 +1758,7 @@ fn signup_platform(engine: &Mutex<Engine>, req: &Request, body: &Json, now: i64)
                 "important",
                 Json::str("Save the api_key now — it is shown once. It starts working as soon as the payment below lands."),
             ),
+            ("plan", Json::str(billing::Pricing::tier_label(&tier))),
             ("invoice", pay_instructions(&e, inv, now)),
             ("check_payment", Json::str(format!("GET /v1/billing/invoices/{invoice_id}"))),
         ])
@@ -2165,9 +2181,14 @@ mod tests {
         let inv = j.get("invoice").unwrap();
         let inv_id = inv.get("invoice_id").unwrap().as_str().unwrap().to_string();
         let amount = inv.get("usdc_amount").unwrap().as_str().unwrap().to_string();
-        assert!(amount.starts_with("29.000") && amount != "29.000000", "{amount}");
+        assert!(amount.starts_with("99.000") && amount != "99.000000", "{amount} — Watch is the default plan");
         assert!(inv.get("how_to_pay").unwrap().as_str().unwrap().contains(&amount));
         assert_eq!(route(&e, req("POST", "/v1/platforms", &[], r#"{"name":"x","pay_with":"gold"}"#), PROD).status, 400);
+        assert_eq!(route(&e, req("POST", "/v1/platforms", &[], r#"{"name":"x","plan":"gold"}"#), PROD).status, 400);
+        let big = body_json(&route(&e, req("POST", "/v1/platforms", &[("X-Real-IP", "198.51.100.77")], r#"{"name":"Big","plan":"platform"}"#), PROD));
+        assert!(big.get("invoice").unwrap().get("usdc_amount").unwrap().as_str().unwrap().starts_with("499.000"));
+        let pricing = body_json(&route(&e, req("GET", "/v1/pricing", &[], ""), PROD));
+        assert!(matches!(pricing.get("plans"), Some(Json::Array(p)) if p.len() == 2));
 
         let k = [("X-Api-Key", key.as_str())];
         assert_eq!(route(&e, req("GET", "/v1/trust/a", &k, ""), PROD).status, 402, "not paid yet");
@@ -2182,7 +2203,7 @@ mod tests {
         assert_eq!(st.get("key_active"), Some(&Json::Bool(true)));
         let usage = body_json(&route(&e, req("GET", "/v1/usage", &k, ""), PROD));
         let statement = usage.get("statement").unwrap();
-        assert_eq!(statement.get("paid_usd").unwrap().as_f().unwrap().round(), 29.0, "credited once");
+        assert_eq!(statement.get("paid_usd").unwrap().as_f().unwrap().round(), 99.0, "credited once");
         assert!(statement.get("balance_usd").unwrap().as_f().unwrap().abs() < 0.01);
 
         // A deal through a paid key counts as a platform.

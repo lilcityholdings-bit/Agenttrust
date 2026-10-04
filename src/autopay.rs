@@ -133,6 +133,7 @@ pub fn stripe_checkout(
     customer_id: &str,
     plan_cents: i64,
     extra_cents: i64,
+    plan_name: &str,
 ) -> Result<(String, String), String> {
     let mut form: Vec<(&str, String)> = vec![
         ("mode", "subscription".into()),
@@ -146,14 +147,14 @@ pub fn stripe_checkout(
         ("line_items[0][price_data][currency]", "usd".into()),
         ("line_items[0][price_data][unit_amount]", plan_cents.to_string()),
         ("line_items[0][price_data][recurring][interval]", "month".into()),
-        ("line_items[0][price_data][product_data][name]", "agenttrust platform plan".into()),
+        ("line_items[0][price_data][product_data][name]", plan_name.into()),
     ];
     if extra_cents > 0 {
         form.extend([
             ("line_items[1][quantity]", "1".into()),
             ("line_items[1][price_data][currency]", "usd".into()),
             ("line_items[1][price_data][unit_amount]", extra_cents.to_string()),
-            ("line_items[1][price_data][product_data][name]", "agenttrust usage beyond plan".into()),
+            ("line_items[1][price_data][product_data][name]", "Keptvow usage beyond plan".into()),
         ]);
     }
     let j = stripe_post(cfg, "/v1/checkout/sessions", &form)?;
@@ -213,7 +214,7 @@ pub fn stripe_add_overage(cfg: &PayConfig, stripe_customer: &str, cents: i64) ->
             ("customer", stripe_customer.to_string()),
             ("amount", cents.to_string()),
             ("currency", "usd".into()),
-            ("description", "agenttrust usage beyond plan".into()),
+            ("description", "Keptvow usage beyond plan".into()),
         ],
     )
     .map(|_| ())

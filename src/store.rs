@@ -365,6 +365,9 @@ pub struct Customer {
     pub stripe_subscription: Option<String>,
     /// Card plans only: overage already added to the next Stripe invoice.
     pub overage_invoiced_mills: i64,
+    /// Which plan a self-serve customer is on ("watch", "platform"); "" for customers from
+    /// before plans existed, who keep the original price list.
+    pub tier: String,
 }
 
 impl Customer {
@@ -426,6 +429,7 @@ impl Customer {
             ("stripe_customer", self.stripe_customer.clone().map(Json::str).unwrap_or(Json::Null)),
             ("stripe_subscription", self.stripe_subscription.clone().map(Json::str).unwrap_or(Json::Null)),
             ("overage_invoiced_mills", Json::num(self.overage_invoiced_mills as f64)),
+            ("tier", Json::str(self.tier.clone())),
         ])
     }
 
@@ -465,6 +469,7 @@ impl Customer {
             stripe_customer: j.get("stripe_customer").and_then(|v| v.as_str()).map(|s| s.to_string()),
             stripe_subscription: j.get("stripe_subscription").and_then(|v| v.as_str()).map(|s| s.to_string()),
             overage_invoiced_mills: j.get("overage_invoiced_mills").and_then(|v| v.as_f()).unwrap_or(0.0) as i64,
+            tier: j.get("tier").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         })
     }
 
@@ -873,6 +878,7 @@ impl Engine {
                 stripe_customer: None,
                 stripe_subscription: None,
                 overage_invoiced_mills: 0,
+                tier: String::new(),
             },
         );
         self.append(
@@ -908,13 +914,19 @@ impl Engine {
     // when paid time runs out the key simply stops counting as a platform until the next payment.
     // Nothing here needs the operator to approve, record or switch anything.
 
-    /// Creates a self-serve customer whose key does nothing until its first payment.
-    pub fn create_self_serve(&mut self, name: &str, raw_key: &str, now_ms: i64) -> String {
+    /// Creates a self-serve customer on `tier` whose key does nothing until its first payment.
+    pub fn create_self_serve(&mut self, name: &str, raw_key: &str, tier: &str, now_ms: i64) -> String {
         let id = self.create_customer(name, raw_key, now_ms);
         if let Some(c) = self.customers.get_mut(&id) {
             c.paid_until_ms = Some(now_ms);
+            c.tier = tier.to_string();
         }
         id
+    }
+
+    /// The price list a customer pays under: its plan's, or the original one.
+    pub fn pricing_of(&self, c: &Customer) -> billing::Pricing {
+        billing::Pricing::for_tier(&c.tier).unwrap_or(self.pricing)
     }
 
     /// Checks a key, telling a lapsed self-serve key apart from one that never existed.
@@ -952,7 +964,10 @@ impl Engine {
     fn overage_mills(&self, c: &Customer) -> i64 {
         c.usage
             .values()
-            .map(|u| billing::total(&billing::invoice(&self.pricing, u)) - self.pricing.monthly_mills)
+            .map(|u| {
+                let p = self.pricing_of(c);
+                billing::total(&billing::invoice(&p, u)) - p.monthly_mills
+            })
             .sum()
     }
 
@@ -974,7 +989,7 @@ impl Engine {
         if !c.active {
             return Err("this key was revoked");
         }
-        let mills = self.pricing.monthly_mills + self.self_serve_balance(c).max(0);
+        let mills = self.pricing_of(c).monthly_mills + self.self_serve_balance(c).max(0);
         let usdc_units = if method == "usdc" {
             let base = mills as u64 * 1000;
             let taken: HashSet<u64> =
@@ -1043,7 +1058,7 @@ impl Engine {
     }
 
     fn extend_plan(&mut self, customer_id: &str, until_ms: i64, now_ms: i64) {
-        let monthly = self.pricing.monthly_mills;
+        let monthly = self.customers.get(customer_id).map(|c| self.pricing_of(c).monthly_mills).unwrap_or(self.pricing.monthly_mills);
         if let Some(c) = self.customers.get_mut(customer_id) {
             let from = c.paid_until_ms.unwrap_or(now_ms).max(now_ms);
             c.paid_until_ms = Some(from.max(until_ms));
@@ -1263,15 +1278,16 @@ impl Engine {
                 .usage
                 .iter()
                 .map(|(m, u)| {
-                    let lines: Vec<billing::Line> = billing::invoice(&self.pricing, u).into_iter().skip(1).collect();
+                    let lines: Vec<billing::Line> = billing::invoice(&self.pricing_of(c), u).into_iter().skip(1).collect();
                     billing::invoice_json(m, &lines, u)
                 })
                 .collect();
             return Json::obj(vec![
                 ("customer_id", Json::str(c.id.clone())),
                 ("name", Json::str(c.name.clone())),
-                ("plan", Json::str(if c.stripe_subscription.is_some() { "card, renews automatically" } else { "prepaid" })),
-                ("pricing", self.pricing.to_json()),
+                ("plan", Json::str(billing::Pricing::tier_label(&c.tier))),
+                ("renews", Json::str(if c.stripe_subscription.is_some() { "card, renews automatically" } else { "prepaid" })),
+                ("pricing", self.pricing_of(c).to_json()),
                 ("paid_until_ms", Json::num(c.paid_until_ms.unwrap_or(0) as f64)),
                 ("active", Json::Bool(c.paid_until_ms.map(|t| now_ms < t).unwrap_or(false))),
                 ("usage_beyond_plan", Json::Array(months)),
