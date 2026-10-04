@@ -50,6 +50,7 @@ const DOCS_PAGE: &str = include_str!("docs.html");
 /// The guide for AI agents, served at `/llms.txt` and `/skill.md`: everything a bot needs to
 /// use the service, in the form models read best.
 const AGENT_GUIDE: &str = include_str!("guide.md");
+const GUARD_JS: &str = include_str!("guard.js");
 
 /// Where this service is reachable from outside: `PUBLIC_URL` if set, else the host the caller
 /// used (Railway's edge terminates TLS, so that is https).
@@ -261,6 +262,7 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
             | ("GET", ["bots", ..])
             | ("GET", ["sitemap.xml"])
             | ("GET", ["robots.txt"])
+            | ("GET", ["guard.js"])
             | ("GET", ["v1", "pricing"])
             | ("GET", ["billing", "done"])
             | ("POST", ["mcp"])
@@ -269,7 +271,10 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
 
 /// Reads metered to a platform's bill when it calls with its key.
 fn is_lookup(method: &str, segments: &[&str]) -> bool {
-    matches!((method, segments), ("GET", ["v1", "trust", ..]) | ("GET", ["v1", "agents", _]) | ("GET", ["v1", "bots", ..]))
+    matches!(
+        (method, segments),
+        ("GET", ["v1", "trust", ..]) | ("GET", ["v1", "agents", _]) | ("GET", ["v1", "bots", ..]) | ("GET", ["v1", "check"])
+    )
 }
 
 /// Endpoints that act for a platform, so they need its key.
@@ -510,6 +515,62 @@ fn any_profile(engine: &Engine, agent_id: &str, now: i64) -> Json {
         });
     }
     engine.trust_profile_json(agent_id, now)
+}
+
+/// Above this, a bot with only a `fair` record is worth a second look before paying.
+const CAREFUL_ABOVE_USD: f64 = 100.0;
+
+/// "Should I pay this wallet?" Finds every bot tied to the address a seller asked to be paid
+/// at — a Keptvow account that proved it owns the wallet, and registry bots that list it as
+/// their payment wallet or owner — and turns the worst of their records into one verdict:
+/// `stop`, `careful` or `ok`. Built for the moment an x402 seller answers 402 with its `payTo`.
+fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i64) -> Result<Json, String> {
+    let wallet = verify::normalize("eth", pay_to).map_err(|_| "pay_to must be a 0x wallet address".to_string())?;
+    let mut matches: Vec<Json> = Vec::new();
+    if let Some(owner) = engine.verified_owner_of("eth", &wallet) {
+        matches.push(engine.trust_profile_json(owner, now));
+    }
+    let ids = chain::index().lock().unwrap_or_else(|e| e.into_inner()).by_address(&wallet);
+    for n in ids.into_iter().take(10) {
+        if let Some(p) = registry_profile(engine, &format!("erc8004:{}:{n}", chain::CHAIN_ID), now) {
+            matches.push(p);
+        }
+    }
+    let rank = |l: &str| match l {
+        "caution" => 0,
+        "unknown" => 1,
+        "fair" => 2,
+        "good" => 3,
+        "excellent" => 4,
+        _ => 1,
+    };
+    let level_of = |p: &Json| p.get("trust_level").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    // The worst record decides: one wallet behind a scam bot and a clean one is still a risk.
+    let worst = matches.iter().map(|p| level_of(p)).min_by_key(|l| rank(l));
+    let big = amount_usd.map_or(false, |a| a > CAREFUL_ABOVE_USD);
+    let (verdict, advice) = match worst.as_deref() {
+        Some("caution") => ("stop", "A bot behind this wallet has a bad record. Don't pay it.".to_string()),
+        None => (
+            "careful",
+            "No bot Keptvow knows of is behind this wallet — no track record. Pay only what you can afford to lose.".to_string(),
+        ),
+        Some("unknown") => (
+            "careful",
+            "The bot behind this wallet has no track record yet. Pay only what you can afford to lose.".to_string(),
+        ),
+        Some("fair") if big => (
+            "careful",
+            format!("A fair record, but not yet strong enough for a payment over ${CAREFUL_ABOVE_USD:.0}. Consider splitting it."),
+        ),
+        Some(level) => ("ok", format!("The bot behind this wallet has a {level} record.")),
+    };
+    Ok(Json::obj(vec![
+        ("pay_to", Json::str(wallet)),
+        ("verdict", Json::str(verdict)),
+        ("advice", Json::str(advice)),
+        ("amount_usd", amount_usd.map(Json::num).unwrap_or(Json::Null)),
+        ("matches", Json::Array(matches)),
+    ]))
 }
 
 /// A shields-style SVG badge. Only numbers and fixed words go into it — never the agent id — so
@@ -801,6 +862,25 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 None => err(404, "no bot with that number in the registry (new bots appear a few minutes after they register)"),
             }
         }
+        ("GET", ["v1", "check"]) => {
+            let Some(pay_to) = req.q("pay_to") else {
+                return err(400, "pay_to is required: the 0x wallet you are about to pay, e.g. /v1/check?pay_to=0x…&amount_usd=2.5");
+            };
+            let amount = match req.q("amount_usd").map(|a| a.parse::<f64>()) {
+                None => None,
+                Some(Ok(a)) if a.is_finite() && a >= 0.0 => Some(a),
+                Some(_) => return err(400, "amount_usd must be a number like 2.5"),
+            };
+            match check_payment(&engine, pay_to, amount, now) {
+                Ok(j) => ok(j),
+                Err(e) => err(400, &e),
+            }
+        }
+        ("GET", ["guard.js"]) => Response {
+            status: 200,
+            content_type: "text/javascript; charset=utf-8",
+            body: GUARD_JS.replace("{URL}", &base_url(&req)),
+        },
         ("GET", ["sitemap.xml"]) => Response {
             status: 200,
             content_type: "application/xml; charset=utf-8",
@@ -984,6 +1064,8 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                         "POST /v1/register                   (free, one call: name -> agent_id + secret)",
                         "POST /mcp                            (MCP server for AI assistants)",
                         "GET  /llms.txt                       (guide for AI agents)",
+                        "GET  /v1/check?pay_to=0x…&amount_usd= (before paying a wallet: ok, careful or stop)",
+                        "GET  /guard.js                       (drop-in check for x402 fetch clients)",
                         "GET  /v1/trust/erc8004:8453:{n}      (any bot in the public ERC-8004 registry on Base)",
                         "GET  /v1/bots?q=&sort=new&offset=    (search every registry bot)",
                         "GET  /bots                           (every bot, rated — for people)",
@@ -1981,6 +2063,46 @@ mod tests {
         // No account can take a registry bot's name.
         let fake = r#"{"parties":["erc8004:8453:900001","someone"],"secret":"s"}"#;
         assert_eq!(route(&e, req("POST", "/v1/agreements", &[], fake), PROD).status, 400);
+    }
+
+    #[test]
+    fn checking_a_wallet_before_paying_it() {
+        let e = engine();
+        let wallet_of = |n: u64| format!("0x{:040x}", 0xfeed_0000u64 + n);
+        let check = |pay_to: &str, amount: Option<&str>| {
+            let mut r = req("GET", "/v1/check", &[], "");
+            r.query.insert("pay_to".into(), pay_to.into());
+            if let Some(a) = amount {
+                r.query.insert("amount_usd".into(), a.into());
+            }
+            body_json(&route(&e, r, PROD))
+        };
+        let verdict = |j: &Json| j.get("verdict").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        {
+            let mut idx = chain::index().lock().unwrap();
+            idx.head = idx.head.max(10 + 60 * 86_400 / 2);
+            // 900101: a scam bot many wallets rated badly. 900102: a well-reviewed bot.
+            for (n, rating) in [(900_101u64, 5i128), (900_102, 95)] {
+                idx.apply(&chain::tests::registered(n, "0x00000000000000000000000000000000000000aa", "", 10));
+                idx.agents.get_mut(&n).unwrap().wallet = wallet_of(n);
+                for c in 0..8u64 {
+                    idx.apply(&chain::tests::feedback(n, &format!("0x{:040x}", 0xabc0_0000u64 + c), 1, rating, 0, "starred"));
+                }
+            }
+        }
+        assert_eq!(verdict(&check(&wallet_of(900_101), None)), "stop");
+        let ok = check(&wallet_of(900_102), Some("20"));
+        assert_eq!(verdict(&ok), "ok", "{}", ok.to_string());
+        assert_eq!(verdict(&check(&wallet_of(900_102), Some("5000"))), "careful", "fair is not enough for a big payment");
+        let nobody = check("0x000000000000000000000000000000000000dEaD", None);
+        assert_eq!(verdict(&nobody), "careful");
+        assert_eq!(nobody.get("matches"), Some(&Json::Array(vec![])));
+        let mut bad = req("GET", "/v1/check", &[], "");
+        bad.query.insert("pay_to".into(), "not-a-wallet".into());
+        assert_eq!(route(&e, bad, PROD).status, 400);
+        assert_eq!(route(&e, req("GET", "/v1/check", &[], ""), PROD).status, 400);
+        let js = route(&e, req("GET", "/guard.js", &[("Host", "trust.example.com")], ""), PROD);
+        assert!(js.content_type.starts_with("text/javascript") && js.body.contains("https://trust.example.com"));
     }
 
     fn new_key(e: &Mutex<Engine>) -> String {

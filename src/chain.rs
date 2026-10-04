@@ -407,6 +407,16 @@ impl Index {
         (total, hits.into_iter().skip(offset).take(limit).map(|(id, a, _)| (id, a)).collect())
     }
 
+    /// Registry bots tied to a wallet, as its payment wallet or its owner. Payment wallets come
+    /// first: that is the address a seller names when it asks to be paid.
+    pub fn by_address(&self, address: &str) -> Vec<u64> {
+        let a = address.to_ascii_lowercase();
+        let mut paid: Vec<u64> = self.agents.iter().filter(|(_, x)| x.wallet == a).map(|(id, _)| *id).collect();
+        let owned: Vec<u64> = self.agents.iter().filter(|(id, x)| x.owner == a && !paid.contains(id)).map(|(id, _)| *id).collect();
+        paid.extend(owned);
+        paid
+    }
+
     /// Hands out up to `n` bots whose registration file still needs reading, marking them taken
     /// so several readers never fetch the same one.
     fn needs_meta(&mut self, n: usize) -> Vec<(u64, String)> {

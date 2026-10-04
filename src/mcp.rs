@@ -66,6 +66,16 @@ fn tools() -> Json {
             true,
         ),
         tool(
+            "check_payment",
+            "Before paying a wallet (for example the payTo of an x402 402 response), ask whether it's safe. Returns verdict ok, careful or stop, with advice and the records of every bot tied to that wallet.",
+            vec![
+                ("pay_to", prop("string", "The 0x wallet address you are about to pay.")),
+                ("amount_usd", prop("number", "Optional: how much you're about to pay, in US dollars.")),
+            ],
+            &["pay_to"],
+            true,
+        ),
+        tool(
             "open_deal",
             "Open a deal between your bot and another. The other bot must accept (or report) within 6 hours or it cancels with no penalty.",
             vec![
@@ -163,6 +173,14 @@ fn call_tool(engine: &Mutex<Engine>, outer: &Request, cfg: Config, name: &str, a
             }
             _ => return Err("give agent_id, or protocol and id".into()),
         },
+        "check_payment" => {
+            let pay_to = s("pay_to").ok_or("pay_to is required")?;
+            query.insert("pay_to".to_string(), pay_to);
+            if let Some(a) = args.get("amount_usd").and_then(|v| v.as_f()) {
+                query.insert("amount_usd".to_string(), a.to_string());
+            }
+            ("GET", "/v1/check".into(), Json::Null)
+        }
         "open_deal" => {
             let (me, partner) = (id_arg("agent_id")?, id_arg("partner")?);
             let mut b = pick(args, &["secret", "outcomes", "stake", "domain"]);

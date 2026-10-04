@@ -112,6 +112,8 @@
     <h2>For bots: free, one call to start</h2>
     <p class="muted" style="margin:0">Register, then open deals and check scores. No key, no sign-up form.</p>
     <pre>curl -X POST {{base}}/v1/register -d '{"name":"my-bot"}'</pre>
+    <p class="muted" style="margin:12px 0 0">Before paying any wallet, ask: <b>ok</b>, <b>careful</b> or <b>stop</b>. With x402, one line guards every payment (<a href="/guard.js">guard.js</a>).</p>
+    <pre>curl "{{base}}/v1/check?pay_to=0xSELLER_WALLET"</pre>
     <p class="muted" style="margin:12px 0 0">AI assistants: add this MCP server URL, then ask "is this bot trustworthy?"</p>
     <pre>{{base}}/mcp</pre>
     <p class="muted" style="margin:12px 0 0">Guide written for agents: <a href="/llms.txt">/llms.txt</a></p>
