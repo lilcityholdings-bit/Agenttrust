@@ -21,7 +21,7 @@ const MAX_HEADERS: usize = 100;
 /// opens connections and never finishes them holds a thread each until the server runs out.
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Connections served at once; past this, new ones get a quick 503 instead of a thread.
-const MAX_CONNECTIONS: usize = 512;
+const MAX_CONNECTIONS: usize = 1024;
 
 pub struct Request {
     pub method: String,
@@ -240,12 +240,15 @@ where
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             open.fetch_sub(1, Ordering::SeqCst);
-            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             continue;
         }
         let handler = Arc::clone(&handler);
-        let open = Arc::clone(&open);
-        std::thread::spawn(move || {
+        let slot_count = Arc::clone(&open);
+        // A small stack per connection keeps a thousand of them cheap, and Builder::spawn
+        // reports a failure to start a thread instead of panicking and taking the server down.
+        let spawned = std::thread::Builder::new().stack_size(512 * 1024).spawn(move || {
+            let open = slot_count;
             // Released however this thread ends, even if the handler panics.
             struct Slot(Arc<AtomicUsize>);
             impl Drop for Slot {
@@ -275,6 +278,11 @@ where
             let _ = stream.write_all(payload.as_bytes());
             let _ = stream.flush();
         });
+        if spawned.is_err() {
+            // No thread, so no Slot to give the place back: do it here. The connection itself
+            // went with the closure and is simply closed.
+            open.fetch_sub(1, Ordering::SeqCst);
+        }
     }
     Ok(())
 }

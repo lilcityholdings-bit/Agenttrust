@@ -219,6 +219,9 @@ const FREE_LOOKUPS_PER_HOUR: u32 = 300;
 const FREE_WRITES_PER_HOUR: u32 = 120;
 /// New bot names per address per hour.
 const FREE_REGISTRATIONS_PER_HOUR: u32 = 20;
+/// New bots from everyone together, per hour: junk sign-ups from many addresses can't bloat
+/// the store or use up the shared write budget.
+const FREE_REGISTRATIONS_GLOBAL_PER_HOUR: u32 = 3_000;
 /// Across every free caller together, so a swarm of addresses can't fill memory with free deals.
 const FREE_WRITES_GLOBAL_PER_HOUR: u32 = 20_000;
 
@@ -234,12 +237,22 @@ fn rate_ok(bucket: &str, ip: &str, limit: u32, now: i64) -> bool {
 /// How many hits `(bucket, ip)` has this hour, counting this one when `hit` is set.
 fn rate_count(bucket: &str, ip: &str, now: i64, hit: bool) -> u32 {
     use std::collections::HashMap;
-    static WINDOWS: Mutex<Option<HashMap<String, (i64, u32)>>> = Mutex::new(None);
+    static WINDOWS: Mutex<Option<(HashMap<String, (i64, u32)>, i64)>> = Mutex::new(None);
     const HOUR: i64 = 60 * 60 * 1000;
+    // Past this many addresses at once, the oldest windows are dropped wholesale: a flood from
+    // countless addresses can't grow memory without end.
+    const MAX_TRACKED: usize = 300_000;
     let mut guard = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = guard.get_or_insert_with(HashMap::new);
-    if map.len() > 50_000 {
+    let (map, last_prune) = guard.get_or_insert_with(|| (HashMap::new(), 0));
+    // Expired windows are swept at most once a minute, never on every request: with many
+    // addresses active at once a sweep per request would itself slow everything down.
+    if map.len() > 50_000 && now - *last_prune > 60_000 {
         map.retain(|_, (start, _)| now - *start < HOUR);
+        *last_prune = now;
+        if map.len() > MAX_TRACKED {
+            // Lockouts for wrong admin secrets survive, so a flood can't be used to reset them.
+            map.retain(|k, _| k.starts_with("admin-fail|"));
+        }
     }
     let w = map.entry(format!("{bucket}|{ip}")).or_insert((now, 0));
     if now - w.0 >= HOUR {
@@ -862,7 +875,8 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             if !rate_ok("search", req.client_ip(), SEARCHES_PER_HOUR, now) {
                 return err(429, "too many searches from this address this hour — try again later");
             }
-            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            let mut idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            idx.prepare_search();
             return Response::html(botpages::directory(&idx, &q, req.q("sort") == Some("new"), page, &base_url(&req)));
         }
         ("GET", ["v1", "bots"]) => {
@@ -872,7 +886,8 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             if let Some(cid) = &customer_id {
                 engine.lock().unwrap_or_else(|e| e.into_inner()).meter_lookup(cid, now);
             }
-            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            let mut idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            idx.prepare_search();
             let offset = req.q("offset").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
             let limit = req.q("limit").and_then(|p| p.parse::<usize>().ok()).unwrap_or(50).clamp(1, 100);
             let (total, hits) = idx.search(req.q("q").unwrap_or(""), req.q("sort") == Some("new"), offset, limit);
@@ -960,7 +975,9 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
 
         // ---- one-call sign-up for a bot --------------------------------------------------
         ("POST", ["v1", "register"]) => {
-            if !rate_ok("register", req.client_ip(), FREE_REGISTRATIONS_PER_HOUR, now) {
+            if !rate_ok("register", req.client_ip(), FREE_REGISTRATIONS_PER_HOUR, now)
+                || !rate_ok("register-all", "*", FREE_REGISTRATIONS_GLOBAL_PER_HOUR, now)
+            {
                 return err(429, "too many new bots from this address this hour — try again later");
             }
             let name = match body.get("name").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty()) {

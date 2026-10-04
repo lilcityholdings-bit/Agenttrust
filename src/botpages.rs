@@ -553,6 +553,7 @@ mod tests {
         assert!(!html.contains("<img src=x"));
         assert!(!html.contains("href=\"javascript"));
         assert!(html.contains("&lt;script&gt;"));
+        idx.prepare_search();
         let dir = directory(&idx, "<script>", false, 0, "https://k.example");
         assert!(!dir.contains("<script>alert") && !dir.contains("value=\"<script>"));
         assert_eq!(js_string("</script><x>"), "\"\\u003c/script\\u003e\\u003cx\\u003e\"");

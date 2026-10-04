@@ -46,6 +46,8 @@ const MAX_STORED_REVIEWS: usize = 3_000_000;
 const REFRESH_READ_MS: i64 = 7 * 86_400_000;
 const RETRY_UNREADABLE_MS: i64 = 3 * 86_400_000;
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+/// Stands in for a profile that was carried inline in the registry record and already read.
+const INLINE_PREFIX: &str = "data:inline#";
 const MAX_REVIEWERS: usize = 5_000;
 /// Reviewers needed before reviews move a bot off `unknown`.
 const MIN_REVIEWERS: usize = 5;
@@ -102,7 +104,28 @@ pub struct Index {
     /// Wallet -> bots that list it as owner or payment wallet; rebuilt when stale.
     by_addr: std::collections::HashMap<String, Vec<u64>>,
     addr_stale: bool,
+    /// Bots pre-ranked for the directory, rebuilt at most once a minute (see `prepare_search`).
+    ranked: Option<Ranking>,
+    rank_stale: bool,
     dirty: bool,
+}
+
+/// Every bot in directory order, with what a search matches on, so a search walks a ready list
+/// instead of scoring and sorting the whole registry each time.
+struct Ranking {
+    built: Instant,
+    /// Most independently reviewed first.
+    by_reviews: Vec<RankRow>,
+    /// Newest first.
+    by_newest: Vec<RankRow>,
+}
+
+/// What a search matches on, kept beside the order so matching never looks a bot up.
+struct RankRow {
+    id: u64,
+    name: String,
+    owner: String,
+    wallet: String,
 }
 
 struct Topics {
@@ -240,7 +263,16 @@ impl Index {
                 self.addr_stale = true;
             } else if t0 == tp.registered || t0 == tp.uri_updated {
                 let Some(id) = id() else { return };
-                let uri = clean(&abi_string(&data, 0).unwrap_or_default(), 4096);
+                let raw = abi_string(&data, 0).unwrap_or_default();
+                // A profile carried inside the record itself ("data:" URI) is read right here, and
+                // only a short fingerprint of it is kept: storing tens of thousands of these whole
+                // was most of this index's memory.
+                let inline = raw.trim_start().starts_with("data:").then(|| fetch_meta(&raw));
+                let uri = if inline.is_some() {
+                    format!("{INLINE_PREFIX}{:016x}", crate::hash::fnv1a64(raw.as_bytes()))
+                } else {
+                    clean(&raw, 2048)
+                };
                 let a = self.agents.entry(id).or_default();
                 if t0 == tp.registered {
                     a.block = block;
@@ -253,6 +285,9 @@ impl Index {
                     a.uri = uri;
                     a.meta = 0;
                     a.tries = 0;
+                    if let Some(m) = inline {
+                        apply_meta(a, m);
+                    }
                 }
             } else if t0 == tp.metadata_set && ts.get(2).map(|t| t.to_ascii_lowercase()) == Some(tp.agent_wallet_key.clone()) {
                 let Some(id) = id() else { return };
@@ -311,6 +346,7 @@ impl Index {
             return;
         }
         self.dirty = true;
+        self.rank_stale = true;
     }
 
     pub fn reviews(&self, a: &Agent) -> Reviews {
@@ -443,27 +479,56 @@ impl Index {
 
     /// Bots matching `q` (a name fragment, a bot number, or an owner/wallet address), best
     /// reviewed or newest first. Returns the total match count and one page.
+    /// Rebuilds the directory ranking if it has gone stale, at most once a minute: a listing a
+    /// minute behind is fine, and ranking every bot on every search is what limited throughput.
+    pub fn prepare_search(&mut self) {
+        let fresh = !cfg!(test)
+            && self.ranked.as_ref().map_or(false, |r| !self.rank_stale || r.built.elapsed() < Duration::from_secs(60));
+        if fresh {
+            return;
+        }
+        let mut rows: Vec<(u64, &Agent, usize)> = self.agents.iter().map(|(id, a)| (*id, a, self.reviews(a).reviewers)).collect();
+        rows.sort_by(|x, y| y.2.cmp(&x.2).then(y.1.block.cmp(&x.1.block)).then(y.0.cmp(&x.0)));
+        let row = |(id, a, _): &(u64, &Agent, usize)| RankRow {
+            id: *id,
+            name: a.name.to_ascii_lowercase(),
+            owner: a.owner.clone(),
+            wallet: a.wallet.clone(),
+        };
+        let by_reviews: Vec<RankRow> = rows.iter().map(row).collect();
+        rows.sort_by(|x, y| y.1.block.cmp(&x.1.block).then(y.0.cmp(&x.0)));
+        let by_newest: Vec<RankRow> = rows.iter().map(row).collect();
+        self.ranked = Some(Ranking { built: Instant::now(), by_reviews, by_newest });
+        self.rank_stale = false;
+    }
+
+    /// Bots matching `q` (a name fragment, a bot number, or an owner/wallet address), best
+    /// reviewed or newest first. Returns the total match count and one page. Call
+    /// `prepare_search` first; without a ranking this answers nothing.
     pub fn search(&self, q: &str, newest: bool, offset: usize, limit: usize) -> (usize, Vec<(u64, &Agent)>) {
+        let Some(ranked) = &self.ranked else { return (0, Vec::new()) };
+        let order = if newest { &ranked.by_newest } else { &ranked.by_reviews };
         let q = q.trim().to_ascii_lowercase();
         let number = q.trim_start_matches('#').parse::<u64>().ok();
-        let mut hits: Vec<(u64, &Agent, usize)> = self
-            .agents
-            .iter()
-            .filter(|(id, a)| {
-                q.is_empty()
-                    || Some(**id) == number
-                    || (q.starts_with("0x") && (a.owner.starts_with(&q) || a.wallet.starts_with(&q)))
-                    || a.name.to_ascii_lowercase().contains(&q)
-            })
-            .map(|(id, a)| (*id, a, self.reviews(a).reviewers))
-            .collect();
-        if newest {
-            hits.sort_by(|x, y| y.1.block.cmp(&x.1.block).then(y.0.cmp(&x.0)));
-        } else {
-            hits.sort_by(|x, y| y.2.cmp(&x.2).then(y.1.block.cmp(&x.1.block)).then(y.0.cmp(&x.0)));
+        let page_of = |ids: Vec<u64>| ids.into_iter().filter_map(|id| self.agents.get(&id).map(|a| (id, a))).collect();
+        if q.is_empty() {
+            return (order.len(), page_of(order.iter().skip(offset).take(limit).map(|r| r.id).collect()));
         }
-        let total = hits.len();
-        (total, hits.into_iter().skip(offset).take(limit).map(|(id, a, _)| (id, a)).collect())
+        let address = q.starts_with("0x");
+        let mut total = 0;
+        let mut ids = Vec::new();
+        for r in order {
+            let hit = Some(r.id) == number
+                || (address && (r.owner.starts_with(&q) || r.wallet.starts_with(&q)))
+                || (!address && r.name.contains(&q));
+            if hit {
+                if total >= offset && ids.len() < limit {
+                    ids.push(r.id);
+                }
+                total += 1;
+            }
+        }
+        (total, page_of(ids))
     }
 
     /// Registry bots tied to a wallet, as its payment wallet or its owner. Payment wallets come
@@ -507,7 +572,7 @@ impl Index {
                 if out.len() >= n {
                     return out;
                 }
-                if !a.uri.is_empty() && due(a, pass) {
+                if !a.uri.is_empty() && !a.uri.starts_with(INLINE_PREFIX) && due(a, pass) {
                     if pass == 2 {
                         a.tries = 2; // one more try; a failure leaves it unreadable for another while
                     }
@@ -525,21 +590,9 @@ impl Index {
             return; // changed while we were fetching; the new one is queued (meta was reset to 0)
         }
         a.meta_at = now_ms;
-        match meta {
-            Ok(m) => {
-                a.tries = 0;
-                a.name = m.name;
-                a.description = m.description;
-                a.services = m.services;
-                a.x402 = m.x402;
-                a.meta = 1;
-            }
-            Err(_) => {
-                a.tries += 1;
-                a.meta = if a.tries >= 3 { 2 } else { 0 };
-            }
-        }
+        apply_meta(a, meta);
         self.dirty = true;
+        self.rank_stale = true;
     }
 
     // ---- the "State of AI bots" numbers ------------------------------------------------------
@@ -685,106 +738,153 @@ impl Index {
 
     // ---- persistence ------------------------------------------------------------------------
 
-    pub fn to_json(&self) -> Json {
-        let agents = self
-            .agents
+    fn agent_json(id: u64, a: &Agent) -> Json {
+        let reviews = a
+            .reviews
             .iter()
-            .map(|(id, a)| {
-                let reviews = a
-                    .reviews
-                    .iter()
-                    .flat_map(|(client, per)| {
-                        per.iter().map(move |(i, (r, revoked))| {
-                            Json::Array(vec![
-                                Json::str(client.clone()),
-                                Json::num(*i as f64),
-                                r.map(|r| Json::num(r as f64)).unwrap_or(Json::Null),
-                                Json::Bool(*revoked),
-                            ])
-                        })
-                    })
-                    .collect();
-                Json::obj(vec![
-                    ("id", Json::num(*id as f64)),
-                    ("owner", Json::str(a.owner.clone())),
-                    ("wallet", Json::str(a.wallet.clone())),
-                    ("uri", Json::str(a.uri.clone())),
-                    ("block", Json::num(a.block as f64)),
-                    ("name", Json::str(a.name.clone())),
-                    ("description", Json::str(a.description.clone())),
-                    (
-                        "services",
-                        Json::Array(
-                            a.services.iter().map(|(n, e)| Json::Array(vec![Json::str(n.clone()), Json::str(e.clone())])).collect(),
-                        ),
-                    ),
-                    ("x402", Json::Bool(a.x402)),
-                    ("meta", Json::num(a.meta as f64)),
-                    ("tries", Json::num(a.tries as f64)),
-                    ("moved_block", Json::num(a.moved_block as f64)),
-                    ("meta_at", Json::num(a.meta_at as f64)),
-                    ("reviews", Json::Array(reviews)),
-                ])
+            .flat_map(|(client, per)| {
+                per.iter().map(move |(i, (r, revoked))| {
+                    Json::Array(vec![
+                        Json::str(client.clone()),
+                        Json::num(*i as f64),
+                        r.map(|r| Json::num(r as f64)).unwrap_or(Json::Null),
+                        Json::Bool(*revoked),
+                    ])
+                })
             })
             .collect();
         Json::obj(vec![
-            ("version", Json::num(1.0)),
-            ("chain_id", Json::num(CHAIN_ID as f64)),
-            ("cursor", Json::num(self.cursor as f64)),
-            ("head", Json::num(self.head as f64)),
-            ("agents", Json::Array(agents)),
+            ("id", Json::num(id as f64)),
+            ("owner", Json::str(a.owner.clone())),
+            ("wallet", Json::str(a.wallet.clone())),
+            ("uri", Json::str(a.uri.clone())),
+            ("block", Json::num(a.block as f64)),
+            ("name", Json::str(a.name.clone())),
+            ("description", Json::str(a.description.clone())),
+            (
+                "services",
+                Json::Array(a.services.iter().map(|(n, e)| Json::Array(vec![Json::str(n.clone()), Json::str(e.clone())])).collect()),
+            ),
+            ("x402", Json::Bool(a.x402)),
+            ("meta", Json::num(a.meta as f64)),
+            ("tries", Json::num(a.tries as f64)),
+            ("moved_block", Json::num(a.moved_block as f64)),
+            ("meta_at", Json::num(a.meta_at as f64)),
+            ("reviews", Json::Array(reviews)),
         ])
     }
 
+    fn agent_from_json(aj: &Json) -> (u64, Agent) {
+        let n = |j: &Json, k: &str| j.get(k).and_then(|v| v.as_f()).unwrap_or(0.0) as u64;
+        let s = |j: &Json, k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut a = Agent {
+            owner: s(aj, "owner"),
+            wallet: s(aj, "wallet"),
+            uri: s(aj, "uri"),
+            block: n(aj, "block"),
+            name: s(aj, "name"),
+            description: s(aj, "description"),
+            x402: matches!(aj.get("x402"), Some(Json::Bool(true))),
+            // A read cut short by a restart is simply read again.
+            meta: match n(aj, "meta") as u8 {
+                3 => 0,
+                m => m,
+            },
+            tries: n(aj, "tries") as u8,
+            moved_block: n(aj, "moved_block"),
+            meta_at: n(aj, "meta_at") as i64,
+            ..Agent::default()
+        };
+        // Files saved before inline profiles were fingerprinted still carry them whole.
+        if a.uri.starts_with("data:") && !a.uri.starts_with(INLINE_PREFIX) {
+            let raw = std::mem::take(&mut a.uri);
+            a.uri = format!("{INLINE_PREFIX}{:016x}", crate::hash::fnv1a64(raw.as_bytes()));
+            if a.meta != 1 {
+                apply_meta(&mut a, fetch_meta(&raw));
+            }
+        }
+        if let Some(Json::Array(svcs)) = aj.get("services") {
+            for sv in svcs {
+                if let Json::Array(p) = sv {
+                    if let (Some(name), Some(e)) = (p.first().and_then(|v| v.as_str()), p.get(1).and_then(|v| v.as_str())) {
+                        a.services.push((name.to_string(), e.to_string()));
+                    }
+                }
+            }
+        }
+        if let Some(Json::Array(revs)) = aj.get("reviews") {
+            for rv in revs {
+                let Json::Array(p) = rv else { continue };
+                let (Some(client), Some(i)) = (p.first().and_then(|v| v.as_str()), p.get(1).and_then(|v| v.as_f())) else {
+                    continue;
+                };
+                let r = p.get(2).and_then(|v| v.as_f()).map(|f| f as f32);
+                let revoked = matches!(p.get(3), Some(Json::Bool(true)));
+                a.reviews.entry(client.to_string()).or_default().insert(i as u64, (r, revoked));
+            }
+        }
+        (n(aj, "id"), a)
+    }
+
+    fn insert_loaded(&mut self, id: u64, a: Agent) {
+        for (client, per) in &a.reviews {
+            *self.reach.entry(client.clone()).or_insert(0) += 1;
+            self.stored_reviews += per.len();
+        }
+        self.agents.insert(id, a);
+    }
+
+    fn header_json(&self) -> Json {
+        Json::obj(vec![
+            ("version", Json::num(2.0)),
+            ("chain_id", Json::num(CHAIN_ID as f64)),
+            ("cursor", Json::num(self.cursor as f64)),
+            ("head", Json::num(self.head as f64)),
+        ])
+    }
+
+    /// Writes the index one line per bot (a header line first), so saving never builds the
+    /// whole index as one giant value in memory.
+    pub fn write_lines(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(out, "{}", self.header_json().to_string())?;
+        for (id, a) in &self.agents {
+            writeln!(out, "{}", Index::agent_json(*id, a).to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Reads what `write_lines` wrote, one line at a time.
+    pub fn read_lines(input: impl std::io::BufRead) -> Option<Index> {
+        let mut lines = input.lines();
+        let header = json::parse(&lines.next()?.ok()?).ok()?;
+        if header.get("chain_id").and_then(|v| v.as_f()) != Some(CHAIN_ID as f64) {
+            return None;
+        }
+        let n = |k: &str| header.get(k).and_then(|v| v.as_f()).unwrap_or(0.0) as u64;
+        let mut idx = Index { cursor: n("cursor"), head: n("head"), addr_stale: true, ..Index::default() };
+        for line in lines {
+            let Ok(line) = line else { return None };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(aj) = json::parse(&line) else { return None };
+            let (id, a) = Index::agent_from_json(&aj);
+            idx.insert_loaded(id, a);
+        }
+        Some(idx)
+    }
+
+    /// The older single-document format, still read so an upgrade keeps what was indexed.
     pub fn from_json(j: &Json) -> Option<Index> {
         if j.get("chain_id").and_then(|v| v.as_f()) != Some(CHAIN_ID as f64) {
             return None;
         }
-        let n = |j: &Json, k: &str| j.get(k).and_then(|v| v.as_f()).unwrap_or(0.0) as u64;
-        let s = |j: &Json, k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let mut idx = Index { cursor: n(j, "cursor"), head: n(j, "head"), addr_stale: true, ..Index::default() };
+        let n = |k: &str| j.get(k).and_then(|v| v.as_f()).unwrap_or(0.0) as u64;
+        let mut idx = Index { cursor: n("cursor"), head: n("head"), addr_stale: true, ..Index::default() };
         if let Some(Json::Array(agents)) = j.get("agents") {
             for aj in agents {
-                let mut a = Agent {
-                    owner: s(aj, "owner"),
-                    wallet: s(aj, "wallet"),
-                    uri: s(aj, "uri"),
-                    block: n(aj, "block"),
-                    name: s(aj, "name"),
-                    description: s(aj, "description"),
-                    x402: matches!(aj.get("x402"), Some(Json::Bool(true))),
-                    // A read cut short by a restart is simply read again.
-                    meta: match n(aj, "meta") as u8 { 3 => 0, m => m },
-                    tries: n(aj, "tries") as u8,
-                    moved_block: n(aj, "moved_block"),
-                    meta_at: n(aj, "meta_at") as i64,
-                    ..Agent::default()
-                };
-                if let Some(Json::Array(svcs)) = aj.get("services") {
-                    for sv in svcs {
-                        if let Json::Array(p) = sv {
-                            if let (Some(name), Some(e)) = (p.first().and_then(|v| v.as_str()), p.get(1).and_then(|v| v.as_str())) {
-                                a.services.push((name.to_string(), e.to_string()));
-                            }
-                        }
-                    }
-                }
-                if let Some(Json::Array(revs)) = aj.get("reviews") {
-                    for rv in revs {
-                        let Json::Array(p) = rv else { continue };
-                        let (Some(client), Some(i)) = (p.first().and_then(|v| v.as_str()), p.get(1).and_then(|v| v.as_f())) else {
-                            continue;
-                        };
-                        let r = p.get(2).and_then(|v| v.as_f()).map(|f| f as f32);
-                        let revoked = matches!(p.get(3), Some(Json::Bool(true)));
-                        a.reviews.entry(client.to_string()).or_default().insert(i as u64, (r, revoked));
-                    }
-                }
-                for (client, per) in &a.reviews {
-                    *idx.reach.entry(client.clone()).or_insert(0) += 1;
-                    idx.stored_reviews += per.len();
-                }
-                idx.agents.insert(n(aj, "id"), a);
+                let (id, a) = Index::agent_from_json(aj);
+                idx.insert_loaded(id, a);
             }
         }
         Some(idx)
@@ -792,6 +892,23 @@ impl Index {
 }
 
 // ---- registration files --------------------------------------------------------------------
+
+fn apply_meta(a: &mut Agent, meta: Result<Meta, String>) {
+    match meta {
+        Ok(m) => {
+            a.tries = 0;
+            a.name = m.name;
+            a.description = m.description;
+            a.services = m.services;
+            a.x402 = m.x402;
+            a.meta = 1;
+        }
+        Err(_) => {
+            a.tries += 1;
+            a.meta = if a.tries >= 3 { 2 } else { 0 };
+        }
+    }
+}
 
 #[derive(Debug, Default, PartialEq)]
 struct Meta {
@@ -876,7 +993,7 @@ fn fetch_meta(uri: &str) -> Result<Meta, String> {
         Source::Url(u) => {
             // Public addresses only: a bot can't point this server at its own private network.
             let agent = ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(6))
                 .redirects(3)
                 .resolver(verify::PublicOnly)
                 .build();
@@ -925,7 +1042,8 @@ fn rpc(url: &str, method: &str, params: Json) -> Result<Json, String> {
 }
 
 fn save(path: &PathBuf) {
-    let body = {
+    let tmp = path.with_extension("jsonl.tmp");
+    let written = {
         let mut idx = lock();
         if !idx.dirty {
             return;
@@ -940,11 +1058,16 @@ fn save(path: &PathBuf) {
             idx.head,
             if idx.last_error.is_empty() { String::new() } else { format!(" — last error: {}", idx.last_error) }
         );
-        idx.to_json().to_string()
+        // Streamed to disk line by line while locked: a fraction of a second, and no second
+        // copy of the index in memory.
+        std::fs::File::create(&tmp).and_then(|f| {
+            let mut w = std::io::BufWriter::new(f);
+            idx.write_lines(&mut w)?;
+            std::io::Write::flush(&mut w)?;
+            w.get_ref().sync_all()
+        })
     };
-    let tmp = path.with_extension("json.tmp");
-    let written = std::fs::write(&tmp, body.as_bytes()).and_then(|_| std::fs::rename(&tmp, path));
-    if let Err(e) = written {
+    if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, path)) {
         eprintln!("keptvow: could not save the bot registry index: {e}");
         lock().dirty = true;
     }
@@ -952,18 +1075,32 @@ fn save(path: &PathBuf) {
 
 /// Loads the saved index from `dir` and starts both readers. Call once, at boot.
 pub fn start(dir: PathBuf, rpc_url: String) {
-    let path = dir.join("onchain.json");
+    let path = dir.join("onchain.jsonl");
+    let old_path = dir.join("onchain.json");
     let start_block = std::env::var("ERC8004_START_BLOCK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_START_BLOCK);
-    let loaded = std::fs::read_to_string(&path).ok().and_then(|s| json::parse(&s).ok()).and_then(|j| Index::from_json(&j));
+    let loaded = match std::fs::File::open(&path) {
+        Ok(f) => Index::read_lines(std::io::BufReader::new(f)),
+        // Upgrading from the single-document file: read it once, then it's replaced below.
+        Err(_) => std::fs::read_to_string(&old_path).ok().and_then(|s| json::parse(&s).ok()).and_then(|j| Index::from_json(&j)),
+    };
+    let migrated = loaded.is_some() && !path.exists();
     {
         let mut idx = lock();
         *idx = loaded.unwrap_or_else(|| Index::starting_at(start_block.saturating_sub(1)));
         println!("keptvow: bot registry index: {} bots, read up to block {}", idx.agents.len(), idx.cursor);
+        idx.dirty = migrated;
+    }
+    if migrated {
+        save(&path);
+        if path.exists() {
+            let _ = std::fs::remove_file(&old_path);
+        }
     }
     let logs_url = rpc_url.clone();
     std::thread::spawn(move || read_logs(logs_url, path));
-    // Most of the wait is on other people's servers, so several readers share the queue.
-    for _ in 0..4 {
+    // Most of the wait is on other people's servers (many never answer), so several readers
+    // share the queue.
+    for _ in 0..12 {
         std::thread::spawn(read_registration_files);
     }
 }
@@ -1234,7 +1371,9 @@ pub(crate) mod tests {
         let (level, reasons) = idx.assess(&idx.agents[&3]);
         assert_eq!(level, "unknown");
         assert!(reasons.iter().any(|x| x.contains("not counted")));
-        let back = Index::from_json(&json::parse(&idx.to_json().to_string()).unwrap()).unwrap();
+        let mut buf = Vec::new();
+        idx.write_lines(&mut buf).unwrap();
+        let back = Index::read_lines(std::io::Cursor::new(buf)).unwrap();
         assert_eq!(back.reviews(&back.agents[&3]).mass, 6, "who is a mass reviewer survives a restart");
     }
 
@@ -1245,9 +1384,22 @@ pub(crate) mod tests {
         idx.apply(&feedback(3, &client(1), 1, 80, 0, ""));
         idx.agents.get_mut(&3).unwrap().name = "Weather Bot".into();
         idx.agents.get_mut(&3).unwrap().services.push(("MCP".into(), "https://w.example/mcp".into()));
-        let back = Index::from_json(&json::parse(&idx.to_json().to_string()).unwrap()).unwrap();
+        let mut buf = Vec::new();
+        idx.write_lines(&mut buf).unwrap();
+        let back = Index::read_lines(std::io::Cursor::new(buf)).unwrap();
         assert_eq!(back.cursor, 123);
         assert_eq!(back.agents, idx.agents);
+    }
+
+    #[test]
+    fn an_inline_profile_is_read_at_once_and_kept_as_a_fingerprint() {
+        let mut idx = Index::starting_at(0);
+        let uri = format!("data:application/json,{}", "%7B%22name%22%3A%22Inline%20Bot%22%7D");
+        idx.apply(&registered(77, "0x00000000000000000000000000000000000000aa", &uri, 5));
+        let a = &idx.agents[&77];
+        assert_eq!((a.name.as_str(), a.meta), ("Inline Bot", 1));
+        assert!(a.uri.starts_with(INLINE_PREFIX) && a.uri.len() < 40, "{}", a.uri);
+        assert!(idx.needs_meta(10, i64::MAX / 2).is_empty(), "nothing to fetch, now or on refresh");
     }
 
     #[test]
@@ -1307,6 +1459,7 @@ pub(crate) mod tests {
             idx.apply(&registered(id, &format!("0x{:040x}", id), "", id * 10));
             idx.agents.get_mut(&id).unwrap().name = name.into();
         }
+        idx.prepare_search();
         assert_eq!(idx.search("weather", true, 0, 10).1.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![3, 1]);
         assert_eq!(idx.search("#2", true, 0, 10).1.len(), 1);
         assert_eq!(idx.search(&format!("0x{:040x}", 3), true, 0, 10).1[0].0, 3);
