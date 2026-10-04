@@ -263,6 +263,7 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
             | ("GET", ["trust", ..])
             | ("GET", ["bots", ..])
             | ("GET", ["sitemap.xml"])
+            | ("GET", ["sitemaps", _])
             | ("GET", ["robots.txt"])
             | ("GET", ["guard.js"])
             | ("GET", ["stats"])
@@ -475,11 +476,21 @@ fn registry_ref(external_id: &str) -> Option<String> {
     }
 }
 
-/// The Keptvow account that proved it owns this registry bot, if any.
+/// The Keptvow account that proved it owns this registry bot, if any. A claim made before the
+/// bot last changed hands (or changed its payment wallet) was made by whoever controlled it
+/// then, so it stops counting until the new controller claims it.
 fn registry_owner<'a>(engine: &'a Engine, agent_ref: &str) -> Option<&'a str> {
     let n = registry_ref_number(agent_ref)?;
     let ext = verify::normalize("erc8004", &format!("{}:{n}", chain::CHAIN_ID)).ok()?;
-    engine.verified_owner_of("erc8004", &ext)
+    let owner = engine.verified_owner_of("erc8004", &ext)?;
+    let moved = chain::index().lock().unwrap_or_else(|e| e.into_inner()).agents.get(&n).map_or(0, |a| a.moved_block);
+    if moved > 0 {
+        let claimed_at = engine.verification_time(owner, "erc8004", &ext).unwrap_or(0);
+        if claimed_at < chain::Index::block_ms(moved) {
+            return None;
+        }
+    }
+    Some(owner)
 }
 
 /// The profile for a bot in the on-chain registry: once claimed, the Keptvow record of the
@@ -526,6 +537,10 @@ fn any_profile(engine: &Engine, agent_id: &str, now: i64) -> Json {
     engine.trust_profile_json(agent_id, now)
 }
 
+/// Directory views and searches, per address per hour. Each one ranks every registry bot, so
+/// they get their own limit even though single bot pages are free.
+const SEARCHES_PER_HOUR: u32 = 300;
+
 /// Above this, a bot with only a `fair` record is worth a second look before paying.
 const CAREFUL_ABOVE_USD: f64 = 100.0;
 
@@ -553,7 +568,22 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
         "excellent" => 4,
         _ => 1,
     };
-    let level_of = |p: &Json| p.get("trust_level").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    // Public reviews alone are cheap to fake in either direction — a handful of fresh wallets can
+    // praise a scam or smear an honest seller — so on their own they never decide a payment:
+    // a review-only record reads as "unknown" here, and only a record built from deals settled
+    // through Keptvow can say ok or stop.
+    let level_of = |p: &Json| {
+        let level = p.get("trust_level").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let reviews_only = p.get("registry").is_some() && p.get("claimed_by").map_or(true, |c| matches!(c, Json::Null));
+        if reviews_only {
+            "unknown".to_string()
+        } else {
+            level
+        }
+    };
+    let flagged_by_reviews = matches.iter().any(|p| {
+        p.get("registry").is_some() && p.get("trust_level").and_then(|v| v.as_str()) == Some("caution")
+    });
     // The worst record decides: one wallet behind a scam bot and a clean one is still a risk.
     let worst = matches.iter().map(|p| level_of(p)).min_by_key(|l| rank(l));
     let big = amount_usd.map_or(false, |a| a > CAREFUL_ABOVE_USD);
@@ -563,13 +593,25 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
             "careful",
             "No bot Keptvow knows of is behind this wallet — no track record. Pay only what you can afford to lose.".to_string(),
         ),
+        Some("unknown") if flagged_by_reviews => (
+            "careful",
+            "Many public reviews of the bot behind this wallet are bad, but it has no deal record here to confirm it. \
+             Pay only what you can afford to lose."
+                .to_string(),
+        ),
         Some("unknown") => (
             "careful",
-            "The bot behind this wallet has no track record yet. Pay only what you can afford to lose.".to_string(),
+            "The bot behind this wallet has no deal record yet. Pay only what you can afford to lose.".to_string(),
         ),
-        Some("fair") if big => (
+        // Fair is real history, but not yet history that is hard to fake: a bot can get there
+        // trading with its own second account.
+        Some("fair") => (
             "careful",
-            format!("A fair record, but not yet strong enough for a payment over ${CAREFUL_ABOVE_USD:.0}. Consider splitting it."),
+            if big {
+                format!("A fair record, but not one that is hard to fake yet — too thin for a payment over ${CAREFUL_ABOVE_USD:.0}. Consider splitting it.")
+            } else {
+                "A fair record, but not one that is hard to fake yet. Fine for small payments.".to_string()
+            },
         ),
         Some(level) => ("ok", format!("The bot behind this wallet has a {level} record.")),
     };
@@ -654,17 +696,18 @@ fn sweep_watches(engine: &Mutex<Engine>, now: i64) {
     if targets.is_empty() {
         return;
     }
-    let levels: Vec<(String, String, String, Vec<String>)> = {
+    // A couple of hundred at a time, letting go of the engine in between, so a customer watching
+    // thousands of targets never holds up anyone's trust check.
+    let mut levels: Vec<(String, String, String, Vec<String>)> = Vec::with_capacity(targets.len());
+    for chunk in targets.chunks(200) {
         let e = engine.lock().unwrap_or_else(|e| e.into_inner());
-        targets
-            .into_iter()
-            .filter(|(c, _)| e.customer(c).map_or(false, |c| c.active && c.paid_until_ms.map_or(true, |t| now < t)))
-            .map(|(c, t)| {
-                let (level, reasons) = target_level(&e, &t, now);
-                (c, t, level, reasons)
-            })
-            .collect()
-    };
+        for (c, t) in chunk {
+            if e.customer(c).map_or(false, |c| c.active && c.paid_until_ms.map_or(true, |t| now < t)) {
+                let (level, reasons) = target_level(&e, t, now);
+                levels.push((c.clone(), t.clone(), level, reasons));
+            }
+        }
+    }
     let deliveries: Vec<(String, watch::Alert, String)> = {
         let mut w = watch::lock();
         levels
@@ -675,9 +718,23 @@ fn sweep_watches(engine: &Mutex<Engine>, now: i64) {
             })
             .collect()
     };
-    for (url, alert, secret) in deliveries.iter().take(200) {
-        watch::deliver(url, alert, secret);
+    if deliveries.is_empty() {
+        return;
     }
+    // Webhooks go out on their own thread: a slow or dead receiver must never stall the job that
+    // also confirms payments. A receiver that fails once is skipped for the rest of this round
+    // (its alerts stay readable at /v1/alerts).
+    std::thread::spawn(move || {
+        let mut failing: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (url, alert, secret) in deliveries.into_iter().take(1_000) {
+            if failing.contains(&url) {
+                continue;
+            }
+            if !watch::deliver(&url, &alert, &secret) {
+                failing.insert(url);
+            }
+        }
+    });
 }
 
 /// A shields-style SVG badge. Only numbers and fixed words go into it — never the agent id — so
@@ -720,7 +777,6 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
     };
     let now = clock(&req, &body, cfg);
     let method = req.method.as_str();
-    count_traffic(&req, &segments, now);
 
     match (method, segments.as_slice()) {
         ("GET", ["llms.txt"]) | ("GET", ["skill.md"]) => {
@@ -792,6 +848,71 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         if engine.lock().unwrap_or_else(|e| e.into_inner()).check_admin(supplied).is_err() {
             rate_count("admin-fail", req.client_ip(), now, true);
         }
+    }
+
+    // Counted only once a request has got past the limits, so a flood can't inflate the numbers.
+    count_traffic(&req, &segments, now);
+
+    // Searching and listing the registry read only the registry index, so they run without the
+    // engine's lock (a slow search must never hold up a trust check), behind their own limit.
+    match (method, segments.as_slice()) {
+        ("GET", ["bots"]) => {
+            let q = req.q("q").unwrap_or("").trim().to_string();
+            let page = req.q("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0).min(10_000);
+            if !rate_ok("search", req.client_ip(), SEARCHES_PER_HOUR, now) {
+                return err(429, "too many searches from this address this hour — try again later");
+            }
+            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            return Response::html(botpages::directory(&idx, &q, req.q("sort") == Some("new"), page, &base_url(&req)));
+        }
+        ("GET", ["v1", "bots"]) => {
+            if !rate_ok("search", req.client_ip(), SEARCHES_PER_HOUR, now) {
+                return err(429, "too many searches from this address this hour — try again later");
+            }
+            if let Some(cid) = &customer_id {
+                engine.lock().unwrap_or_else(|e| e.into_inner()).meter_lookup(cid, now);
+            }
+            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            let offset = req.q("offset").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
+            let limit = req.q("limit").and_then(|p| p.parse::<usize>().ok()).unwrap_or(50).clamp(1, 100);
+            let (total, hits) = idx.search(req.q("q").unwrap_or(""), req.q("sort") == Some("new"), offset, limit);
+            return ok(Json::obj(vec![
+                ("total", Json::num(total as f64)),
+                ("offset", Json::num(offset as f64)),
+                (
+                    "bots",
+                    Json::Array(
+                        hits.iter()
+                            .map(|(id, a)| {
+                                let r = idx.reviews(a);
+                                Json::obj(vec![
+                                    ("agent_id", Json::str(format!("erc8004:{}:{id}", chain::CHAIN_ID))),
+                                    ("name", Json::str(chain::Index::display_name(*id, a))),
+                                    ("trust_level", Json::str(idx.assess(a).0)),
+                                    ("reviewers", Json::num(r.reviewers as f64)),
+                                    ("profile_page", Json::str(format!("/bots/{}/{id}", chain::CHAIN_NAME))),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                ("registry_read_to_block", Json::num(idx.cursor as f64)),
+                ("registry_head_block", Json::num(idx.head as f64)),
+            ]));
+        }
+        ("GET", ["sitemap.xml"]) => {
+            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            return Response { status: 200, content_type: "application/xml; charset=utf-8", body: botpages::sitemap_index(&idx, &base_url(&req)) };
+        }
+        ("GET", ["sitemaps", file]) => {
+            let Some(n) = file.strip_suffix(".xml").and_then(|n| n.parse::<usize>().ok()) else { return err(404, "no such sitemap") };
+            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            return match botpages::sitemap_part(&idx, n, &base_url(&req)) {
+                Some(body) => Response { status: 200, content_type: "application/xml; charset=utf-8", body },
+                None => err(404, "no such sitemap"),
+            };
+        }
+        _ => {}
     }
 
     // Routes that call out to the network run with the engine unlocked.
@@ -917,11 +1038,6 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         }
 
         // ---- every bot in the public on-chain registry ----------------------------------
-        ("GET", ["bots"]) => {
-            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
-            let page = req.q("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0).min(10_000);
-            Response::html(botpages::directory(&idx, req.q("q").unwrap_or("").trim(), req.q("sort") == Some("new"), page, &base_url(&req)))
-        }
         ("GET", ["bots", chain_name, n]) if *chain_name == chain::CHAIN_NAME => {
             let Ok(n) = n.parse::<u64>() else { return err(404, "no such bot") };
             let agent_ref = format!("erc8004:{}:{n}", chain::CHAIN_ID);
@@ -941,35 +1057,6 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     ),
                 },
             }
-        }
-        ("GET", ["v1", "bots"]) => {
-            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
-            let offset = req.q("offset").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
-            let limit = req.q("limit").and_then(|p| p.parse::<usize>().ok()).unwrap_or(50).clamp(1, 100);
-            let (total, hits) = idx.search(req.q("q").unwrap_or(""), req.q("sort") == Some("new"), offset, limit);
-            ok(Json::obj(vec![
-                ("total", Json::num(total as f64)),
-                ("offset", Json::num(offset as f64)),
-                (
-                    "bots",
-                    Json::Array(
-                        hits.iter()
-                            .map(|(id, a)| {
-                                let r = idx.reviews(a);
-                                Json::obj(vec![
-                                    ("agent_id", Json::str(format!("erc8004:{}:{id}", chain::CHAIN_ID))),
-                                    ("name", Json::str(chain::Index::display_name(*id, a))),
-                                    ("trust_level", Json::str(idx.assess(a).0)),
-                                    ("reviewers", Json::num(r.reviewers as f64)),
-                                    ("profile_page", Json::str(format!("/bots/{}/{id}", chain::CHAIN_NAME))),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ),
-                ("registry_read_to_block", Json::num(idx.cursor as f64)),
-                ("registry_head_block", Json::num(idx.head as f64)),
-            ]))
         }
         ("GET", ["v1", "bots", chain_name, n]) if *chain_name == chain::CHAIN_NAME => {
             match n.parse::<u64>().ok().and_then(|n| registry_profile(&engine, &format!("erc8004:{}:{n}", chain::CHAIN_ID), now)) {
@@ -1151,11 +1238,6 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             status: 200,
             content_type: "text/javascript; charset=utf-8",
             body: GUARD_JS.replace("{URL}", &base_url(&req)),
-        },
-        ("GET", ["sitemap.xml"]) => Response {
-            status: 200,
-            content_type: "application/xml; charset=utf-8",
-            body: botpages::sitemap(&chain::index().lock().unwrap_or_else(|e| e.into_inner()), &base_url(&req)),
         },
         ("GET", ["robots.txt"]) => Response {
             status: 200,
@@ -2355,7 +2437,21 @@ mod tests {
         let mut api = req("GET", "/v1/bots", &[], "");
         api.query.insert("q".into(), "forecast".into());
         assert_eq!(body_json(&route(&e, api, PROD)).get("total").and_then(|v| v.as_f()), Some(1.0));
-        assert!(route(&e, req("GET", "/sitemap.xml", &[], ""), PROD).body.contains("/bots/base/900001"));
+        assert!(route(&e, req("GET", "/sitemap.xml", &[], ""), PROD).body.contains("/sitemaps/1.xml"));
+        assert!(route(&e, req("GET", "/sitemaps/1.xml", &[], ""), PROD).body.contains("/bots/base/900001"));
+        assert_eq!(route(&e, req("GET", "/sitemaps/x.xml", &[], ""), PROD).status, 404);
+        // The directory and its search have their own hourly limit; single bot pages don't.
+        let searcher = [("X-Real-IP", "203.0.113.77")];
+        for _ in 0..SEARCHES_PER_HOUR {
+            let mut r = req("GET", "/bots", &searcher, "");
+            r.query.insert("q".into(), "x".into());
+            route(&e, r, PROD);
+        }
+        let mut r = req("GET", "/bots", &searcher, "");
+        r.query.insert("q".into(), "x".into());
+        assert_eq!(route(&e, r, PROD).status, 429);
+        assert_eq!(route(&e, req("GET", "/bots", &searcher, ""), PROD).status, 429, "the directory ranks everything too");
+        assert_eq!(route(&e, req("GET", "/bots/base/900001", &searcher, ""), PROD).status, 200, "single bot pages stay open");
         assert!(route(&e, req("GET", "/robots.txt", &[], ""), PROD).body.contains("Sitemap:"));
 
         // Once an account proves it owns the bot, the bot's profile is that account's record.
@@ -2379,6 +2475,37 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_lapses_when_the_bot_changes_hands() {
+        let e = engine();
+        let ext = verify::normalize("erc8004", "8453:900301").unwrap();
+        let sold_at_block = 52_000_000u64;
+        {
+            let mut idx = chain::index().lock().unwrap();
+            idx.apply(&chain::tests::registered(900_301, "0x00000000000000000000000000000000000000a1", "", 50_000_000));
+        }
+        e.lock().unwrap().record_verified("seller-bot", "erc8004", &ext, "test", 1, chain::Index::block_ms(sold_at_block) - 1_000).unwrap();
+        let claimed = |e: &Mutex<Engine>| {
+            body_json(&route(e, req("GET", "/v1/trust/erc8004:8453:900301", &[], ""), PROD))
+                .get("claimed_by")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+        assert_eq!(claimed(&e).as_deref(), Some("seller-bot"));
+        // The bot is sold: the old owner's claim no longer stands.
+        chain::index().lock().unwrap().apply(&chain::tests::transfer(
+            900_301,
+            "0x00000000000000000000000000000000000000a1",
+            "0x00000000000000000000000000000000000000b2",
+            sold_at_block,
+        ));
+        assert_eq!(claimed(&e), None, "a sold bot isn't the seller's any more");
+        assert!(route(&e, req("GET", "/bots/base/900301", &[], ""), PROD).body.contains("Claim with my wallet"));
+        // The new owner proves control afterwards and takes the page.
+        e.lock().unwrap().record_verified("buyer-bot", "erc8004", &ext, "test", 2, chain::Index::block_ms(sold_at_block) + 1_000).unwrap();
+        assert_eq!(claimed(&e).as_deref(), Some("buyer-bot"));
+    }
+
+    #[test]
     fn checking_a_wallet_before_paying_it() {
         let e = engine();
         let wallet_of = |n: u64| format!("0x{:040x}", 0xfeed_0000u64 + n);
@@ -2394,25 +2521,55 @@ mod tests {
         {
             let mut idx = chain::index().lock().unwrap();
             idx.head = idx.head.max(10 + 60 * 86_400 / 2);
-            // 900101: a scam bot many wallets rated badly. 900102: a well-reviewed bot.
+            // 900101: many fresh wallets rated it badly. 900102: many rated it well.
             for (n, rating) in [(900_101u64, 5i128), (900_102, 95)] {
                 idx.apply(&chain::tests::registered(n, "0x00000000000000000000000000000000000000aa", "", 10));
                 idx.agents.get_mut(&n).unwrap().wallet = wallet_of(n);
                 for c in 0..8u64 {
-                    idx.apply(&chain::tests::feedback(n, &format!("0x{:040x}", 0xabc0_0000u64 + c), 1, rating, 0, "starred"));
+                    idx.apply(&chain::tests::feedback(n, &format!("0x{:040x}", 0xabc0_0000u64 + n * 100 + c), 1, rating, 0, "starred"));
                 }
             }
         }
-        assert_eq!(verdict(&check(&wallet_of(900_101), None)), "stop");
-        let ok = check(&wallet_of(900_102), Some("20"));
-        assert_eq!(verdict(&ok), "ok", "{}", ok.to_string());
-        assert_eq!(verdict(&check(&wallet_of(900_102), Some("5000"))), "careful", "fair is not enough for a big payment");
+        // Reviews alone are cheap to fake both ways: they can never block a payment or clear one.
+        let smeared = check(&wallet_of(900_101), None);
+        assert_eq!(verdict(&smeared), "careful", "a smear can't make an honest seller unpayable");
+        assert!(smeared.get("advice").and_then(|v| v.as_str()).unwrap().contains("public reviews"));
+        assert_eq!(verdict(&check(&wallet_of(900_102), Some("20"))), "careful", "praise from fresh wallets can't clear a scam");
+
+        // A record built from deals settled here can: one that went silent on its buyers is stop.
+        // A single kept deal is only fair — easy to fake with a second account — so still careful.
+        let (good, bad) = (wallet_of(1), wallet_of(2));
+        {
+            let mut g = e.lock().unwrap();
+            let honest = g
+                .create_agreement(vec!["shop".into(), "buyer1".into()], 2, 10.0, "USDC".into(), domain_from("commerce"), None, 0)
+                .unwrap();
+            g.report(&honest, "shop", 0, None, 1).unwrap();
+            g.report(&honest, "buyer1", 0, None, 2).unwrap();
+            for i in 0..3 {
+                let other = format!("victim{i}");
+                let id = g
+                    .create_agreement(vec![other.clone(), "flaky".into()], 2, 10.0, "USDC".into(), domain_from("commerce"), None, 0)
+                    .unwrap();
+                g.accept(&id, "flaky", 1).unwrap();
+                g.report(&id, &other, 0, None, 10).unwrap();
+            }
+            g.sweep(store::REPORT_WINDOW_MS + 1);
+            g.record_verified("shop", "eth", &good, "test", 0, 0).unwrap();
+            g.record_verified("flaky", "eth", &bad, "test", 0, 0).unwrap();
+        }
+        let fair = check(&good, Some("20"));
+        assert_eq!(verdict(&fair), "careful");
+        assert!(fair.get("advice").and_then(|v| v.as_str()).unwrap().contains("Fine for small payments"));
+        assert!(check(&good, Some("5000")).get("advice").and_then(|v| v.as_str()).unwrap().contains("splitting"));
+        assert_eq!(verdict(&check(&bad, None)), "stop");
+
         let nobody = check("0x000000000000000000000000000000000000dEaD", None);
         assert_eq!(verdict(&nobody), "careful");
         assert_eq!(nobody.get("matches"), Some(&Json::Array(vec![])));
-        let mut bad = req("GET", "/v1/check", &[], "");
-        bad.query.insert("pay_to".into(), "not-a-wallet".into());
-        assert_eq!(route(&e, bad, PROD).status, 400);
+        let mut bad_req = req("GET", "/v1/check", &[], "");
+        bad_req.query.insert("pay_to".into(), "not-a-wallet".into());
+        assert_eq!(route(&e, bad_req, PROD).status, 400);
         assert_eq!(route(&e, req("GET", "/v1/check", &[], ""), PROD).status, 400);
         let js = route(&e, req("GET", "/guard.js", &[("Host", "trust.example.com")], ""), PROD);
         assert!(js.content_type.starts_with("text/javascript") && js.body.contains("https://trust.example.com"));
@@ -2452,8 +2609,8 @@ mod tests {
             .iter()
             .map(|a| (a.get("target").unwrap().as_str().unwrap().to_string(), a.get("to").unwrap().as_str().unwrap().to_string()))
             .collect();
-        assert!(to.contains(&(wallet.clone(), "stop".to_string())), "{to:?}");
         assert!(to.contains(&("erc8004:8453:900201".to_string(), "caution".to_string())), "{to:?}");
+        assert!(!to.iter().any(|(t, _)| t == &wallet), "reviews alone don't flip a wallet's payment verdict: {to:?}");
         assert!(list.iter().all(|a| a.get("worse") == Some(&Json::Bool(true))));
         let last = list.iter().filter_map(|a| a.get("alert_id").and_then(|v| v.as_f())).fold(0.0, f64::max);
         let mut since = req("GET", "/v1/alerts", &k, "");

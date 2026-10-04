@@ -35,7 +35,7 @@ curl "{URL}/v1/check?pay_to=0xSELLER_WALLET&amount_usd=2.5"
 → {"verdict":"stop"|"careful"|"ok","advice":"…","matches":[…]}
 ```
 
-`stop` = a bot behind that wallet has a bad record: don't pay. `careful` = no track record: pay only what you can afford to lose. Using x402-fetch? One line does it for every payment: save `{URL}/guard.js`, then `wrapFetchWithPayment(withKeptvow(fetch), account)`. MCP tool: `check_payment`.
+`stop` = a bot behind that wallet broke deals settled here: don't pay. `careful` = no record that's hard to fake yet (public reviews alone never decide it either way): pay only what you can afford to lose. `ok` = a good or excellent record from real deals. Using x402-fetch? One line does it for every payment: save `{URL}/guard.js`, then `wrapFetchWithPayment(withKeptvow(fetch), account)`. MCP tool: `check_payment`.
 
 3. Open a deal (you are the first party):
 

@@ -93,10 +93,20 @@ pub struct Watches {
 /// are kept lowercase so the same one can't be listed twice.
 pub fn normalize_target(t: &str) -> Result<String, String> {
     let t = t.trim();
+    if t.len() > 80 {
+        return Err("a target is at most 80 characters".into());
+    }
     if t.starts_with("0x") || t.starts_with("0X") {
         return verify::normalize("eth", t).map_err(|_| format!("{t} is not a 0x wallet address"));
     }
-    if crate::store::valid_agent_id(t) || t.to_ascii_lowercase().starts_with("erc8004:") {
+    if let Some(rest) = t.to_ascii_lowercase().strip_prefix("erc8004:") {
+        let parts: Vec<&str> = rest.split(':').collect();
+        return match parts.as_slice() {
+            [c, n] if c.parse::<u64>().is_ok() && n.parse::<u64>().is_ok() => Ok(format!("erc8004:{c}:{n}")),
+            _ => Err(format!("{t} is not a registry bot — use erc8004:8453:<number>")),
+        };
+    }
+    if crate::store::valid_agent_id(t) {
         return Ok(t.to_string());
     }
     Err(format!("{t} is not a bot id, registry bot (erc8004:8453:N) or 0x wallet"))
@@ -286,19 +296,18 @@ pub fn signed(alert: &Alert, secret: &str) -> (String, String) {
 
 /// POSTs one alert. Public addresses only, a short timeout, no retries: the alert stays
 /// available at GET /v1/alerts either way.
-pub fn deliver(url: &str, alert: &Alert, secret: &str) {
+pub fn deliver(url: &str, alert: &Alert, secret: &str) -> bool {
     if cfg!(test) {
-        return;
+        return true;
     }
     let (body, sig) = signed(alert, secret);
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).redirects(0).resolver(verify::PublicOnly).build();
-    if let Err(e) = agent
-        .post(url)
-        .set("Content-Type", "application/json")
-        .set("X-Keptvow-Signature", &sig)
-        .send_string(&body)
-    {
-        eprintln!("keptvow: webhook to {url} failed: {e}");
+    match agent.post(url).set("Content-Type", "application/json").set("X-Keptvow-Signature", &sig).send_string(&body) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("keptvow: webhook to {url} failed: {e}");
+            false
+        }
     }
 }
 
@@ -338,6 +347,8 @@ mod tests {
         assert!(valid_webhook("https://x.example/hook") && !valid_webhook("http://x.example") && !valid_webhook("https://a b"));
         assert_eq!(normalize_target("0x00000000000000000000000000000000000000AA").unwrap(), "0x00000000000000000000000000000000000000aa");
         assert!(normalize_target("<script>").is_err());
+        assert!(normalize_target("erc8004:8453:<b>").is_err());
+        assert_eq!(normalize_target("ERC8004:8453:42").unwrap(), "erc8004:8453:42");
         assert_eq!(w.remove("c", &["a".into()]), 0);
     }
 }

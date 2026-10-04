@@ -441,20 +441,43 @@ pub fn stats_page(stats: &Json, base: &str) -> String {
         )
 }
 
-/// `/sitemap.xml` — every bot page, so search engines index them.
-pub fn sitemap(idx: &Index, base: &str) -> String {
+/// Bot pages per sitemap file (the format allows 50,000).
+const PER_SITEMAP: usize = 40_000;
+
+/// `/sitemap.xml` — an index of sitemap files, so search engines find every bot page however
+/// many there are.
+pub fn sitemap_index(idx: &Index, base: &str) -> String {
+    let parts = idx.agents.len().div_ceil(PER_SITEMAP).max(1);
+    let mut s = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+"#);
+    for n in 0..=parts {
+        s.push_str(&format!("<sitemap><loc>{}/sitemaps/{n}.xml</loc></sitemap>\n", esc(base)));
+    }
+    s.push_str("</sitemapindex>\n");
+    s
+}
+
+/// `/sitemaps/0.xml` is the site's own pages; `/sitemaps/1.xml` onward hold the bot pages.
+pub fn sitemap_part(idx: &Index, n: usize, base: &str) -> Option<String> {
     let mut s = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 "#);
-    for path in ["", "/bots", "/docs", "/trust", "/stats"] {
-        s.push_str(&format!("<url><loc>{}{path}</loc></url>\n", esc(base)));
-    }
-    // The sitemap format allows 50,000 addresses per file.
-    for id in idx.agents.keys().take(49_000) {
-        s.push_str(&format!("<url><loc>{}/bots/{}/{id}</loc></url>\n", esc(base), chain::CHAIN_NAME));
+    if n == 0 {
+        for path in ["", "/bots", "/stats", "/docs", "/trust"] {
+            s.push_str(&format!("<url><loc>{}{path}</loc></url>\n", esc(base)));
+        }
+    } else {
+        let ids: Vec<&u64> = idx.agents.keys().skip((n - 1) * PER_SITEMAP).take(PER_SITEMAP).collect();
+        if ids.is_empty() {
+            return None;
+        }
+        for id in ids {
+            s.push_str(&format!("<url><loc>{}/bots/{}/{id}</loc></url>\n", esc(base), chain::CHAIN_NAME));
+        }
     }
     s.push_str("</urlset>\n");
-    s
+    Some(s)
 }
 
 fn url_encode(s: &str) -> String {
@@ -546,7 +569,10 @@ mod tests {
         let html = bot_page(&idx, 9, Some(("weather-bot", &profile)), "https://k.example").unwrap();
         assert!(html.contains("pill good") && html.contains("Claimed.") && !html.contains("Claim with my wallet"));
         assert!(bot_page(&idx, 10, None, "https://k.example").is_none());
-        assert!(sitemap(&idx, "https://k.example").contains("<loc>https://k.example/bots/base/9</loc>"));
+        assert!(sitemap_index(&idx, "https://k.example").contains("<loc>https://k.example/sitemaps/1.xml</loc>"));
+        assert!(sitemap_part(&idx, 1, "https://k.example").unwrap().contains("<loc>https://k.example/bots/base/9</loc>"));
+        assert!(sitemap_part(&idx, 0, "https://k.example").unwrap().contains("<loc>https://k.example/stats</loc>"));
+        assert!(sitemap_part(&idx, 2, "https://k.example").is_none());
         assert_eq!(suggest_name("Weather Bot!", 9), "weather-bot");
         assert_eq!(suggest_name("☃", 9), "bot-9");
     }

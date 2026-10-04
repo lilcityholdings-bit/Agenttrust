@@ -1586,6 +1586,11 @@ impl Engine {
             .map(|s| s.as_str())
     }
 
+    /// When an agent's proof of an identity was accepted, in ms.
+    pub fn verification_time(&self, agent_id: &str, protocol: &str, external_id: &str) -> Option<i64> {
+        self.registration(agent_id, protocol, external_id).and_then(|r| r.verified.as_ref()).map(|v| v.at_ms)
+    }
+
     /// How many identities of one kind have been proven (e.g. registry bots claimed).
     pub fn count_verified(&self, protocol: &str) -> usize {
         self.registrations.values().flatten().filter(|r| r.protocol == protocol && r.verified.is_some()).count()

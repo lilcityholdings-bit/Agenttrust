@@ -37,7 +37,15 @@ const MAX_SPAN: u64 = 10_000;
 /// Base makes a block every two seconds.
 const BLOCK_SECONDS: u64 = 2;
 /// Reviews kept per (bot, reviewer) and reviewers kept per bot — a spammer can't grow memory.
-const MAX_REVIEWS_PER_CLIENT: usize = 50;
+const MAX_REVIEWS_PER_CLIENT: usize = 10;
+/// Reviews kept across the whole registry. Each review costs its poster a transaction, but a
+/// determined spammer could still try to fill memory; past this, new ones are no longer kept.
+const MAX_STORED_REVIEWS: usize = 3_000_000;
+/// How often a bot's registration file is read again, to pick up edits made without any
+/// on-chain change; and how long before an unreadable one is tried again.
+const REFRESH_READ_MS: i64 = 7 * 86_400_000;
+const RETRY_UNREADABLE_MS: i64 = 3 * 86_400_000;
+const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const MAX_REVIEWERS: usize = 5_000;
 /// Reviewers needed before reviews move a bot off `unknown`.
 const MIN_REVIEWERS: usize = 5;
@@ -58,6 +66,11 @@ pub struct Agent {
     pub description: String,
     pub services: Vec<(String, String)>,
     pub x402: bool,
+    /// The last block in which the bot changed hands or changed its payment wallet. A claim
+    /// made before this was made by whoever controlled it then, so it no longer stands.
+    pub moved_block: u64,
+    /// When its registration file was last read (or tried), in ms.
+    pub meta_at: i64,
     /// 0 = registration file not read yet, 1 = read, 2 = unreadable, 3 = being read now.
     pub meta: u8,
     pub tries: u8,
@@ -85,6 +98,10 @@ pub struct Index {
     pub last_error: String,
     /// How many bots each reviewing wallet has reviewed.
     reach: std::collections::HashMap<String, u32>,
+    stored_reviews: usize,
+    /// Wallet -> bots that list it as owner or payment wallet; rebuilt when stale.
+    by_addr: std::collections::HashMap<String, Vec<u64>>,
+    addr_stale: bool,
     dirty: bool,
 }
 
@@ -207,12 +224,20 @@ impl Index {
 
         if address == IDENTITY {
             if t0 == tp.transfer && ts.len() == 4 {
-                let (Some(to), Some(id)) = (topic_address(ts[2]), ts.get(3).and_then(|t| topic_u64(t))) else { return };
+                let (Some(from), Some(to), Some(id)) =
+                    (topic_address(ts[1]), topic_address(ts[2]), ts.get(3).and_then(|t| topic_u64(t)))
+                else {
+                    return;
+                };
                 let a = self.agents.entry(id).or_default();
-                a.owner = to;
+                if from != ZERO_ADDRESS {
+                    a.moved_block = a.moved_block.max(block);
+                }
+                a.owner = if to == ZERO_ADDRESS { String::new() } else { to };
                 if a.block == 0 {
                     a.block = block;
                 }
+                self.addr_stale = true;
             } else if t0 == tp.registered || t0 == tp.uri_updated {
                 let Some(id) = id() else { return };
                 let uri = clean(&abi_string(&data, 0).unwrap_or_default(), 4096);
@@ -221,6 +246,7 @@ impl Index {
                     a.block = block;
                     if let Some(o) = ts.get(2).and_then(|t| topic_address(t)) {
                         a.owner = o;
+                        self.addr_stale = true;
                     }
                 }
                 if a.uri != uri {
@@ -232,7 +258,12 @@ impl Index {
                 let Some(id) = id() else { return };
                 let value = abi_dynamic(&data, 1).unwrap_or_default();
                 let a = self.agents.entry(id).or_default();
-                a.wallet = if value.len() == 20 { format!("0x{}", hex(value)) } else { String::new() };
+                let wallet = if value.len() == 20 { format!("0x{}", hex(value)) } else { String::new() };
+                if wallet != a.wallet && a.block != 0 && block > a.block {
+                    a.moved_block = a.moved_block.max(block);
+                }
+                a.wallet = wallet;
+                self.addr_stale = true;
             } else {
                 return;
             }
@@ -256,10 +287,17 @@ impl Index {
                     *self.reach.entry(client.clone()).or_insert(0) += 1;
                 }
                 let r = a.reviews.entry(client).or_default();
+                if !r.contains_key(&index) {
+                    if self.stored_reviews >= MAX_STORED_REVIEWS {
+                        return;
+                    }
+                    self.stored_reviews += 1;
+                }
                 r.insert(index, (rating(value, decimals.min(255) as u8, &tag), false));
                 while r.len() > MAX_REVIEWS_PER_CLIENT {
                     let first = *r.keys().next().expect("non-empty");
                     r.remove(&first);
+                    self.stored_reviews -= 1;
                 }
             } else if t0 == tp.feedback_revoked {
                 let Some(index) = ts.get(3).and_then(|t| topic_u64(t)) else { return };
@@ -417,7 +455,7 @@ impl Index {
                     || (q.starts_with("0x") && (a.owner.starts_with(&q) || a.wallet.starts_with(&q)))
                     || a.name.to_ascii_lowercase().contains(&q)
             })
-            .map(|(id, a)| (*id, a, a.reviews.len()))
+            .map(|(id, a)| (*id, a, self.reviews(a).reviewers))
             .collect();
         if newest {
             hits.sort_by(|x, y| y.1.block.cmp(&x.1.block).then(y.0.cmp(&x.0)));
@@ -430,37 +468,66 @@ impl Index {
 
     /// Registry bots tied to a wallet, as its payment wallet or its owner. Payment wallets come
     /// first: that is the address a seller names when it asks to be paid.
-    pub fn by_address(&self, address: &str) -> Vec<u64> {
-        let a = address.to_ascii_lowercase();
-        let mut paid: Vec<u64> = self.agents.iter().filter(|(_, x)| x.wallet == a).map(|(id, _)| *id).collect();
-        let owned: Vec<u64> = self.agents.iter().filter(|(id, x)| x.owner == a && !paid.contains(id)).map(|(id, _)| *id).collect();
-        paid.extend(owned);
-        paid
+    pub fn by_address(&mut self, address: &str) -> Vec<u64> {
+        if self.addr_stale || (self.by_addr.is_empty() && !self.agents.is_empty()) {
+            let mut m: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+            // Payment wallets go in first, so they lead each list.
+            for (id, x) in &self.agents {
+                if !x.wallet.is_empty() {
+                    m.entry(x.wallet.clone()).or_default().push(*id);
+                }
+            }
+            for (id, x) in &self.agents {
+                if !x.owner.is_empty() {
+                    let ids = m.entry(x.owner.clone()).or_default();
+                    if !ids.contains(id) {
+                        ids.push(*id);
+                    }
+                }
+            }
+            self.by_addr = m;
+            self.addr_stale = false;
+        }
+        self.by_addr.get(&address.to_ascii_lowercase()).cloned().unwrap_or_default()
     }
 
     /// Hands out up to `n` bots whose registration file still needs reading, marking them taken
     /// so several readers never fetch the same one.
-    fn needs_meta(&mut self, n: usize) -> Vec<(u64, String)> {
+    /// New bots first; then files read more than a week ago (owners edit them without any
+    /// on-chain change), then unreadable ones due another try.
+    fn needs_meta(&mut self, n: usize, now_ms: i64) -> Vec<(u64, String)> {
         let mut out = Vec::new();
-        for (id, a) in self.agents.iter_mut() {
-            if out.len() >= n {
-                break;
-            }
-            if a.meta == 0 && !a.uri.is_empty() && a.tries < 3 {
-                a.meta = 3;
-                out.push((*id, a.uri.clone()));
+        let due = |a: &Agent, pass: u8| match pass {
+            0 => a.meta == 0 && a.tries < 3,
+            1 => a.meta == 1 && now_ms - a.meta_at > REFRESH_READ_MS,
+            _ => a.meta == 2 && now_ms - a.meta_at > RETRY_UNREADABLE_MS,
+        };
+        for pass in 0..3u8 {
+            for (id, a) in self.agents.iter_mut() {
+                if out.len() >= n {
+                    return out;
+                }
+                if !a.uri.is_empty() && due(a, pass) {
+                    if pass == 2 {
+                        a.tries = 2; // one more try; a failure leaves it unreadable for another while
+                    }
+                    a.meta = 3;
+                    out.push((*id, a.uri.clone()));
+                }
             }
         }
         out
     }
 
-    fn set_meta(&mut self, id: u64, uri: &str, meta: Result<Meta, String>) {
+    fn set_meta(&mut self, id: u64, uri: &str, meta: Result<Meta, String>, now_ms: i64) {
         let Some(a) = self.agents.get_mut(&id) else { return };
         if a.uri != uri {
             return; // changed while we were fetching; the new one is queued (meta was reset to 0)
         }
+        a.meta_at = now_ms;
         match meta {
             Ok(m) => {
+                a.tries = 0;
                 a.name = m.name;
                 a.description = m.description;
                 a.services = m.services;
@@ -477,10 +544,15 @@ impl Index {
 
     // ---- the "State of AI bots" numbers ------------------------------------------------------
 
+    /// When a Base block was made, in ms.
+    pub fn block_ms(block: u64) -> i64 {
+        const BASE_GENESIS_SECS: i64 = 1_686_789_347;
+        (BASE_GENESIS_SECS + block as i64 * BLOCK_SECONDS as i64) * 1000
+    }
+
     /// The date (UTC, "YYYY-MM-DD") a Base block was made.
     pub fn block_day(block: u64) -> String {
-        const BASE_GENESIS_SECS: i64 = 1_686_789_347;
-        crate::metrics::day_of((BASE_GENESIS_SECS + block as i64 * BLOCK_SECONDS as i64) * 1000)
+        crate::metrics::day_of(Index::block_ms(block))
     }
 
     /// What the whole registry looks like: growth, bursts, who owns how many bots, how many
@@ -649,6 +721,8 @@ impl Index {
                     ("x402", Json::Bool(a.x402)),
                     ("meta", Json::num(a.meta as f64)),
                     ("tries", Json::num(a.tries as f64)),
+                    ("moved_block", Json::num(a.moved_block as f64)),
+                    ("meta_at", Json::num(a.meta_at as f64)),
                     ("reviews", Json::Array(reviews)),
                 ])
             })
@@ -668,7 +742,7 @@ impl Index {
         }
         let n = |j: &Json, k: &str| j.get(k).and_then(|v| v.as_f()).unwrap_or(0.0) as u64;
         let s = |j: &Json, k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let mut idx = Index { cursor: n(j, "cursor"), head: n(j, "head"), ..Index::default() };
+        let mut idx = Index { cursor: n(j, "cursor"), head: n(j, "head"), addr_stale: true, ..Index::default() };
         if let Some(Json::Array(agents)) = j.get("agents") {
             for aj in agents {
                 let mut a = Agent {
@@ -682,6 +756,8 @@ impl Index {
                     // A read cut short by a restart is simply read again.
                     meta: match n(aj, "meta") as u8 { 3 => 0, m => m },
                     tries: n(aj, "tries") as u8,
+                    moved_block: n(aj, "moved_block"),
+                    meta_at: n(aj, "meta_at") as i64,
                     ..Agent::default()
                 };
                 if let Some(Json::Array(svcs)) = aj.get("services") {
@@ -704,8 +780,9 @@ impl Index {
                         a.reviews.entry(client.to_string()).or_default().insert(i as u64, (r, revoked));
                     }
                 }
-                for client in a.reviews.keys() {
+                for (client, per) in &a.reviews {
                     *idx.reach.entry(client.clone()).or_insert(0) += 1;
+                    idx.stored_reviews += per.len();
                 }
                 idx.agents.insert(n(aj, "id"), a);
             }
@@ -923,7 +1000,7 @@ fn read_logs(url: String, path: PathBuf) {
             idx.cursor
         };
         if cursor >= head {
-            if last_save.elapsed() > Duration::from_secs(60) {
+            if last_save.elapsed() > Duration::from_secs(300) {
                 save(&path);
                 last_save = Instant::now();
             }
@@ -980,16 +1057,20 @@ fn read_logs(url: String, path: PathBuf) {
     }
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
 fn read_registration_files() {
     loop {
-        let batch = lock().needs_meta(10);
+        let batch = lock().needs_meta(10, now_ms());
         if batch.is_empty() {
             std::thread::sleep(Duration::from_secs(30));
             continue;
         }
         for (id, uri) in batch {
             let meta = fetch_meta(&uri);
-            lock().set_meta(id, &uri, meta);
+            lock().set_meta(id, &uri, meta, now_ms());
             std::thread::sleep(Duration::from_millis(300));
         }
     }
@@ -1041,6 +1122,23 @@ pub(crate) mod tests {
         ])
     }
 
+    pub fn transfer(id: u64, from: &str, to: &str, block: u64) -> Json {
+        Json::obj(vec![
+            ("address", Json::str(IDENTITY)),
+            (
+                "topics",
+                Json::Array(vec![
+                    Json::str(topics().transfer.clone()),
+                    Json::str(addr_topic(from)),
+                    Json::str(addr_topic(to)),
+                    Json::str(format!("0x{}", word(id))),
+                ]),
+            ),
+            ("data", Json::str("0x")),
+            ("blockNumber", Json::str(format!("0x{block:x}"))),
+        ])
+    }
+
     pub fn feedback(id: u64, client: &str, index: u64, value: i128, decimals: u8, tag: &str) -> Json {
         let fill = if value < 0 { "f" } else { "0" };
         let v = format!("{}{:032x}", fill.repeat(32), value as u128);
@@ -1074,10 +1172,13 @@ pub(crate) mod tests {
         assert_eq!(a.owner, "0x00000000000000000000000000000000000000aa");
         assert_eq!(a.uri, "https://example.com/agent.json");
         assert_eq!(a.block, 1_000);
-        assert_eq!(idx.needs_meta(10), vec![(42, "https://example.com/agent.json".to_string())]);
-        assert!(idx.needs_meta(10).is_empty(), "a bot being read is not handed out twice");
-        idx.set_meta(42, "https://example.com/agent.json", Err("timeout".into()));
-        assert_eq!(idx.needs_meta(10).len(), 1, "a failed read is retried");
+        assert_eq!(idx.needs_meta(10, 0), vec![(42, "https://example.com/agent.json".to_string())]);
+        assert!(idx.needs_meta(10, 0).is_empty(), "a bot being read is not handed out twice");
+        idx.set_meta(42, "https://example.com/agent.json", Err("timeout".into()), 0);
+        assert_eq!(idx.needs_meta(10, 0).len(), 1, "a failed read is retried");
+        idx.set_meta(42, "https://example.com/agent.json", Ok(Meta { name: "W".into(), ..Meta::default() }), 1_000);
+        assert!(idx.needs_meta(10, 2_000).is_empty());
+        assert_eq!(idx.needs_meta(10, 1_000 + REFRESH_READ_MS + 1).len(), 1, "read again a week later to catch edits");
 
         idx.apply(&feedback(42, &client(1), 1, 90, 0, "starred"));
         idx.apply(&feedback(42, &client(2), 1, 9977, 2, "uptime"));
