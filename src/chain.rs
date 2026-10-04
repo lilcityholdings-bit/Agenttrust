@@ -721,7 +721,12 @@ fn read_logs(url: String, path: PathBuf) {
             .map(|t| Json::str((*t).clone()))
             .collect(),
     );
+    // The node refuses ranges that are too big; `ceiling` remembers the largest that worked, so
+    // the reader doesn't keep paying for a refusal on every other call. It probes higher again
+    // after a long run of successes, in case the refusal was momentary.
     let mut span = MAX_SPAN;
+    let mut ceiling = MAX_SPAN;
+    let mut streak = 0u32;
     let mut last_save = Instant::now();
     loop {
         let head = match rpc(&url, "eth_blockNumber", Json::Array(vec![])) {
@@ -763,12 +768,18 @@ fn read_logs(url: String, path: PathBuf) {
                 idx.cursor = to;
                 idx.dirty = true;
                 idx.last_error.clear();
-                span = (span * 2).min(MAX_SPAN);
+                streak += 1;
+                if streak % 200 == 0 {
+                    ceiling = (ceiling * 2).min(MAX_SPAN);
+                }
+                span = (span * 2).min(ceiling);
             }
             Ok(_) => lock().last_error = "eth_getLogs returned something other than a list".into(),
             Err(e) => {
+                streak = 0;
                 if span > 50 {
                     span /= 2;
+                    ceiling = span;
                 } else {
                     eprintln!("keptvow: bot registry: {e}");
                     lock().last_error = e;
@@ -781,7 +792,7 @@ fn read_logs(url: String, path: PathBuf) {
             last_save = Instant::now();
         }
         // Gentle on a shared public node while catching up.
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
