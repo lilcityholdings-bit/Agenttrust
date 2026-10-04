@@ -31,6 +31,7 @@ mod verify;
 mod watch;
 
 use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,72 +84,133 @@ fn state_path() -> std::path::PathBuf {
     std::env::var("STATE_FILE").unwrap_or_else(|_| "data/state.json".to_string()).into()
 }
 
-/// Loads the last snapshot if one exists and parses cleanly; otherwise starts fresh. A corrupt
-/// or foreign file is a reason to log a warning and boot clean, not a reason to refuse to start
-/// — losing history is recoverable, refusing to serve traffic is not.
+/// Loads the last snapshot, falling back to the backup kept beside it. A file that won't parse
+/// is moved aside under a dated name, never overwritten, so a damaged disk can't turn into lost
+/// customer and payment records; only with neither file usable does it start fresh.
 fn load_or_new(path: &std::path::Path, admin_secret: &str) -> Engine {
-    match std::fs::read_to_string(path) {
-        Ok(text) => match json::parse(&text) {
-            Ok(snapshot) => match Engine::from_snapshot(&snapshot) {
-                Ok(engine) => {
-                    println!("agenttrust: restored state from {}", path.display());
-                    return engine;
-                }
-                Err(e) => eprintln!(
-                    "agenttrust: {} did not parse as a valid snapshot ({e}) — starting fresh",
-                    path.display()
-                ),
-            },
-            Err(e) => eprintln!(
-                "agenttrust: {} is not valid JSON ({e}) — starting fresh",
-                path.display()
-            ),
-        },
-        Err(_) => println!("agenttrust: no existing state at {} — starting fresh", path.display()),
+    let backup = path.with_extension("json.bak");
+    for candidate in [path.to_path_buf(), backup] {
+        let Ok(text) = std::fs::read_to_string(&candidate) else { continue };
+        match json::parse(&text).map_err(|e| e.to_string()).and_then(|j| Engine::from_snapshot(&j).map_err(|e| e.to_string())) {
+            Ok(engine) => {
+                println!("agenttrust: restored state from {}", candidate.display());
+                return engine;
+            }
+            Err(e) => {
+                let aside = candidate.with_extension(format!("corrupt-{}", now_ms()));
+                let _ = std::fs::rename(&candidate, &aside);
+                eprintln!(
+                    "agenttrust: STATE FILE DAMAGED: {} ({e}) — kept as {} and trying the backup",
+                    candidate.display(),
+                    aside.display()
+                );
+            }
+        }
     }
+    println!("agenttrust: no usable state at {} — starting fresh", path.display());
     Engine::with_admin_secret(admin_secret)
 }
 
-/// When state was last written, and how long the audit log was then. Writing the whole snapshot
-/// on every change would let a burst of cheap writes turn into a burst of expensive saves, so a
-/// request saves at most once a second and the background job catches whatever is left.
-static LAST_SAVE: Mutex<(i64, usize)> = Mutex::new((0, 0));
+// ---- saving, off the request path ----------------------------------------------------------
+//
+// Requests only mark the state as changed. A saver thread copies the engine under the lock
+// (fast: a copy, not a serialization) and writes it with the lock released, so a large snapshot
+// never stalls traffic. Saves come at most every few seconds — further apart when copying gets
+// expensive — and once more, synchronously, when the platform asks the process to stop.
 
-fn save_if_changed(engine: &Engine, path: &std::path::Path, now: i64, force: bool) {
-    let mut last = LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner());
-    let len = engine.audit_len();
-    if len == last.1 && !force {
-        return;
-    }
-    if !force && now - last.0 < 1_000 {
-        return;
-    }
-    save(engine, path);
-    *last = (now, len);
+static STATE_DIRTY: AtomicBool = AtomicBool::new(false);
+static STOPPING: AtomicBool = AtomicBool::new(false);
+static LAST_SAVE_OK_MS: AtomicI64 = AtomicI64::new(0);
+static LAST_SAVE_FAILED: AtomicBool = AtomicBool::new(false);
+static LAST_BACKGROUND_MS: AtomicI64 = AtomicI64::new(0);
+
+fn mark_dirty() {
+    STATE_DIRTY.store(true, Ordering::SeqCst);
 }
 
-/// Writes the snapshot to `path`, via a temp file renamed into place, so a process killed
-/// mid-write leaves the previous, still-valid snapshot on disk instead of a half-written one.
-fn save(engine: &Engine, path: &std::path::Path) {
-    let Some(dir) = path.parent() else { return };
+extern "C" fn on_stop_signal(_: libc::c_int) {
+    // Only an atomic store: all a signal handler may safely do. The saver does the rest.
+    STOPPING.store(true, Ordering::SeqCst);
+}
+
+fn listen_for_stop() {
+    let handler = on_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
+
+/// Runs a job on its own thread and starts it again if it ever panics, so one bad record can't
+/// silently stop payments, deadlines or registry reading for good.
+fn supervise<F: Fn() + Send + Sync + 'static>(name: &'static str, job: F) {
+    std::thread::spawn(move || loop {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&job)) {
+            Ok(()) => return,
+            Err(_) => {
+                eprintln!("agenttrust: {name} crashed — restarting it in 10 seconds");
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+        }
+    });
+}
+
+fn saver(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
+    let mut last_save = std::time::Instant::now();
+    let mut gap = std::time::Duration::from_secs(2);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let stopping = STOPPING.load(Ordering::SeqCst);
+        if STATE_DIRTY.load(Ordering::SeqCst) && (stopping || last_save.elapsed() >= gap) {
+            STATE_DIRTY.store(false, Ordering::SeqCst);
+            let started = std::time::Instant::now();
+            let copy = engine.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            // Never spend more than about a tenth of the time holding the lock for saves.
+            gap = std::time::Duration::from_secs(2).max(started.elapsed() * 10);
+            if save(&copy, path) {
+                LAST_SAVE_OK_MS.store(now_ms(), Ordering::SeqCst);
+                LAST_SAVE_FAILED.store(false, Ordering::SeqCst);
+            } else {
+                LAST_SAVE_FAILED.store(true, Ordering::SeqCst);
+                mark_dirty();
+            }
+            last_save = std::time::Instant::now();
+        }
+        if stopping {
+            chain::save_now();
+            watch::save_if_dirty();
+            metrics::save_if_dirty();
+            println!("agenttrust: stop signal — everything saved, exiting");
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Writes the snapshot via a temp file renamed into place (a process killed mid-write leaves the
+/// previous snapshot intact), keeping the one before as a backup. Returns whether it worked.
+fn save(engine: &Engine, path: &std::path::Path) -> bool {
+    let Some(dir) = path.parent() else { return false };
     if let Err(e) = std::fs::create_dir_all(dir) {
         eprintln!("agenttrust: could not create {}: {e}", dir.display());
-        return;
+        return false;
     }
     let tmp = path.with_extension("json.tmp");
     let body = engine.to_snapshot().to_string();
-    let write_result = (|| -> std::io::Result<()> {
+    let written = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(body.as_bytes())?;
-        f.sync_all()
-    })();
-    match write_result {
-        Ok(()) => {
-            if let Err(e) = std::fs::rename(&tmp, path) {
-                eprintln!("agenttrust: could not save state to {}: {e}", path.display());
-            }
+        f.sync_all()?;
+        if path.exists() {
+            std::fs::rename(path, path.with_extension("json.bak"))?;
         }
-        Err(e) => eprintln!("agenttrust: could not write {}: {e}", tmp.display()),
+        std::fs::rename(&tmp, path)
+    })();
+    match written {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("agenttrust: could not save state to {}: {e}", path.display());
+            false
+        }
     }
 }
 
@@ -272,6 +334,7 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
         ("GET", [])
             | ("GET", ["docs"])
             | ("GET", ["health"])
+            | ("GET", ["health", "deep"])
             | ("GET", ["admin"])
             | ("GET", ["trust", ..])
             | ("GET", ["bots", ..])
@@ -635,6 +698,57 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
         ("amount_usd", amount_usd.map(Json::num).unwrap_or(Json::Null)),
         ("matches", Json::Array(matches)),
     ]))
+}
+
+/// Whether each moving part is doing its job, and a plain list of what isn't. `/health/deep`
+/// answers 503 when the list isn't empty, so an uptime monitor can raise the alarm.
+fn health_checks(now: i64) -> (Json, Vec<String>) {
+    let mut problems = Vec::new();
+    let age = |t: i64| if t == 0 { -1.0 } else { ((now - t) / 1000) as f64 };
+    let background = LAST_BACKGROUND_MS.load(Ordering::SeqCst);
+    if background > 0 && now - background > 5 * 60_000 {
+        problems.push("the background job (payments, deadlines, alerts) hasn't run for over 5 minutes".to_string());
+    }
+    if LAST_SAVE_FAILED.load(Ordering::SeqCst) {
+        problems.push("the last save to disk failed — check disk space".to_string());
+    }
+    let (behind, last_error, bots, last_ok) = {
+        let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+        (idx.head.saturating_sub(idx.cursor), idx.last_error.clone(), idx.agents.len(), idx.last_ok_ms)
+    };
+    if last_ok > 0 && now - last_ok > 15 * 60_000 {
+        problems.push("no Base node has answered for over 15 minutes — the registry and USDC payments are on hold".to_string());
+    }
+    // 1,800 blocks is an hour on Base.
+    if behind > 1_800 {
+        problems.push(format!("the registry reader is {behind} blocks behind the chain"));
+    }
+    // Memory against the container's cap: past 80% is the moment to act, well before the
+    // platform stops the process for running out.
+    let rss_mb = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok()))
+        .map(|kb| kb / 1024.0);
+    let limit_mb = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|b| b / 1_048_576.0);
+    if let (Some(used), Some(limit)) = (rss_mb, limit_mb) {
+        if used > limit * 0.8 {
+            problems.push(format!("memory is at {used:.0} MB of {limit:.0} MB — raise the limit or trim stored data soon"));
+        }
+    }
+    let checks = Json::obj(vec![
+        ("memory_mb", rss_mb.map(|m| Json::num(m.round())).unwrap_or(Json::Null)),
+        ("memory_limit_mb", limit_mb.map(|m| Json::num(m.round())).unwrap_or(Json::Null)),
+        ("background_seconds_ago", Json::num(age(background))),
+        ("saved_seconds_ago", Json::num(age(LAST_SAVE_OK_MS.load(Ordering::SeqCst)))),
+        ("registry_bots", Json::num(bots as f64)),
+        ("registry_blocks_behind", Json::num(behind as f64)),
+        ("registry_last_error", if last_error.is_empty() { Json::Null } else { Json::str(last_error) }),
+        ("base_node_answered_seconds_ago", Json::num(age(last_ok))),
+    ]);
+    (checks, problems)
 }
 
 /// The traction numbers anyone may see.
@@ -1419,9 +1533,22 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             }
             None => err(401, "usage is per customer — call this with your API key"),
         },
+        ("GET", ["health", "deep"]) => {
+            let (checks, problems) = health_checks(now);
+            Response::json(
+                if problems.is_empty() { 200 } else { 503 },
+                Json::obj(vec![
+                    ("status", Json::str(if problems.is_empty() { "ok" } else { "degraded" })),
+                    ("problems", Json::Array(problems.into_iter().map(Json::str).collect())),
+                    ("checks", checks),
+                ])
+                .to_string(),
+            )
+        }
         ("GET", ["health"]) | ("GET", []) => ok(Json::obj(vec![
             ("service", Json::str("Keptvow")),
             ("status", Json::str("ok")),
+            ("checks", health_checks(now).0),
             ("free_tier", Json::str("bots need no key: POST /v1/register, then use every agent endpoint")),
             ("agent_guide", Json::str("/llms.txt")),
             (
@@ -2247,6 +2374,7 @@ fn billing_done(engine: &Mutex<Engine>, req: &Request, now: i64) -> Response {
 fn background(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
     let pay = autopay::config();
     let mut tick: u64 = 0;
+    LAST_BACKGROUND_MS.store(now_ms(), Ordering::SeqCst);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(20));
         tick += 1;
@@ -2328,8 +2456,11 @@ fn background(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
         if tick % 180 == 0 && engine.lock().unwrap_or_else(|e| e.into_inner()).prune_unpaid(now) > 0 {
             dirty = true;
         }
-        let e = engine.lock().unwrap_or_else(|e| e.into_inner());
-        save_if_changed(&e, path, now_ms(), dirty || e.audit_len() != before);
+        if dirty || engine.lock().unwrap_or_else(|e| e.into_inner()).audit_len() != before {
+            mark_dirty();
+        }
+        LAST_BACKGROUND_MS.store(now_ms(), Ordering::SeqCst);
+        let _ = path;
     }
 }
 
@@ -2385,17 +2516,23 @@ fn main() -> std::io::Result<()> {
     let engine: &'static Mutex<Engine> = Box::leak(Box::new(Mutex::new(engine)));
     let path: &'static std::path::Path = Box::leak(path.into_boxed_path());
 
-    std::thread::spawn(move || background(engine, path));
+    listen_for_stop();
+    supervise("the background job", move || background(engine, path));
+    supervise("the saver", move || saver(engine, path));
     let data_dir = path.parent().map(|d| d.to_path_buf()).unwrap_or_default();
     watch::load(data_dir.clone());
     metrics::load(data_dir.clone());
-    chain::start(data_dir, pay.base_rpc.clone());
+    chain::start(data_dir, autopay::base_rpc_urls());
 
     http::serve(&addr, move |req| {
-        // Reads can change state too (a status check that finds a payment), so every request
-        // is checked the same way: save when the audit log grew.
+        // What can change state: any write, anything done with a key (it is metered), and a
+        // billing status check (it may find a payment). Those mark the state for the saver;
+        // free reads don't.
+        let changes = req.method != "GET" || req.api_key().is_some() || req.path.contains("billing");
         let response = route(engine, req, cfg);
-        save_if_changed(&engine.lock().unwrap_or_else(|e| e.into_inner()), path, now_ms(), false);
+        if changes {
+            mark_dirty();
+        }
         response
     })
 }
@@ -2701,6 +2838,28 @@ mod tests {
         }
         let right_but_locked = [("X-Real-IP", "203.0.113.99"), ("X-Admin-Secret", "adm")];
         assert!(body_json(&route(&e, req("GET", "/v1/stats", &right_but_locked, ""), PROD)).get("revenue_usd").is_none());
+    }
+
+    #[test]
+    fn a_damaged_state_file_is_kept_aside_and_the_backup_restores() {
+        let dir = std::env::temp_dir().join(format!("keptvow-state-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut first = Engine::with_admin_secret("adm");
+        first.create_customer("First Customer", "key-1", 1);
+        assert!(save(&first, &path));
+        let mut second = first.clone();
+        second.create_customer("Second Customer", "key-2", 2);
+        assert!(save(&second, &path));
+        assert!(path.with_extension("json.bak").exists(), "the save before is kept as a backup");
+
+        // The disk mangles the live file.
+        std::fs::write(&path, "{\"truncated\": ").unwrap();
+        let restored = load_or_new(&path, "adm");
+        assert_eq!(restored.customers().len(), 1, "restored from the backup, one save behind");
+        let kept: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().into_string().unwrap()).collect();
+        assert!(kept.iter().any(|n| n.starts_with("state.corrupt-")), "the damaged file is kept for inspection: {kept:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn new_key(e: &Mutex<Engine>) -> String {
@@ -3179,5 +3338,37 @@ mod settlement_tests {
         assert!(route(&e, browser, PROD).content_type.starts_with("text/html"));
         assert_eq!(route(&e, req("GET", "/", "", ""), PROD).content_type, "application/json");
         assert!(route(&e, req("GET", "/docs", "", ""), PROD).content_type.starts_with("text/html"));
+    }
+}
+
+#[cfg(test)]
+mod scale_probe {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn snapshot_cost_with_a_big_engine() {
+        let mut e = Engine::with_admin_secret("adm");
+        for i in 0..100_000 {
+            let _ = e.authenticate(&format!("bot-{i}"), Some(&format!("ats_{i:032}")));
+            e.mark_seen(&format!("bot-{i}"), i);
+        }
+        for i in 0..20_000 {
+            let id = e.create_agreement(vec![format!("bot-{i}"), format!("bot-{}", i + 1)], 2, 1.0, "USDC".into(), domain_from("commerce"), None, i).unwrap();
+            e.report(&id, &format!("bot-{i}"), 0, None, i + 1).unwrap();
+            e.report(&id, &format!("bot-{}", i + 1), 0, None, i + 2).unwrap();
+        }
+        let t = std::time::Instant::now();
+        let copy = e.clone();
+        println!("clone: {:?}", t.elapsed());
+        drop(copy);
+        let t = std::time::Instant::now();
+        let body = e.to_snapshot().to_string();
+        println!("snapshot: {} MB in {:?}", body.len() / 1_000_000, t.elapsed());
+        if let Ok(out) = std::env::var("KEPTVOW_PROBE_OUT") {
+            std::fs::write(out, &body).unwrap();
+        }
+        let t = std::time::Instant::now();
+        let back = Engine::from_snapshot(&json::parse(&body).unwrap()).unwrap();
+        println!("load: {:?} ({} audit entries)", t.elapsed(), back.audit_len());
     }
 }

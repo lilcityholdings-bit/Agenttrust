@@ -98,6 +98,8 @@ pub struct Index {
     pub head: u64,
     pub agents: BTreeMap<u64, Agent>,
     pub last_error: String,
+    /// When a Base node last answered, in ms (0 = not yet since boot).
+    pub last_ok_ms: i64,
     /// How many bots each reviewing wallet has reviewed.
     reach: std::collections::HashMap<String, u32>,
     stored_reviews: usize,
@@ -1073,8 +1075,33 @@ fn save(path: &PathBuf) {
     }
 }
 
+static SAVE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Saves the index now if it changed — used when the process is asked to stop.
+pub fn save_now() {
+    if let Some(p) = SAVE_PATH.get() {
+        save(p);
+    }
+}
+
+/// Calls the first Base node that answers, starting with the one that answered last.
+fn rpc_any(urls: &[String], preferred: &mut usize, method: &str, params: Json) -> Result<Json, String> {
+    let mut last_err = String::from("no Base node configured");
+    for k in 0..urls.len() {
+        let i = (*preferred + k) % urls.len();
+        match rpc(&urls[i], method, params.clone()) {
+            Ok(j) => {
+                *preferred = i;
+                return Ok(j);
+            }
+            Err(e) => last_err = format!("{}: {e}", urls[i]),
+        }
+    }
+    Err(last_err)
+}
+
 /// Loads the saved index from `dir` and starts both readers. Call once, at boot.
-pub fn start(dir: PathBuf, rpc_url: String) {
+pub fn start(dir: PathBuf, rpc_urls: Vec<String>) {
     let path = dir.join("onchain.jsonl");
     let old_path = dir.join("onchain.json");
     let start_block = std::env::var("ERC8004_START_BLOCK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_START_BLOCK);
@@ -1096,16 +1123,17 @@ pub fn start(dir: PathBuf, rpc_url: String) {
             let _ = std::fs::remove_file(&old_path);
         }
     }
-    let logs_url = rpc_url.clone();
-    std::thread::spawn(move || read_logs(logs_url, path));
+    let _ = SAVE_PATH.set(path.clone());
+    crate::supervise("the registry reader", move || read_logs(rpc_urls.clone(), path.clone()));
     // Most of the wait is on other people's servers (many never answer), so several readers
     // share the queue.
     for _ in 0..12 {
-        std::thread::spawn(read_registration_files);
+        crate::supervise("a registration file reader", read_registration_files);
     }
 }
 
-fn read_logs(url: String, path: PathBuf) {
+fn read_logs(urls: Vec<String>, path: PathBuf) {
+    let mut preferred = 0usize;
     let tp = topics();
     let wanted = Json::Array(
         [&tp.registered, &tp.uri_updated, &tp.metadata_set, &tp.transfer, &tp.new_feedback, &tp.feedback_revoked]
@@ -1122,7 +1150,7 @@ fn read_logs(url: String, path: PathBuf) {
     let mut last_save = Instant::now();
     let mut last_report: Option<Instant> = None;
     loop {
-        let head = match rpc(&url, "eth_blockNumber", Json::Array(vec![])) {
+        let head = match rpc_any(&urls, &mut preferred, "eth_blockNumber", Json::Array(vec![])) {
             Ok(v) => v.as_str().and_then(hex_u64).unwrap_or(0).saturating_sub(CONFIRMATIONS),
             Err(e) => {
                 eprintln!("keptvow: bot registry: {e}");
@@ -1134,6 +1162,7 @@ fn read_logs(url: String, path: PathBuf) {
         let cursor = {
             let mut idx = lock();
             idx.head = idx.head.max(head);
+            idx.last_ok_ms = now_ms();
             idx.cursor
         };
         if cursor >= head {
@@ -1157,7 +1186,7 @@ fn read_logs(url: String, path: PathBuf) {
             ("address", Json::Array(vec![Json::str(IDENTITY), Json::str(REPUTATION)])),
             ("topics", Json::Array(vec![wanted.clone()])),
         ]);
-        match rpc(&url, "eth_getLogs", Json::Array(vec![filter])) {
+        match rpc_any(&urls, &mut preferred, "eth_getLogs", Json::Array(vec![filter])) {
             Ok(Json::Array(logs)) => {
                 let mut idx = lock();
                 for log in &logs {

@@ -235,7 +235,12 @@ where
     let handler = Arc::new(handler);
     let open = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
+        let Ok(mut stream) = stream else {
+            // Usually "too many open files": pause instead of spinning a core at full speed
+            // until connections close.
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {

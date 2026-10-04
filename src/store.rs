@@ -677,6 +677,7 @@ impl Registration {
     }
 }
 
+#[derive(Clone)]
 pub struct Engine {
     customers: HashMap<String, Customer>,
     /// Which customer's key opened each agreement, so an escalated dispute bills the right one.

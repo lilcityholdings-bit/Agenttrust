@@ -220,7 +220,38 @@ pub fn stripe_add_overage(cfg: &PayConfig, stripe_customer: &str, cents: i64) ->
     .map(|_| ())
 }
 
-fn rpc(cfg: &PayConfig, method: &str, params: Json) -> Result<Json, String> {
+/// Base nodes to try in order: `BASE_RPC_URL` (one or several, comma-separated), then a public
+/// backup, so one node going down doesn't stop payments or registry reading.
+pub fn base_rpc_urls() -> Vec<String> {
+    let mut urls: Vec<String> = config().base_rpc.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect();
+    for backup in ["https://mainnet.base.org", "https://base-rpc.publicnode.com"] {
+        if !urls.iter().any(|u| u == backup) {
+            urls.push(backup.to_string());
+        }
+    }
+    urls
+}
+
+/// The first node that answers wins; the one that answered last is tried first next time.
+fn rpc(_cfg: &PayConfig, method: &str, params: Json) -> Result<Json, String> {
+    static PREFERRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let urls = base_rpc_urls();
+    let start = PREFERRED.load(std::sync::atomic::Ordering::Relaxed) % urls.len();
+    let mut last_err = String::new();
+    for k in 0..urls.len() {
+        let i = (start + k) % urls.len();
+        match rpc_at(&urls[i], method, params.clone()) {
+            Ok(j) => {
+                PREFERRED.store(i, std::sync::atomic::Ordering::Relaxed);
+                return Ok(j);
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+fn rpc_at(url: &str, method: &str, params: Json) -> Result<Json, String> {
     let body = Json::obj(vec![
         ("jsonrpc", Json::str("2.0")),
         ("id", Json::num(1.0)),
@@ -228,7 +259,7 @@ fn rpc(cfg: &PayConfig, method: &str, params: Json) -> Result<Json, String> {
         ("params", params),
     ]);
     let resp = agent()
-        .post(&cfg.base_rpc)
+        .post(url)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
         .map_err(|e| format!("Base RPC failed: {e}"))?;

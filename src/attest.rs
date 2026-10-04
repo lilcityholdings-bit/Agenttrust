@@ -309,7 +309,7 @@ impl DomainScores {
 
 /// The whole federated view: every agent's per-domain standing, plus the standing of the
 /// sources doing the reporting.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TrustNetwork {
     agents: HashMap<String, DomainScores>,
     sources: HashMap<String, i32>,
