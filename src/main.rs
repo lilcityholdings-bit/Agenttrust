@@ -22,6 +22,7 @@ mod billing;
 mod hash;
 mod http;
 mod json;
+mod metrics;
 mod jury;
 mod mcp;
 mod store;
@@ -264,6 +265,7 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
             | ("GET", ["sitemap.xml"])
             | ("GET", ["robots.txt"])
             | ("GET", ["guard.js"])
+            | ("GET", ["stats"])
             | ("GET", ["v1", "pricing"])
             | ("GET", ["billing", "done"])
             | ("POST", ["mcp"])
@@ -435,7 +437,11 @@ fn verify_registration(engine: &Mutex<Engine>, agent_id: &str, body: &Json, now:
         Err(e) => return err(422, &format!("proof rejected: {e}")),
     };
     let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-    match engine.record_verified(agent_id, protocol, &external_id, &method, timestamp_ms, now) {
+    let recorded = engine.record_verified(agent_id, protocol, &external_id, &method, timestamp_ms, now);
+    if recorded.is_ok() && protocol == "erc8004" {
+        metrics::count("bots_claimed", now);
+    }
+    match recorded {
         Ok(()) => ok(Json::obj(vec![
             ("agent_id", Json::str(agent_id)),
             ("protocol", Json::str(protocol)),
@@ -576,6 +582,44 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
     ]))
 }
 
+/// The traction numbers anyone may see.
+fn public_stats(engine: &Engine, now: i64) -> Json {
+    let (keptvow_bots, settled, _) = engine.stats();
+    let registry_bots = chain::index().lock().unwrap_or_else(|e| e.into_inner()).agents.len();
+    let m = metrics::lock();
+    Json::obj(vec![
+        ("bots_rated", Json::num((registry_bots + keptvow_bots) as f64)),
+        ("registry_bots", Json::num(registry_bots as f64)),
+        ("registry_bots_claimed", Json::num(engine.count_verified("erc8004") as f64)),
+        ("keptvow_bots", Json::num(keptvow_bots as f64)),
+        ("deals_settled", Json::num(settled as f64)),
+        ("activity", m.summary_json(now)),
+        ("daily", m.daily_json(30)),
+    ])
+}
+
+/// Counts what each request was, for the traction numbers at /v1/stats.
+fn count_traffic(req: &Request, segments: &[&str], now: i64) {
+    let event = match (req.method.as_str(), segments) {
+        ("GET", ["v1", "trust", _]) | ("GET", ["v1", "trust", "lookup"]) => Some("trust_checks"),
+        ("GET", ["v1", "check"]) => Some("payment_checks"),
+        ("GET", ["bots", _, _]) => Some("bot_pages"),
+        ("GET", ["bots"]) => Some("directory_views"),
+        ("POST", ["mcp"]) => Some("mcp_calls"),
+        ("GET", ["guard.js"]) => Some("guard_downloads"),
+        _ => None,
+    };
+    let api = matches!(segments.first(), Some(&"v1") | Some(&"mcp") | Some(&"bots") | Some(&"guard.js"));
+    if event.is_none() && !api {
+        return;
+    }
+    let mut m = metrics::lock();
+    if let Some(e) = event {
+        m.count(e, now);
+    }
+    m.caller(req.client_ip(), now);
+}
+
 /// Where a watched target stands now: a wallet's payment verdict (ok, careful, stop) or a
 /// bot's trust level, with the reasons.
 fn target_level(engine: &Engine, target: &str, now: i64) -> (String, Vec<String>) {
@@ -676,6 +720,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
     };
     let now = clock(&req, &body, cfg);
     let method = req.method.as_str();
+    count_traffic(&req, &segments, now);
 
     match (method, segments.as_slice()) {
         ("GET", ["llms.txt"]) | ("GET", ["skill.md"]) => {
@@ -815,6 +860,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 return err(409, e);
             }
             engine.mark_seen(&name, now);
+            metrics::count("bots_registered", now);
             let base = base_url(&req);
             Response::json(
                 201,
@@ -985,6 +1031,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 ("check_payment", Json::str(format!("GET /v1/billing/invoices/{inv_id}"))),
             ];
             if let Some(k) = new_key {
+                metrics::count("plan_signups", now);
                 out.insert(1, ("api_key", Json::str(k)));
                 out.insert(2, ("important", Json::str("Save the api_key now — it is shown once. It works as soon as the payment lands, until the credit is used.")));
             }
@@ -1071,6 +1118,34 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             let cid = customer_id.clone().unwrap_or_default();
             let since = req.q("since").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
             ok(Json::obj(vec![("alerts", Json::Array(watch::lock().alerts_since(&cid, since)))]))
+        }
+        // ---- traction, in public: proof the numbers are real ------------------------------
+        ("GET", ["stats"]) => Response::html(botpages::stats_page(&public_stats(&engine, now), &base_url(&req))),
+        ("GET", ["v1", "stats"]) => {
+            let Json::Object(public) = public_stats(&engine, now) else { unreachable!() };
+            let mut out: Vec<(&str, Json)> = Vec::new();
+            // The operator also sees the money. A wrong secret here counts toward the same
+            // lockout as the admin routes, so this can't be used to guess it.
+            let operator = match admin_secret_of(&req, &body) {
+                None => false,
+                Some(_) if rate_count("admin-fail", req.client_ip(), now, false) >= 10 => false,
+                Some(given) => {
+                    let right = engine.check_admin(Some(given)).is_ok();
+                    if !right {
+                        rate_count("admin-fail", req.client_ip(), now, true);
+                    }
+                    right
+                }
+            };
+            if operator {
+                out.push(("paying_customers", Json::num(engine.paying_customers() as f64)));
+                out.push(("revenue_usd", Json::num(engine.operator_revenue)));
+            }
+            let mut all = public;
+            for (k, v) in out {
+                all.insert(k.to_string(), v);
+            }
+            ok(Json::Object(all))
         }
         ("GET", ["guard.js"]) => Response {
             status: 200,
@@ -1271,6 +1346,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                         "POST /v1/register                   (free, one call: name -> agent_id + secret)",
                         "POST /mcp                            (MCP server for AI assistants)",
                         "GET  /llms.txt                       (guide for AI agents)",
+                        "GET  /v1/stats                       (public traction numbers)",
                         "GET  /v1/check?pay_to=0x…&amount_usd= (before paying a wallet: ok, careful or stop)",
                         "GET  /guard.js                       (drop-in check for x402 fetch clients)",
                         "POST /v1/watch {targets, webhook_url} (plan key: alerts when a bot or wallet changes standing)",
@@ -1958,6 +2034,7 @@ fn signup_platform(engine: &Mutex<Engine>, req: &Request, body: &Json, now: i64)
     if let Err(r) = attach_checkout(engine, req, &invoice_id) {
         return r;
     }
+    metrics::count("plan_signups", now);
     let e = engine.lock().unwrap_or_else(|e| e.into_inner());
     let inv = e.invoice(&invoice_id).expect("just created");
     Response::json(
@@ -2147,6 +2224,7 @@ fn background(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
             sweep_watches(engine, now);
         }
         watch::save_if_dirty();
+        metrics::save_if_dirty();
 
         if tick % 180 == 0 && engine.lock().unwrap_or_else(|e| e.into_inner()).prune_unpaid(now) > 0 {
             dirty = true;
@@ -2211,6 +2289,7 @@ fn main() -> std::io::Result<()> {
     std::thread::spawn(move || background(engine, path));
     let data_dir = path.parent().map(|d| d.to_path_buf()).unwrap_or_default();
     watch::load(data_dir.clone());
+    metrics::load(data_dir.clone());
     chain::start(data_dir, pay.base_rpc.clone());
 
     http::serve(&addr, move |req| {
@@ -2423,6 +2502,31 @@ mod tests {
         let plan_key = new_key(&e);
         let pk = [("X-Api-Key", plan_key.as_str())];
         assert_eq!(route(&e, req("POST", "/v1/credits", &pk, "{}"), PROD).status, 409, "monthly plans already include checks");
+    }
+
+    #[test]
+    fn traction_is_counted_and_public_but_money_is_operator_only() {
+        let e = engine();
+        let before = |s: &Json, k: &str| s.get("activity").and_then(|a| a.get("today")).and_then(|t| t.get(k)).and_then(|v| v.as_f()).unwrap_or(0.0);
+        let s0 = body_json(&route(&e, req("GET", "/v1/stats", &[], ""), PROD));
+        route(&e, req("GET", "/v1/trust/someone", &[("X-Real-IP", "203.0.113.50")], ""), PROD);
+        let mut c = req("GET", "/v1/check", &[], "");
+        c.query.insert("pay_to".into(), "0x000000000000000000000000000000000000dEaD".into());
+        route(&e, c, PROD);
+        let s1 = body_json(&route(&e, req("GET", "/v1/stats", &[], ""), PROD));
+        // Other tests run at the same time and share the counters, so only "went up" is certain.
+        assert!(before(&s1, "trust_checks") >= before(&s0, "trust_checks") + 1.0);
+        assert!(before(&s1, "payment_checks") >= before(&s0, "payment_checks") + 1.0);
+        assert!(s1.get("bots_rated").is_some() && s1.get("revenue_usd").is_none(), "money stays private");
+        let admin = body_json(&route(&e, req("GET", "/v1/stats", &[("X-Admin-Secret", "adm")], ""), PROD));
+        assert!(admin.get("revenue_usd").is_some() && admin.get("paying_customers").is_some());
+        // Guessing the secret here hits the same lockout as the admin routes.
+        let guesser = [("X-Real-IP", "203.0.113.99"), ("X-Admin-Secret", "guess")];
+        for _ in 0..12 {
+            route(&e, req("GET", "/v1/stats", &guesser, ""), PROD);
+        }
+        let right_but_locked = [("X-Real-IP", "203.0.113.99"), ("X-Admin-Secret", "adm")];
+        assert!(body_json(&route(&e, req("GET", "/v1/stats", &right_but_locked, ""), PROD)).get("revenue_usd").is_none());
     }
 
     fn new_key(e: &Mutex<Engine>) -> String {

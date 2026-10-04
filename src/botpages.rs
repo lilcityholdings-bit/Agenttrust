@@ -93,7 +93,7 @@ fn page(title: &str, description: &str, canonical: &str, body: &str) -> String {
 </head>
 <body>
 <main>
-<nav><a class="brand" href="/">Keptvow</a><a href="/bots">All bots</a><a href="/docs">Docs</a></nav>
+<nav><a class="brand" href="/">Keptvow</a><a href="/bots">All bots</a><a href="/stats">Numbers</a><a href="/docs">Docs</a></nav>
 {body}
 </main>
 </body>
@@ -381,12 +381,62 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
     Some(page(&format!("{name} — bot #{id} trust score | Keptvow"), &summary, &format!("{base}/bots/{}/{id}", chain::CHAIN_NAME), &body))
 }
 
+/// `/stats` — the traction numbers, in public. Built from the same JSON as `/v1/stats`.
+pub fn stats_page(stats: &Json, base: &str) -> String {
+    let num = |j: Option<&Json>| j.and_then(|v| v.as_f()).unwrap_or(0.0) as usize;
+    let week = stats.get("activity").and_then(|a| a.get("last_7_days"));
+    let w = |k: &str| num(week.and_then(|x| x.get(k)));
+    let tile = |n: usize, label: &str| format!(r#"<div class="stat"><b>{}</b><span>{}</span></div>"#, fmt_count(n), esc(label));
+    let tiles = [
+        tile(num(stats.get("bots_rated")), "bots rated"),
+        tile(num(stats.get("registry_bots_claimed")), "bots claimed by owners"),
+        tile(num(stats.get("deals_settled")), "deals settled"),
+        tile(w("trust_checks") + w("payment_checks"), "checks, last 7 days"),
+        tile(w("distinct_callers"), "distinct callers, last 7 days"),
+        tile(w("bot_pages") + w("directory_views"), "page views, last 7 days"),
+    ]
+    .concat();
+    let mut rows = String::new();
+    if let Some(Json::Array(days)) = stats.get("daily") {
+        let max = days.iter().map(|d| num(d.get("trust_checks")) + num(d.get("payment_checks"))).max().unwrap_or(0).max(1);
+        for d in days.iter().rev() {
+            let checks = num(d.get("trust_checks")) + num(d.get("payment_checks"));
+            rows.push_str(&format!(
+                r#"<tr><td class="mono">{day}</td><td><div class="bar"><span style="width:{pct}%"></span></div></td><td>{checks}</td><td>{callers}</td><td>{claims}</td></tr>"#,
+                day = esc(d.get("day").and_then(|v| v.as_str()).unwrap_or("")),
+                pct = checks * 100 / max,
+                checks = fmt_count(checks),
+                callers = fmt_count(num(d.get("distinct_callers"))),
+                claims = fmt_count(num(d.get("bots_claimed"))),
+            ));
+        }
+    }
+    if rows.is_empty() {
+        rows = r#"<tr><td colspan="5" class="muted">Counting started today.</td></tr>"#.into();
+    }
+    let body = format!(
+        r#"<h1>Keptvow in numbers</h1>
+<p class="sub">Live and public. Counts only — nobody's identity is stored.</p>
+<section><div class="stats" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">{tiles}</div></section>
+<section>
+<h2>Day by day</h2>
+<table class="days"><thead><tr><th>Day</th><th></th><th>Checks</th><th>Callers</th><th>Claims</th></tr></thead><tbody>{rows}</tbody></table>
+</section>
+<p class="muted">Raw numbers: <a href="/v1/stats">/v1/stats</a></p>"#
+    );
+    page("Keptvow in numbers", "Live traction numbers for Keptvow, the trust layer for AI bots.", &format!("{base}/stats"), &body)
+        .replace(
+            "</style>",
+            "  table.days { width: 100%; border-collapse: collapse; font-size: .9rem; }\n  .days th, .days td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--line); }\n  .days td:nth-child(n+3), .days th:nth-child(n+3) { text-align: right; font-variant-numeric: tabular-nums; }\n  .bar { background: var(--bg); border-radius: 3px; height: 8px; min-width: 60px; }\n  .bar span { display: block; height: 8px; border-radius: 3px; background: var(--accent); }\n</style>",
+        )
+}
+
 /// `/sitemap.xml` — every bot page, so search engines index them.
 pub fn sitemap(idx: &Index, base: &str) -> String {
     let mut s = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 "#);
-    for path in ["", "/bots", "/docs", "/trust"] {
+    for path in ["", "/bots", "/docs", "/trust", "/stats"] {
         s.push_str(&format!("<url><loc>{}{path}</loc></url>\n", esc(base)));
     }
     // The sitemap format allows 50,000 addresses per file.

@@ -1586,6 +1586,16 @@ impl Engine {
             .map(|s| s.as_str())
     }
 
+    /// How many identities of one kind have been proven (e.g. registry bots claimed).
+    pub fn count_verified(&self, protocol: &str) -> usize {
+        self.registrations.values().flatten().filter(|r| r.protocol == protocol && r.verified.is_some()).count()
+    }
+
+    /// Self-serve customers that have paid at least once.
+    pub fn paying_customers(&self) -> usize {
+        self.customers.values().filter(|c| c.self_serve() && !c.payments.is_empty()).count()
+    }
+
     /// Agents that have claimed (verified or not) an identity.
     pub fn claimants_of(&self, protocol: &str, external_id: &str) -> Vec<String> {
         let mut out: Vec<String> = self
