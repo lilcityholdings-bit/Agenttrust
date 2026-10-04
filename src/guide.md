@@ -106,7 +106,15 @@ Self-serve, active the minute payment lands:
 curl -X POST {URL}/v1/platforms -H 'Content-Type: application/json' -d '{"name":"My company","plan":"watch","pay_with":"usdc"}'
 ```
 
-**Watch alerts** (any plan): list the bots and wallets you depend on and hear when one changes standing.
+**Pay as you go instead** (no monthly fee): prepaid credit in USDC, $0.001 per check, $0.02 per deal.
+
+```
+curl -X POST {URL}/v1/credits -H 'Content-Type: application/json' -d '{"amount_usd":10}'
+```
+
+Pay the exact USDC amount it returns; the key works the moment it lands and until the credit is used. Top up with the same call plus your `X-Api-Key`. (Credit keys skip the free limits but don't count as a paying platform.)
+
+**Watch alerts** (Watch and Platform plans): list the bots and wallets you depend on and hear when one changes standing.
 
 ```
 curl -X POST {URL}/v1/watch -H 'X-Api-Key: KEY' -H 'Content-Type: application/json' \

@@ -934,6 +934,14 @@ impl Engine {
         let hash = sha256_hex(raw_key.as_bytes());
         match self.customers.values().find(|c| c.active && c.key_hash == hash) {
             None => KeyCheck::Unknown,
+            // Prepaid credit works while any is left; a payment tops it up.
+            Some(c) if c.tier == "credits" => {
+                if self.self_serve_balance(c) < 0 {
+                    KeyCheck::Valid(c.id.clone())
+                } else {
+                    KeyCheck::Unpaid(c.id.clone())
+                }
+            }
             Some(c) if c.paid_until_ms.map(|t| now_ms < t).unwrap_or(true) => KeyCheck::Valid(c.id.clone()),
             Some(c) => KeyCheck::Unpaid(c.id.clone()),
         }
@@ -983,13 +991,44 @@ impl Engine {
     /// gets an exact amount no other open bill has, which is how its payment is recognized.
     pub fn open_invoice(&mut self, customer_id: &str, method: &str, now_ms: i64) -> Result<String, &'static str> {
         let c = self.customers.get(customer_id).ok_or("no such customer")?;
+        if c.tier == "credits" {
+            return Err("credits are bought by amount: POST /v1/credits {\"amount_usd\": 10}");
+        }
+        let mills = self.pricing_of(c).monthly_mills + self.self_serve_balance(c).max(0);
+        self.open_bill(customer_id, method, mills, now_ms)
+    }
+
+    /// A bill for prepaid credit: the amount asked for, plus anything already overdrawn.
+    pub fn open_credit_invoice(&mut self, customer_id: &str, mills: i64, now_ms: i64) -> Result<String, &'static str> {
+        let c = self.customers.get(customer_id).ok_or("no such customer")?;
+        if c.tier != "credits" {
+            return Err("this key is on a monthly plan, which already includes checks");
+        }
+        let owed = self.self_serve_balance(c).max(0);
+        self.open_bill(customer_id, "usdc", mills + owed, now_ms)
+    }
+
+    pub fn is_credits(&self, customer_id: &str) -> bool {
+        self.customers.get(customer_id).map_or(false, |c| c.tier == "credits")
+    }
+
+    /// Meters a deal opened with a credits key. It is billed, but not counted as a paying
+    /// platform's deal: a few dollars of credit must not buy the platform independence that
+    /// good and excellent ratings require.
+    pub fn meter_agreement(&mut self, customer_id: &str, now_ms: i64) {
+        if let Some(u) = self.usage_mut(customer_id, now_ms) {
+            u.agreements += 1;
+        }
+    }
+
+    fn open_bill(&mut self, customer_id: &str, method: &str, mills: i64, now_ms: i64) -> Result<String, &'static str> {
+        let c = self.customers.get(customer_id).ok_or("no such customer")?;
         if !c.self_serve() {
             return Err("this key was issued by the operator and is billed separately");
         }
         if !c.active {
             return Err("this key was revoked");
         }
-        let mills = self.pricing_of(c).monthly_mills + self.self_serve_balance(c).max(0);
         let usdc_units = if method == "usdc" {
             let base = mills as u64 * 1000;
             let taken: HashSet<u64> =

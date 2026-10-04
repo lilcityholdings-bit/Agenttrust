@@ -598,6 +598,7 @@ fn target_level(engine: &Engine, target: &str, now: i64) -> (String, Vec<String>
 fn watch_limit(engine: &Engine, customer_id: &str) -> usize {
     match engine.customer(customer_id).map(|c| c.tier.as_str()) {
         Some("platform") => 10_000,
+        Some("credits") => 0,
         _ => 100,
     }
 }
@@ -699,9 +700,15 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         None => None,
         Some(KeyCheck::Valid(id)) => Some(id),
         Some(KeyCheck::Unpaid(id))
-            if matches!((method, segments.as_slice()), ("GET", ["v1", "usage"]) | ("POST", ["v1", "billing", "renew"])) =>
+            if matches!(
+                (method, segments.as_slice()),
+                ("GET", ["v1", "usage"]) | ("POST", ["v1", "billing", "renew"]) | ("POST", ["v1", "credits"])
+            ) =>
         {
             Some(id)
+        }
+        Some(KeyCheck::Unpaid(id)) if engine.lock().unwrap_or_else(|e| e.into_inner()).is_credits(&id) => {
+            return err(402, "this key's prepaid credit is used up — top up with POST /v1/credits {\"amount_usd\": 10}, or send no key to use the free tier")
         }
         Some(KeyCheck::Unpaid(_)) => {
             return err(
@@ -938,6 +945,52 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 Err(e) => err(400, &e),
             }
         }
+        // ---- prepaid credits: pay per check, no monthly fee ------------------------------
+        ("POST", ["v1", "credits"]) => {
+            if autopay::config().usdc_pay_to.is_none() {
+                return err(503, "credits are paid in USDC on Base, which isn't switched on yet");
+            }
+            let amount = match body.get("amount_usd") {
+                None => 10.0,
+                Some(v) => match v.as_f() {
+                    Some(a) if (5.0..=1000.0).contains(&a) => a,
+                    _ => return err(400, "amount_usd must be a number from 5 to 1000"),
+                },
+            };
+            let mills = (amount * 1000.0).round() as i64;
+            let (cid, new_key) = match &customer_id {
+                Some(c) if engine.is_credits(c) => (c.clone(), None),
+                Some(_) => return err(409, "this key is on a monthly plan, which already includes checks"),
+                None => {
+                    if !rate_ok("signup", req.client_ip(), 5, now) {
+                        return err(429, "too many sign-ups from this address — try again in an hour");
+                    }
+                    if engine.unpaid_signups() >= 500 {
+                        return err(503, "too many unpaid sign-ups right now — try again later");
+                    }
+                    let name = body.get("name").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty() && s.len() <= 80).unwrap_or("credits");
+                    let key = format!("at_live_{}", random_hex());
+                    (engine.create_self_serve(name, &key, "credits", now), Some(key))
+                }
+            };
+            let inv_id = match engine.open_credit_invoice(&cid, mills, now) {
+                Ok(i) => i,
+                Err(e) => return err(503, e),
+            };
+            let inv = engine.invoice(&inv_id).cloned().expect("just created");
+            let mut out = vec![
+                ("customer_id", Json::str(cid)),
+                ("buys", Json::str(format!("{} trust checks at $0.001, or deals at $0.02", (mills as f64).round() as i64))),
+                ("invoice", pay_instructions(&engine, &inv, now)),
+                ("check_payment", Json::str(format!("GET /v1/billing/invoices/{inv_id}"))),
+            ];
+            if let Some(k) = new_key {
+                out.insert(1, ("api_key", Json::str(k)));
+                out.insert(2, ("important", Json::str("Save the api_key now — it is shown once. It works as soon as the payment lands, until the credit is used.")));
+            }
+            Response::json(201, Json::obj(out).to_string())
+        }
+
         // ---- Watch: alerts when what a customer depends on changes standing -------------
         ("GET", ["v1", "watch"]) => {
             let cid = customer_id.clone().unwrap_or_default();
@@ -987,6 +1040,9 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 (t, level)
             }).collect();
             let limit = watch_limit(&engine, &cid);
+            if limit == 0 {
+                return err(403, "Watch alerts come with the Watch ($99) or Platform ($499) plan — see GET /v1/pricing");
+            }
             let mut w = watch::lock();
             let count = match w.add(&cid, with_levels, limit) {
                 Ok(n) => n,
@@ -1166,6 +1222,14 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     }),
                 );
                 m.insert("bots".into(), Json::str("free: POST /v1/register, then deals and trust checks with no key"));
+                m.insert(
+                    "credits".into(),
+                    Json::obj(vec![
+                        ("per_check_usd", Json::num(0.001)),
+                        ("per_deal_usd", Json::num(0.02)),
+                        ("buy", Json::str("POST /v1/credits {\"amount_usd\": 10} — $5 to $1,000, paid in USDC on Base, no monthly fee")),
+                    ]),
+                );
             }
             ok(j)
         }
@@ -1305,13 +1369,18 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             let arbiter = body.get("arbiter").and_then(|v| v.as_str()).map(|s| s.to_string());
             match engine.create_agreement(parties, outcomes, stake, asset, domain, arbiter, now) {
                 Ok(id) => {
+                    let credits = customer_id.as_deref().map_or(false, |c| engine.is_credits(c));
                     if let Some(cid) = &customer_id {
-                        engine.tag_agreement(&id, cid, now);
+                        if credits {
+                            engine.meter_agreement(cid, now);
+                        } else {
+                            engine.tag_agreement(&id, cid, now);
+                        }
                     }
                     engine.set_labels(&id, labels);
                     let a = engine.agreement(&id).unwrap();
                     let other = a.parties[1].clone();
-                    let tier = if customer_id.is_some() {
+                    let tier = if customer_id.is_some() && !credits {
                         "platform"
                     } else {
                         "free — counts toward both bots' trust (up to 150 points each from free deals); \
@@ -2313,6 +2382,47 @@ mod tests {
         assert!(matches!(body_json(&route(&e, since, PROD)).get("alerts"), Some(Json::Array(a)) if a.is_empty()));
         let r = body_json(&route(&e, req("POST", "/v1/watch/remove", &k, &format!(r#"{{"targets":["{wallet}"]}}"#)), PROD));
         assert_eq!(r.get("watching").and_then(|v| v.as_f()), Some(1.0));
+    }
+
+    #[test]
+    fn prepaid_credits_work_until_used_up_and_never_count_as_a_platform() {
+        let e = engine();
+        let ip = [("X-Real-IP", "198.51.100.88")];
+        assert_eq!(route(&e, req("POST", "/v1/credits", &ip, r#"{"amount_usd":2}"#), PROD).status, 400, "minimum $5");
+        let r = body_json(&route(&e, req("POST", "/v1/credits", &ip, r#"{"amount_usd":5,"name":"Scraper bot"}"#), PROD));
+        let key = r.get("api_key").and_then(|v| v.as_str()).unwrap().to_string();
+        let cid = r.get("customer_id").and_then(|v| v.as_str()).unwrap().to_string();
+        let inv = r.get("invoice").unwrap();
+        let inv_id = inv.get("invoice_id").and_then(|v| v.as_str()).unwrap().to_string();
+        assert!(inv.get("usdc_amount").and_then(|v| v.as_str()).unwrap().starts_with("5.000"));
+        let k = [("X-Api-Key", key.as_str())];
+        let unpaid = route(&e, req("GET", "/v1/trust/a", &k, ""), PROD);
+        assert_eq!(unpaid.status, 402);
+        assert!(unpaid.body.contains("top up"), "{}", unpaid.body);
+
+        e.lock().unwrap().pay_invoice(&inv_id, "0xc0ffee:1", now_ms()).unwrap();
+        assert_eq!(route(&e, req("GET", "/v1/trust/a", &k, ""), PROD).status, 200, "credit works once paid");
+        let deal = body_json(&route(&e, req("POST", "/v1/agreements", &k, r#"{"parties":["c1","c2"],"secret":"s"}"#), PROD));
+        assert_ne!(deal.get("tier").and_then(|v| v.as_str()), Some("platform"), "credit doesn't buy platform standing");
+        assert_eq!(route(&e, req("POST", "/v1/watch", &k, r#"{"targets":["a"]}"#), PROD).status, 403);
+
+        // $5 is 5,000 checks; the 5,000th used, the key stops until topped up.
+        {
+            let mut g = e.lock().unwrap();
+            for _ in 0..5_000 {
+                g.meter_lookup(&cid, now_ms());
+            }
+        }
+        assert_eq!(route(&e, req("GET", "/v1/trust/a", &k, ""), PROD).status, 402);
+        let top = route(&e, req("POST", "/v1/credits", &k, r#"{"amount_usd":10}"#), PROD);
+        assert_eq!(top.status, 201, "{}", top.body);
+        let top = body_json(&top);
+        assert!(top.get("api_key").is_none(), "a top-up keeps the same key");
+        let amount = top.get("invoice").unwrap().get("usdc_amount").and_then(|v| v.as_str()).unwrap().to_string();
+        assert!(amount.starts_with("10.0"), "{amount}");
+        let plan_key = new_key(&e);
+        let pk = [("X-Api-Key", plan_key.as_str())];
+        assert_eq!(route(&e, req("POST", "/v1/credits", &pk, "{}"), PROD).status, 409, "monthly plans already include checks");
     }
 
     fn new_key(e: &Mutex<Engine>) -> String {

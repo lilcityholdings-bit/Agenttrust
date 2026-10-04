@@ -112,6 +112,15 @@ impl Pricing {
                 included_lookups: 1_000_000,
                 lookup_mills: 1,
             }),
+            // Prepaid, no monthly fee: every check and deal is paid from the balance.
+            "credits" => Some(Pricing {
+                monthly_mills: 0,
+                included_agreements: 0,
+                agreement_mills: 20,
+                dispute_mills: 500,
+                included_lookups: 0,
+                lookup_mills: 1,
+            }),
             _ => None,
         }
     }
@@ -120,6 +129,7 @@ impl Pricing {
         match tier {
             "watch" => "Keptvow Watch",
             "platform" => "Keptvow Platform",
+            "credits" => "Keptvow credits",
             _ => "Keptvow plan",
         }
     }
