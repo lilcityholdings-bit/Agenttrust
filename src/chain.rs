@@ -454,6 +454,142 @@ impl Index {
         self.dirty = true;
     }
 
+    // ---- the "State of AI bots" numbers ------------------------------------------------------
+
+    /// The date (UTC, "YYYY-MM-DD") a Base block was made.
+    pub fn block_day(block: u64) -> String {
+        const BASE_GENESIS_SECS: i64 = 1_686_789_347;
+        crate::metrics::day_of((BASE_GENESIS_SECS + block as i64 * BLOCK_SECONDS as i64) * 1000)
+    }
+
+    /// What the whole registry looks like: growth, bursts, who owns how many bots, how many
+    /// have a readable profile, and how much of the reviewing comes from wallets that review
+    /// almost everything. Every number is computed from the index, nothing is estimated.
+    pub fn report(&self) -> Json {
+        use std::collections::HashMap;
+        let n = |x: usize| Json::num(x as f64);
+        let total = self.agents.len();
+        let mut by_month: BTreeMap<String, usize> = BTreeMap::new();
+        let mut by_day: HashMap<String, usize> = HashMap::new();
+        let mut owners: HashMap<&str, usize> = HashMap::new();
+        let mut reviewer_bots: HashMap<&str, usize> = HashMap::new();
+        let (mut named, mut unreadable, mut no_file, mut pending, mut x402, mut with_services, mut own_wallet) = (0, 0, 0, 0, 0, 0, 0);
+        let (mut reviewed, mut reviews, mut ratings, mut fair, mut caution) = (0, 0, 0, 0, 0);
+        for a in self.agents.values() {
+            let day = Index::block_day(a.block);
+            *by_month.entry(day[..7].to_string()).or_default() += 1;
+            *by_day.entry(day).or_default() += 1;
+            *owners.entry(a.owner.as_str()).or_default() += 1;
+            match (a.uri.is_empty(), a.meta) {
+                (true, _) => no_file += 1,
+                (false, 1) => {
+                    if !a.name.is_empty() {
+                        named += 1;
+                    }
+                }
+                (false, 2) => unreadable += 1,
+                _ => pending += 1,
+            }
+            if a.x402 {
+                x402 += 1;
+            }
+            if !a.services.is_empty() {
+                with_services += 1;
+            }
+            if !a.wallet.is_empty() && a.wallet != a.owner {
+                own_wallet += 1;
+            }
+            if !a.reviews.is_empty() {
+                reviewed += 1;
+            }
+            for (client, per) in &a.reviews {
+                *reviewer_bots.entry(client.as_str()).or_default() += 1;
+                reviews += per.len();
+                ratings += per.values().filter(|(r, _)| r.is_some()).count();
+            }
+            match self.assess(a).0 {
+                "fair" => fair += 1,
+                "caution" => caution += 1,
+                _ => {}
+            }
+        }
+        let mut days: Vec<(String, usize)> = by_day.into_iter().collect();
+        days.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+        let mut top_owners: Vec<usize> = owners.values().copied().collect();
+        top_owners.sort_unstable_by(|a, b| b.cmp(a));
+        let owners_with_100 = top_owners.iter().filter(|c| **c >= 100).count();
+        let bots_of_big_owners: usize = top_owners.iter().filter(|c| **c >= 100).sum();
+        let reviewers = reviewer_bots.len();
+        let heavy: Vec<(&str, usize)> = reviewer_bots.iter().filter(|(_, c)| **c >= 50).map(|(k, v)| (*k, *v)).collect();
+        // Bots whose reviewers are mostly wallets that review 50+ bots: reviews nobody earned.
+        let heavy_set: std::collections::HashSet<&str> = heavy.iter().map(|(k, _)| *k).collect();
+        let mostly_heavy = self
+            .agents
+            .values()
+            .filter(|a| !a.reviews.is_empty())
+            .filter(|a| a.reviews.keys().filter(|c| heavy_set.contains(c.as_str())).count() * 2 > a.reviews.len())
+            .count();
+        Json::obj(vec![
+            ("as_of_block", Json::num(self.cursor as f64)),
+            ("as_of_day", Json::str(Index::block_day(self.cursor))),
+            ("bots", n(total)),
+            ("registered_by_month", Json::Object(by_month.into_iter().map(|(k, v)| (k, Json::num(v as f64))).collect())),
+            (
+                "busiest_days",
+                Json::Array(days.iter().take(5).map(|(d, c)| Json::obj(vec![("day", Json::str(d.clone())), ("bots", n(*c))])).collect()),
+            ),
+            ("distinct_owners", n(owners.len())),
+            ("largest_owner_bots", n(top_owners.first().copied().unwrap_or(0))),
+            ("owners_with_100_plus_bots", n(owners_with_100)),
+            ("bots_of_owners_with_100_plus", n(bots_of_big_owners)),
+            ("profile_readable_with_name", n(named)),
+            ("profile_unreadable", n(unreadable)),
+            ("no_profile_file", n(no_file)),
+            ("profile_not_read_yet", n(pending)),
+            ("say_they_take_x402", n(x402)),
+            ("list_services", n(with_services)),
+            ("separate_payment_wallet", n(own_wallet)),
+            ("bots_with_reviews", n(reviewed)),
+            ("reviews", n(reviews)),
+            ("reviews_that_are_ratings", n(ratings)),
+            ("distinct_reviewers", n(reviewers)),
+            ("reviewers_of_one_bot", n(reviewer_bots.values().filter(|c| **c == 1).count())),
+            ("reviewers_of_50_plus_bots", n(heavy.len())),
+            ("bots_reviewed_mostly_by_mass_reviewers", n(mostly_heavy)),
+            ("rated_fair", n(fair)),
+            ("rated_caution", n(caution)),
+            ("most_reviewed", self.most_reviewed(30, &heavy_set)),
+        ])
+    }
+
+    /// The bots with the most independent reviewers (mass reviewers left out), with what their
+    /// owners published — where to look first for owners who care about reputation.
+    fn most_reviewed(&self, k: usize, mass: &std::collections::HashSet<&str>) -> Json {
+        let mut ranked: Vec<(u64, &Agent, usize)> = self
+            .agents
+            .iter()
+            .map(|(id, a)| (*id, a, a.reviews.keys().filter(|c| !mass.contains(c.as_str())).count()))
+            .filter(|(_, _, c)| *c > 0)
+            .collect();
+        ranked.sort_by(|x, y| y.2.cmp(&x.2).then(x.0.cmp(&y.0)));
+        Json::Array(
+            ranked
+                .into_iter()
+                .take(k)
+                .map(|(id, a, c)| {
+                    Json::obj(vec![
+                        ("id", Json::num(id as f64)),
+                        ("name", Json::str(Index::display_name(id, a))),
+                        ("independent_reviewers", Json::num(c as f64)),
+                        ("level", Json::str(self.assess(a).0)),
+                        ("x402", Json::Bool(a.x402)),
+                        ("first_service", a.services.first().map(|(_, e)| Json::str(e.clone())).unwrap_or(Json::Null)),
+                    ])
+                })
+                .collect(),
+        )
+    }
+
     // ---- persistence ------------------------------------------------------------------------
 
     pub fn to_json(&self) -> Json {
@@ -746,6 +882,7 @@ fn read_logs(url: String, path: PathBuf) {
     let mut ceiling = MAX_SPAN;
     let mut streak = 0u32;
     let mut last_save = Instant::now();
+    let mut last_report: Option<Instant> = None;
     loop {
         let head = match rpc(&url, "eth_blockNumber", Json::Array(vec![])) {
             Ok(v) => v.as_str().and_then(hex_u64).unwrap_or(0).saturating_sub(CONFIRMATIONS),
@@ -765,6 +902,11 @@ fn read_logs(url: String, path: PathBuf) {
             if last_save.elapsed() > Duration::from_secs(60) {
                 save(&path);
                 last_save = Instant::now();
+            }
+            // Once caught up, and then daily: the registry-wide numbers, to the log.
+            if last_report.map_or(true, |t: Instant| t.elapsed() > Duration::from_secs(86_400)) {
+                println!("keptvow: registry report: {}", lock().report().to_string());
+                last_report = Some(Instant::now());
             }
             std::thread::sleep(Duration::from_secs(20));
             continue;
@@ -985,6 +1127,30 @@ pub(crate) mod tests {
         assert_eq!(m.name, "Plain");
         assert!(matches!(source_of("ipfs://bafyabc/agent.json"), Ok(Source::Url(u)) if u == "https://ipfs.io/ipfs/bafyabc/agent.json"));
         assert!(source_of("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn the_registry_report_counts_what_is_there() {
+        let mut idx = Index::starting_at(0);
+        for id in 0..120u64 {
+            idx.apply(&registered(id, "0x00000000000000000000000000000000000000f0", "", 2_000_000));
+        }
+        idx.apply(&registered(500, "0x00000000000000000000000000000000000000f1", "https://x.example/a.json", 3_000_000));
+        for id in 0..60u64 {
+            idx.apply(&feedback(id, &client(1), 1, 100, 0, "starred"));
+        }
+        idx.apply(&feedback(500, &client(2), 1, 90, 0, ""));
+        let r = idx.report();
+        let num = |k: &str| r.get(k).and_then(|v| v.as_f()).unwrap();
+        assert_eq!(num("bots"), 121.0);
+        assert_eq!(num("largest_owner_bots"), 120.0);
+        assert_eq!(num("owners_with_100_plus_bots"), 1.0);
+        assert_eq!(num("no_profile_file"), 120.0);
+        assert_eq!(num("profile_not_read_yet"), 1.0);
+        assert_eq!(num("distinct_reviewers"), 2.0);
+        assert_eq!(num("reviewers_of_50_plus_bots"), 1.0);
+        assert_eq!(num("bots_reviewed_mostly_by_mass_reviewers"), 60.0);
+        assert_eq!(Index::block_day(0), "2023-06-15");
     }
 
     #[test]
