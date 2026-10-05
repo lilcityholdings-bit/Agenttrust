@@ -945,6 +945,7 @@ pub fn start(dir: PathBuf, rpc_urls: Vec<String>, catalog_urls: Vec<String>) {
     crate::supervise("the payment scanner", move || scan_live(&urls));
     let urls = rpc_urls.clone();
     crate::supervise("the payment history reader", move || scan_backfill(&urls));
+    crate::supervise("the progress reporter", progress_loop);
     crate::supervise("the service catalog reader", move || read_catalog(&catalog_urls));
     // Four at a time: one alone can't visit tens of thousands of services in a day.
     for _ in 0..PROBERS {
@@ -1024,6 +1025,17 @@ fn scan_live(urls: &[String]) {
 /// history reader (`usize::MAX` until the first count).
 pub static STRONG_SELLERS: AtomicUsize = AtomicUsize::new(usize::MAX);
 
+/// How the history reader's queries to Base have gone since the server started, so a slow
+/// history can be diagnosed from the log: queries that answered, queries that failed, the time
+/// they took, and the block span it is currently asking for.
+static BF_OK: AtomicUsize = AtomicUsize::new(0);
+static BF_FAILED: AtomicUsize = AtomicUsize::new(0);
+static BF_OK_MS: AtomicUsize = AtomicUsize::new(0);
+static BF_FAILED_MS: AtomicUsize = AtomicUsize::new(0);
+static BF_SPAN: AtomicUsize = AtomicUsize::new(0);
+static BF_BATCHES: AtomicUsize = AtomicUsize::new(0);
+static BF_STOPPED: AtomicUsize = AtomicUsize::new(0);
+
 /// Logs how far reading history has got, how many sellers have earned a strong record, and how
 /// many services were visited in the last day. Run from the history reader's thread, never on
 /// a request.
@@ -1044,8 +1056,37 @@ fn report_progress() {
         (line, spread)
     };
     println!("{line}");
+    println!("keptvow: {}", reader_line());
     println!("keptvow: sellers against the bar for ok: {}", spread_line(&spread));
     *BAR_SPREAD.lock().unwrap_or_else(|e| e.into_inner()) = spread;
+}
+
+/// One line on how reading history from Base is going.
+fn reader_line() -> String {
+    let (ok, failed) = (BF_OK.load(Ordering::Relaxed), BF_FAILED.load(Ordering::Relaxed));
+    let avg = |ms: &AtomicUsize, n: usize| if n == 0 { 0 } else { ms.load(Ordering::Relaxed) / n };
+    let err = lock().last_error.clone();
+    format!(
+        "history reader: {ok} queries answered (avg {} ms), {failed} failed (avg {} ms), asking for {} blocks at a time, \
+         {} batches done, {} stopped early and requeued, {} wallets per query; last error: {}",
+        avg(&BF_OK_MS, ok),
+        avg(&BF_FAILED_MS, failed),
+        BF_SPAN.load(Ordering::Relaxed),
+        BF_BATCHES.load(Ordering::Relaxed),
+        BF_STOPPED.load(Ordering::Relaxed),
+        chunk_size(),
+        if err.is_empty() { "none".to_string() } else { err.chars().take(160).collect() }
+    )
+}
+
+/// Logs the progress lines every ten minutes on its own thread: a batch of history can take
+/// longer than that, and the log should not go quiet while it does.
+fn progress_loop() {
+    std::thread::sleep(Duration::from_secs(20));
+    loop {
+        report_progress();
+        std::thread::sleep(Duration::from_secs(600));
+    }
 }
 
 /// The last count of how sellers stand against the bar for "ok" (see `Ledger::bar_spread`).
@@ -1097,10 +1138,7 @@ fn spread_line(j: &Json) -> String {
 /// a wallet is only marked as read once all 45 days are.
 fn scan_backfill(urls: &[String]) {
     let mut nodes = Nodes { urls: urls.to_vec(), preferred: 0 };
-    let mut last_report: Option<Instant> = None;
-    let mut reported_done = false;
     loop {
-        let due = last_report.map_or(true, |t| t.elapsed() > Duration::from_secs(600));
         let batch: Vec<(String, u64, u64)> = {
             let mut l = lock();
             let n = chunk_size().min(l.backfill.len());
@@ -1109,19 +1147,8 @@ fn scan_backfill(urls: &[String]) {
             batch
         };
         if batch.is_empty() {
-            // Once more when the queue empties, then every ten minutes while anything changes.
-            if !reported_done || due {
-                report_progress();
-                last_report = Some(Instant::now());
-                reported_done = true;
-            }
             std::thread::sleep(Duration::from_secs(30));
             continue;
-        }
-        reported_done = false;
-        if due {
-            report_progress();
-            last_report = Some(Instant::now());
         }
         let Ok(head) = nodes.head() else {
             let mut l = lock();
@@ -1147,7 +1174,18 @@ fn scan_backfill(urls: &[String]) {
         let mut stopped_at = None;
         while from <= until {
             let to = until.min(from + span - 1);
-            match nodes.transfers_to(&wallets, from, to) {
+            BF_SPAN.store(span as usize, Ordering::Relaxed);
+            let started = Instant::now();
+            let answer = nodes.transfers_to(&wallets, from, to);
+            let took = started.elapsed().as_millis() as usize;
+            if answer.is_ok() {
+                BF_OK.fetch_add(1, Ordering::Relaxed);
+                BF_OK_MS.fetch_add(took, Ordering::Relaxed);
+            } else {
+                BF_FAILED.fetch_add(1, Ordering::Relaxed);
+                BF_FAILED_MS.fetch_add(took, Ordering::Relaxed);
+            }
+            match answer {
                 Ok(logs) => {
                     let mut l = lock();
                     for log in &logs {
@@ -1191,6 +1229,7 @@ fn scan_backfill(urls: &[String]) {
         l.backfill_active.clear();
         match stopped_at {
             Some(resume) => {
+                BF_STOPPED.fetch_add(1, Ordering::Relaxed);
                 // Everything before `resume` is counted; carry on from there later.
                 for (w, u, f) in batch {
                     let lo = start_of(u, f);
@@ -1201,6 +1240,7 @@ fn scan_backfill(urls: &[String]) {
                 std::thread::sleep(Duration::from_secs(60));
             }
             None => {
+                BF_BATCHES.fetch_add(1, Ordering::Relaxed);
                 for (w, u, _) in &batch {
                     if let Some(s) = l.sellers.get_mut(w) {
                         s.backfilled_from = until_of(*u).saturating_sub(BACKFILL_BLOCKS).max(1);
