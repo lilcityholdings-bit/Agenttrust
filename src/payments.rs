@@ -1289,7 +1289,7 @@ fn spread_line(j: &Json) -> String {
 
 /// Wallets one history reader takes from the queue at a time (`HISTORY_BATCH` changes it).
 fn batch_wallets() -> usize {
-    std::env::var("HISTORY_BATCH").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(200, |n| n.clamp(1, 1_000))
+    std::env::var("HISTORY_BATCH").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(1_000, |n| n.clamp(1, 5_000))
 }
 
 /// History readers running side by side (`HISTORY_READERS`): each takes its own batch from the
@@ -1298,9 +1298,10 @@ fn batch_wallets() -> usize {
 fn history_readers() -> usize {
     std::env::var("HISTORY_READERS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(4, |n| n.clamp(1, 8))
 }
-/// Wallets per query to begin with, and the most it climbs to. Public nodes refuse requests
-/// naming many wallets (half of the queries naming 200 failed; at 10 about one in ten did).
-const MAX_GROUP: usize = 100;
+/// The most wallets one query names. It starts at 50 and climbs while queries answer (measured on
+/// Base's public node: 51 or more wallets per query answer as well as one; it is blocks that it
+/// refuses).
+const MAX_GROUP: usize = 1_000;
 const MIN_GROUP: usize = 5;
 /// The blocks per query in use now, shared by every reader. It only ever shrinks (when a node
 /// refuses what it was asked), so no reader keeps probing above what the node allows.
@@ -1308,7 +1309,7 @@ static SPAN_NOW: AtomicU64 = AtomicU64::new(DEFAULT_LOGS_SPAN);
 
 /// The wallets per query in use now, shared by every reader, and the smallest size a node has
 /// refused (the size is never raised to that again).
-static GROUP: AtomicUsize = AtomicUsize::new(12);
+static GROUP: AtomicUsize = AtomicUsize::new(50);
 static BAD_GROUP: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// The narrowest slice of blocks asked about for one wallet. A wallet whose payments in a slice
 /// this narrow are still too many for a public node to return is "busy".
@@ -1437,7 +1438,8 @@ fn scan_backfill(urls: &[String]) {
         }
         let until = batch.iter().map(|(_, u, _)| *u).max().unwrap_or(head);
         let start = batch.iter().map(|(_, _, f)| *f).min().unwrap_or(until);
-        let range_of = |w: &str| batch.iter().find(|(b, _, _)| b == w).map(|(_, u, f)| (*f, *u));
+        let ranges: HashMap<&str, (u64, u64)> = batch.iter().map(|(w, u, f)| (w.as_str(), (*f, *u))).collect();
+        let range_of = |w: &str| ranges.get(w).copied();
         // Counts one answer's payments, only those inside the wallet's own range: later blocks
         // the live scan reads, earlier ones an earlier attempt already did.
         let count = |logs: &[Json]| {
@@ -1454,6 +1456,7 @@ fn scan_backfill(urls: &[String]) {
             }
         };
         let mut active: Vec<String> = batch.iter().map(|(w, _, _)| w.clone()).collect();
+        let mut active_set: HashSet<String> = active.iter().cloned().collect();
         let mut hot: Vec<String> = Vec::new();
         let mut busy: Vec<String> = Vec::new();
         let mut stopped = false;
@@ -1485,7 +1488,7 @@ fn scan_backfill(urls: &[String]) {
                 // Recorded with the payments it covers, under one lock.
                 let mut l = lock();
                 for (w, _, f) in l.backfill_active.iter_mut() {
-                    if active.contains(w) {
+                    if active_set.contains(w) {
                         *f = (*f).max(to + 1);
                     }
                 }
@@ -1506,7 +1509,10 @@ fn scan_backfill(urls: &[String]) {
             if active.len() >= 8 && st.hot.len() * 4 >= active.len() {
                 SPAN_NOW.store((span / 2).max(MIN_SLICE), Ordering::Relaxed);
             }
-            active.retain(|w| !st.hot.contains(w) && !st.busy.contains(w));
+            if !st.hot.is_empty() || !st.busy.is_empty() {
+                active.retain(|w| !st.hot.contains(w) && !st.busy.contains(w));
+                active_set = active.iter().cloned().collect();
+            }
             // Any split means a query was too big for the node: fewer wallets per query from now
             // on. Clean windows bring the number back up, a quarter at a time.
             if st.splits > 0 && st.hot.is_empty() {
