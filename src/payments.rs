@@ -885,7 +885,7 @@ struct Nodes {
 
 impl Nodes {
     fn call(&mut self, method: &str, params: Json) -> Result<Json, String> {
-        let mut last = String::from("no Base node configured");
+        let mut errors: Vec<String> = Vec::new();
         for k in 0..self.urls.len() {
             let i = (self.preferred + k) % self.urls.len();
             match rpc(&self.urls[i], method, params.clone()) {
@@ -894,11 +894,13 @@ impl Nodes {
                     lock().last_ok_ms = now_ms();
                     return Ok(j);
                 }
-                Err(e) => last = e,
+                Err(e) => errors.push(e),
             }
         }
-        lock().last_error = last.clone();
-        Err(last)
+        // Every node's answer, so a log line says which one refused and why.
+        let all = if errors.is_empty() { "no Base node configured".to_string() } else { errors.join(" | ") };
+        lock().last_error = all.clone();
+        Err(all)
     }
 
     fn head(&mut self) -> Result<u64, String> {
@@ -1019,6 +1021,27 @@ fn scan_live(urls: &[String]) {
             last_save = Instant::now();
         }
     }
+}
+
+/// The most blocks one history query asks for. Base's own public node refuses more than 2,000,
+/// so that is the default; `BASE_LOGS_SPAN` raises it for a paid node that allows more.
+const DEFAULT_LOGS_SPAN: u64 = 2_000;
+
+fn logs_span_from(setting: Option<&str>) -> u64 {
+    setting.and_then(|v| v.trim().parse::<u64>().ok()).map_or(DEFAULT_LOGS_SPAN, |n| n.clamp(100, 50_000))
+}
+
+fn max_logs_span() -> u64 {
+    logs_span_from(std::env::var("BASE_LOGS_SPAN").ok().as_deref())
+}
+
+/// Whether every node that failed did so with a plain HTTP refusal (blocked, rate-limited or
+/// down) rather than a complaint about the query. Asking for fewer blocks won't help then; waiting
+/// will.
+fn is_refusal(error: &str) -> bool {
+    error.split(" | ").all(|e| {
+        e.contains("status code 403") || e.contains("status code 429") || e.contains("status code 5") || e.contains("Connection")
+    })
 }
 
 /// Sellers with a strong enough payment record for "ok" on their own, as last counted by the
@@ -1169,7 +1192,7 @@ fn scan_backfill(urls: &[String]) {
         let start = batch.iter().map(|(_, u, f)| start_of(*u, *f)).min().unwrap_or(until);
         let wallets: Vec<String> = batch.iter().map(|(w, _, _)| w.clone()).collect();
         let mut from = start;
-        let mut span: u64 = 20_000;
+        let mut span: u64 = max_logs_span();
         let mut failures = 0;
         let mut stopped_at = None;
         while from <= until {
@@ -1209,12 +1232,21 @@ fn scan_backfill(urls: &[String]) {
                     from = to + 1;
                     failures = 0;
                     if logs.len() < 2_000 {
-                        span = (span * 2).min(50_000);
+                        span = (span * 2).min(max_logs_span());
                     }
                 }
                 Err(e) => {
                     failures += 1;
-                    if span > 500 {
+                    if is_refusal(&e) {
+                        // Blocked or rate-limited: the same query will do once the node has
+                        // calmed down, so wait (longer each time) rather than ask for less.
+                        if failures > 8 {
+                            lock().last_error = format!("payment history: {e}");
+                            stopped_at = Some(from);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_secs((2u64 << failures.min(5)).min(60)));
+                    } else if span > 100 {
                         span /= 2;
                     } else if failures > 5 {
                         lock().last_error = format!("payment history: {e}");
@@ -1680,5 +1712,21 @@ pub(crate) mod tests {
         assert_eq!((at(0), at(1), at(3)), (1, 2, 2), "20/7/14 lets one through, 15/5/14 two, 5/3/7 still two");
         let line = spread_line(&j);
         assert!(line.contains("1 strong, 1 close") && line.contains("15/5/14d: 2"), "{line}");
+    }
+
+    #[test]
+    fn history_queries_ask_for_what_nodes_allow_and_wait_when_refused() {
+        // Base's own public node refuses more than 2,000 blocks, so that is the default.
+        assert_eq!(logs_span_from(None), 2_000);
+        assert_eq!(logs_span_from(Some("10000")), 10_000);
+        assert_eq!(logs_span_from(Some("nonsense")), 2_000);
+        assert_eq!((logs_span_from(Some("5")), logs_span_from(Some("999999"))), (100, 50_000));
+        // A blocked or rate-limited node is waited for; a complaint about the query shrinks it.
+        let blocked = "eth_getLogs failed: https://base-rpc.publicnode.com/: status code 403";
+        let busy = "eth_getLogs failed: https://mainnet.base.org/: status code 429";
+        assert!(is_refusal(blocked) && is_refusal(&format!("{busy} | {blocked}")));
+        let too_wide = r#"eth_getLogs: {"code":-32602,"message":"range too large, max is 2000 blocks"}"#;
+        assert!(!is_refusal(too_wide), "a range complaint is not a refusal");
+        assert!(!is_refusal(&format!("{too_wide} | {blocked}")), "one node's range complaint still means ask for less");
     }
 }
