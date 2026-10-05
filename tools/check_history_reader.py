@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HEAD = 52_300_000
 TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-MAX_WALLETS = 20          # more than this in one query: HTTP 413
+MAX_WALLETS = 8           # more than this in one query: HTTP 413 (the readers start at 12, so they must learn)
 MAX_SPAN = 2000           # wider than this: JSON-RPC range error
 MAX_LOGS = 150            # an answer with more logs than this: HTTP 413, like a busy wallet on a public node
 UNTIL = HEAD - 1000       # the reader is told to cover up to here
@@ -98,7 +98,8 @@ def main():
     threading.Thread(target=node.serve_forever, daemon=True).start()
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = {**os.environ, "STATE_FILE": d + "/state.json", "PORT": "8097", "ADMIN_SECRET": "local-only-test-secret-123456",
-           "BASE_RPC_URL": f"http://127.0.0.1:{node.server_address[1]}", "CATALOG_URLS": "https://127.0.0.1:1/x"}
+           "BASE_RPC_URL": f"http://127.0.0.1:{node.server_address[1]}", "CATALOG_URLS": "https://127.0.0.1:1/x",
+           "HISTORY_BATCH": "10", "HISTORY_READERS": "4"}
     server = subprocess.Popen([root + "/target/release/agenttrust"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     def get(path):
         return json.load(urllib.request.urlopen("http://127.0.0.1:8097" + path, timeout=5))

@@ -879,6 +879,7 @@ fn rpc(url: &str, method: &str, params: Json) -> Result<Json, String> {
         .build()
         .post(url)
         .set("Content-Type", "application/json")
+        .set("User-Agent", "KeptvowBot/1.0 (reads public USDC payments on Base)")
         .send_string(&body.to_string())
         .map_err(|e| format!("{method} failed: {e}"))?;
     let mut text = String::new();
@@ -895,6 +896,22 @@ struct Nodes {
     preferred: usize,
 }
 
+/// How each node has answered since the server started: (answered, refused, last refusal).
+static NODE_STATS: Mutex<BTreeMap<String, (usize, usize, String)>> = Mutex::new(BTreeMap::new());
+
+fn note_node(url: &str, error: Option<&str>) {
+    let host = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or(url).to_string();
+    let mut m = NODE_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    let e = m.entry(host).or_insert((0, 0, String::new()));
+    match error {
+        None => e.0 += 1,
+        Some(err) => {
+            e.1 += 1;
+            e.2 = err.rsplit(": ").next().unwrap_or(err).chars().take(40).collect();
+        }
+    }
+}
+
 impl Nodes {
     fn call(&mut self, method: &str, params: Json) -> Result<Json, String> {
         let mut errors: Vec<String> = Vec::new();
@@ -902,11 +919,15 @@ impl Nodes {
             let i = (self.preferred + k) % self.urls.len();
             match rpc(&self.urls[i], method, params.clone()) {
                 Ok(j) => {
+                    note_node(&self.urls[i], None);
                     self.preferred = i;
                     lock().last_ok_ms = now_ms();
                     return Ok(j);
                 }
-                Err(e) => errors.push(e),
+                Err(e) => {
+                    note_node(&self.urls[i], Some(&e));
+                    errors.push(e);
+                }
             }
         }
         // Every node's answer, so a log line says which one refused and why.
@@ -958,7 +979,10 @@ pub fn start(dir: PathBuf, rpc_urls: Vec<String>, catalog_urls: Vec<String>) {
     let urls = rpc_urls.clone();
     crate::supervise("the payment scanner", move || scan_live(&urls));
     let urls = rpc_urls.clone();
-    crate::supervise("the payment history reader", move || scan_backfill(&urls));
+    for _ in 0..history_readers() {
+        let urls = urls.clone();
+        crate::supervise("the payment history reader", move || scan_backfill(&urls));
+    }
     crate::supervise("the progress reporter", progress_loop);
     crate::supervise("the service catalog reader", move || read_catalog(&catalog_urls));
     // Four at a time: one alone can't visit tens of thousands of services in a day.
@@ -1142,11 +1166,17 @@ fn reader_line() -> String {
         (l.last_error.clone(), l.history_waiting())
     };
     let pace = pace_line(waiting);
+    let nodes: Vec<String> = NODE_STATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(h, (ok, bad, last))| format!("{h} {ok} answered {bad} refused (last: {last})"))
+        .collect();
     format!(
         "history reader ({pace}): {ok} queries answered (avg {} ms), {failed} failed (avg {} ms), asking for {} blocks at a time, \
          {} batches done, {} stopped early and requeued, {} wallets per query on the live scan; \
          {} busy wallets read separately, {} too busy to read fully, {} queries split to fit, \
-         {} retried of which {} then worked; last error: {}",
+         {} retried of which {} then worked; last error: {}; nodes: {}",
         avg(&BF_OK_MS, ok),
         avg(&BF_FAILED_MS, failed),
         BF_SPAN.load(Ordering::Relaxed),
@@ -1158,7 +1188,8 @@ fn reader_line() -> String {
         BF_SPLITS.load(Ordering::Relaxed),
         BF_RETRIED.load(Ordering::Relaxed),
         BF_RETRY_FIXED.load(Ordering::Relaxed),
-        if err.is_empty() { "none".to_string() } else { err.chars().take(160).collect() }
+        if err.is_empty() { "none".to_string() } else { err.chars().take(160).collect() },
+        nodes.join("; ")
     )
 }
 
@@ -1216,12 +1247,25 @@ fn spread_line(j: &Json) -> String {
     )
 }
 
-/// Wallets the history reader takes from the queue at a time.
-const BATCH_WALLETS: usize = 200;
+/// Wallets one history reader takes from the queue at a time (`HISTORY_BATCH` changes it).
+fn batch_wallets() -> usize {
+    std::env::var("HISTORY_BATCH").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(200, |n| n.clamp(1, 1_000))
+}
+
+/// History readers running side by side (`HISTORY_READERS`): each takes its own batch from the
+/// queue. Public nodes refuse big requests rather than slow down, so more readers mean more
+/// wallets an hour; a node that does push back answers 429, which each reader waits out.
+fn history_readers() -> usize {
+    std::env::var("HISTORY_READERS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(4, |n| n.clamp(1, 8))
+}
 /// Wallets per query to begin with, and the most it climbs to. Public nodes refuse requests
 /// naming many wallets (half of the queries naming 200 failed; at 10 about one in ten did).
-const START_GROUP: usize = 25;
 const MAX_GROUP: usize = 100;
+const MIN_GROUP: usize = 5;
+/// The wallets per query in use now, shared by every reader, and the smallest size a node has
+/// refused (the size is never raised to that again).
+static GROUP: AtomicUsize = AtomicUsize::new(12);
+static BAD_GROUP: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// The narrowest slice of blocks asked about for one wallet. A wallet whose payments in a slice
 /// this narrow are still too many for a public node to return is "busy".
 const MIN_SLICE: u64 = 100;
@@ -1274,7 +1318,7 @@ fn fetch_logs(nodes: &mut Nodes, wallets: &[String], from: u64, to: u64, st: &mu
         }
         // Public nodes fail now and then for no reason that has to do with the query, so ask the
         // same thing again (after a pause) before concluding it is too big.
-        if retries < 2 {
+        if retries < 2 && !e.contains("status code 413") {
             retries += 1;
             BF_RETRIED.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(400 * retries));
@@ -1315,18 +1359,19 @@ fn scan_backfill(urls: &[String]) {
     loop {
         let batch: Vec<(String, u64, u64)> = {
             let mut l = lock();
-            let n = BATCH_WALLETS.min(l.backfill.len());
+            let n = batch_wallets().min(l.backfill.len());
             let batch: Vec<_> = l.backfill.drain(..n).collect();
-            l.backfill_active = batch.clone();
+            l.backfill_active.extend(batch.iter().cloned());
             batch
         };
         if batch.is_empty() {
             std::thread::sleep(Duration::from_secs(30));
             continue;
         }
+        let mine: HashSet<String> = batch.iter().map(|(w, _, _)| w.clone()).collect();
         let Ok(head) = nodes.head() else {
             let mut l = lock();
-            l.backfill_active.clear();
+            l.backfill_active.retain(|e| !mine.contains(&e.0));
             l.backfill.extend(batch);
             drop(l);
             std::thread::sleep(Duration::from_secs(30));
@@ -1338,7 +1383,11 @@ fn scan_backfill(urls: &[String]) {
         let start_of = |u: u64, f: u64| if f > 0 { f } else { until_of(u).saturating_sub(BACKFILL_BLOCKS) };
         // From here on each wallet's range is fixed, so a restart resumes exactly where this left.
         let batch: Vec<(String, u64, u64)> = batch.into_iter().map(|(w, u, f)| (w, until_of(u), start_of(u, f))).collect();
-        lock().backfill_active = batch.clone();
+        {
+            let mut l = lock();
+            l.backfill_active.retain(|e| !mine.contains(&e.0));
+            l.backfill_active.extend(batch.iter().cloned());
+        }
         let until = batch.iter().map(|(_, u, _)| *u).max().unwrap_or(head);
         let start = batch.iter().map(|(_, _, f)| *f).min().unwrap_or(until);
         let range_of = |w: &str| batch.iter().find(|(b, _, _)| b == w).map(|(_, u, f)| (*f, *u));
@@ -1361,7 +1410,6 @@ fn scan_backfill(urls: &[String]) {
         let mut hot: Vec<String> = Vec::new();
         let mut busy: Vec<String> = Vec::new();
         let mut stopped = false;
-        let mut group = START_GROUP;
         let mut clean_windows = 0;
 
         // The main pass: everyone not busy, window by window.
@@ -1374,7 +1422,8 @@ fn scan_backfill(urls: &[String]) {
             // goes wrong halfway can simply be asked again without counting anything twice.
             let mut st = Fetching::default();
             let mut collected: Vec<Json> = Vec::new();
-            for chunk in active.chunks(group.max(1)) {
+            let group = GROUP.load(Ordering::Relaxed).max(1);
+            for chunk in active.chunks(group) {
                 match fetch_logs(&mut nodes, chunk, from, to, &mut st) {
                     Ok(logs) => collected.extend(logs),
                     Err(e) => {
@@ -1408,13 +1457,19 @@ fn scan_backfill(urls: &[String]) {
             active.retain(|w| !st.hot.contains(w) && !st.busy.contains(w));
             // Any split means a query was too big for the node: fewer wallets per query from now
             // on. Clean windows bring the number back up, a quarter at a time.
-            if st.splits > 0 {
-                group = (group / 2).max(10);
+            if st.splits > 0 && st.hot.is_empty() {
+                BAD_GROUP.fetch_min(group, Ordering::Relaxed);
+                GROUP.store((group / 2).max(MIN_GROUP), Ordering::Relaxed);
                 clean_windows = 0;
-            } else {
+            } else if st.splits == 0 {
                 clean_windows += 1;
                 if clean_windows >= 10 {
-                    group = (group + group / 4).min(MAX_GROUP);
+                    let cur = GROUP.load(Ordering::Relaxed);
+                    let ceiling = BAD_GROUP.load(Ordering::Relaxed).saturating_sub(1);
+                    let next = (cur + (cur / 4).max(1)).min(MAX_GROUP).min(ceiling);
+                    if next > cur {
+                        GROUP.store(next, Ordering::Relaxed);
+                    }
                     clean_windows = 0;
                 }
             }
@@ -1475,7 +1530,8 @@ fn scan_backfill(urls: &[String]) {
         }
 
         let mut l = lock();
-        let resume: Vec<(String, u64, u64)> = std::mem::take(&mut l.backfill_active);
+        let resume: Vec<(String, u64, u64)> = l.backfill_active.iter().filter(|e| mine.contains(&e.0)).cloned().collect();
+        l.backfill_active.retain(|e| !mine.contains(&e.0));
         if stopped {
             BF_STOPPED.fetch_add(1, Ordering::Relaxed);
             // Each wallet carries on from where it got to.
