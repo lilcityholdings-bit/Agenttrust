@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.lilcityholdings-bit/keptvow",
   "title": "Keptvow",
-  "description": "Trust scores for AI bots. Check any bot or wallet before you pay it: ok, careful or stop.",
-  "version": "1.0.0",
+  "description": "Check a seller's wallet before your agent pays it: ok, careful or stop. Free, no key.",
+  "version": "1.1.0",
   "websiteUrl": "https://agenttrust-production-381e.up.railway.app",
   "remotes": [
     {

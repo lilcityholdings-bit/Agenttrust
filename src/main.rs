@@ -635,6 +635,9 @@ const CAREFUL_ABOVE_USD: f64 = 100.0;
 /// their payment wallet or owner — and turns the worst of their records into one verdict:
 /// `stop`, `careful` or `ok`. Built for the moment an x402 seller answers 402 with its `payTo`.
 fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i64) -> Result<Json, String> {
+    // Some wallet apps copy addresses with an uppercase "0X"; it is the same address.
+    let pay_to = pay_to.trim();
+    let pay_to = &pay_to.strip_prefix("0X").map_or_else(|| pay_to.to_string(), |rest| format!("0x{rest}"));
     let wallet = verify::normalize("eth", pay_to).map_err(|_| "pay_to must be a 0x wallet address".to_string())?;
     let mut matches: Vec<Json> = Vec::new();
     if let Some(owner) = engine.verified_owner_of("eth", &wallet) {
@@ -3424,6 +3427,53 @@ mod tests {
         assert_eq!(t.get("result").unwrap().get("isError"), Some(&Json::Bool(false)));
         let bad = call(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"deal_status","arguments":{"agreement_id":"../x"}}}"#);
         assert_eq!(bad.get("result").unwrap().get("isError"), Some(&Json::Bool(true)));
+    }
+
+    #[test]
+    fn wallet_addresses_copied_in_any_common_form_are_accepted() {
+        let e = engine();
+        let w = "0x00000000000000000000000000000000000000d5";
+        for form in [w.to_string(), format!("  {w}\n"), w.replace("0x", "0X"), w.to_uppercase().replace("0X", "0x")] {
+            let mut r = req("GET", "/v1/check", &[], "");
+            r.query.insert("pay_to".into(), form.clone());
+            let j = body_json(&route(&e, r, PROD));
+            assert_eq!(j.get("pay_to").and_then(|v| v.as_str()), Some(w), "{form:?}");
+        }
+    }
+
+    #[test]
+    fn the_mcp_registry_listing_stays_within_the_registry_limits() {
+        let j = json::parse(include_str!("../server.json")).unwrap();
+        let text = |k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        assert!((1..=100).contains(&text("description").chars().count()), "the registry rejects descriptions over 100 characters");
+        assert!((1..=100).contains(&text("title").chars().count()));
+        assert!(text("description").to_lowercase().contains("before"), "the listing leads with check-before-paying");
+        assert!(text("name").starts_with("io.github.") && text("name").contains('/'));
+    }
+
+    #[test]
+    fn a_new_customer_meets_check_before_paying_first() {
+        let e = engine();
+        // An assistant reading the tool list or the instructions meets the pre-payment check first.
+        let call = |body: &str| body_json(&route(&e, req("POST", "/mcp", &[], body), PROD));
+        let init = call(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+        let instructions = init.get("result").unwrap().get("instructions").unwrap().as_str().unwrap().to_string();
+        assert!(instructions.starts_with("Keptvow tells you who is safe to pay") && instructions.contains("check_payment"));
+        let list = call(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+        let Some(Json::Array(tools)) = list.get("result").unwrap().get("tools") else { panic!() };
+        let names: Vec<&str> = tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
+        assert_eq!(&names[..2], ["check_payment", "report_delivery"]);
+        let pos = |n: &str| names.iter().position(|x| *x == n).unwrap();
+        assert!(pos("check_payment") < pos("register") && pos("wallet_history") < pos("open_deal"));
+        // The tool does what its description says, through the same checks as the HTTP call.
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"check_payment","arguments":{"pay_to":"0x00000000000000000000000000000000000000c4","amount_usd":5}}}"#);
+        let text = r.get("result").unwrap().get("content").and_then(|c| if let Json::Array(a) = c { a.first().cloned() } else { None }).unwrap();
+        assert!(text.get("text").unwrap().as_str().unwrap().contains("\"verdict\":\"careful\""));
+        // The Docs page leads with it too, and still teaches deals further down.
+        let docs = route(&e, req("GET", "/docs", &[("Accept", "text/html")], ""), PROD).body;
+        let first_step = docs.find("Ask before you pay").unwrap();
+        assert!(first_step < docs.find("Open a deal").unwrap() && first_step < docs.find("/v1/register").unwrap());
+        assert!(docs.contains("npm install keptvow") && docs.contains("pip install keptvow") && docs.contains("/v1/check?pay_to="));
     }
 
     #[test]

@@ -14,10 +14,12 @@ use crate::json::Json;
 use crate::store::Engine;
 use crate::Config;
 
-const INSTRUCTIONS: &str = "Keptvow keeps a public trust score for every bot and settles deals between bots. \
-Before dealing with a bot you don't know, call check_trust. To build your own record: register once (keep the \
-secret), open_deal with the other bot, and when the deal is done both bots report_outcome. Matching reports \
-settle; a disagreement goes to a neutral jury. Going silent or lying costs far more than honest deals earn.";
+const INSTRUCTIONS: &str = "Keptvow tells you who is safe to pay. Before paying any seller wallet (for example the payTo of an x402 \
+402 response), call check_payment: it answers ok, careful or stop, with the reason. Stop means don't pay. After \
+you pay, call report_delivery with the payment's transaction to say whether the result arrived. That is what \
+lets honest sellers earn ok and exposes the ones that take the money and deliver nothing. wallet_history, \
+check_trust and search_bots look up a wallet or bot in more depth. To build your own record, register once \
+(keep the secret) and settle deals with other bots through open_deal and report_outcome.";
 
 fn prop(kind: &str, description: &str) -> Json {
     Json::obj(vec![("type", Json::str(kind)), ("description", Json::str(description))])
@@ -48,38 +50,42 @@ fn tools() -> Json {
     let deal = || prop("string", "The agreement_id from open_deal.");
     Json::Array(vec![
         tool(
-            "register",
-            "Create a free Keptvow identity for your bot in one call. Returns agent_id and a secret — save the secret, it is shown once.",
-            vec![("name", prop("string", "Optional name, 3-48 letters/digits/-/_/. — made up for you if left out."))],
-            &[],
+            "check_payment",
+            "CALL THIS BEFORE PAYING ANY SELLER. Give the wallet you are about to pay (for example the payTo of an x402 402 response). Returns verdict ok, careful or stop, plus one sentence of advice and the evidence: payments the wallet received, buyers who came back, delivery reports, and whether its listed services answer. If the verdict is stop, do not pay. Free, no key.",
+            vec![
+                ("pay_to", prop("string", "The 0x wallet address you are about to pay (the payTo).")),
+                ("amount_usd", prop("number", "Optional: how much you're about to pay, in US dollars. Big payments need a stronger record to get ok.")),
+            ],
+            &["pay_to"],
+            true,
+        ),
+        tool(
+            "report_delivery",
+            "CALL THIS AFTER PAYING a seller (x402 or any USDC payment on Base): say whether the result arrived. Quote the payment transaction; it is checked on Base, so only real buyers count, once per payment. This is how honest sellers earn ok and sellers who take the money and deliver nothing get flagged.",
+            vec![
+                ("tx", prop("string", "The payment's transaction hash (0x…).")),
+                ("delivered", prop("boolean", "true if you got what you paid for.")),
+                ("pay_to", prop("string", "Optional: the wallet you paid.")),
+            ],
+            &["tx", "delivered"],
             false,
         ),
         tool(
+            "wallet_history",
+            "The full record behind a check_payment verdict: payments a seller wallet received on Base (buyers, returning buyers), reports from buyers who did or didn't get what they paid for, and the paid services listed at it with whether each answered at the last check.",
+            vec![("wallet", prop("string", "The 0x wallet address."))],
+            &["wallet"],
+            true,
+        ),
+        tool(
             "check_trust",
-            "Look up any bot's public trust profile: trust_level (unknown/caution/fair/good/excellent), score, the reasons, and its proven identities. Give agent_id, or protocol + id to look a bot up by wallet, ICP principal, DID or domain.",
+            "Look up a bot's full public trust profile (use check_payment instead when you are about to pay a wallet): trust_level (unknown/caution/fair/good/excellent), score, the reasons, and its proven identities. Give agent_id, or protocol + id to look a bot up by wallet, ICP principal, DID or domain.",
             vec![
                 ("agent_id", prop("string", "The bot's Keptvow id.")),
                 ("protocol", prop("string", "Or: icp, eth, erc8004, did, web_bot_auth.")),
                 ("id", prop("string", "The identity for that protocol.")),
             ],
             &[],
-            true,
-        ),
-        tool(
-            "check_payment",
-            "Before paying a wallet (for example the payTo of an x402 402 response), ask whether it's safe. Returns verdict ok, careful or stop, with advice and the records of every bot tied to that wallet.",
-            vec![
-                ("pay_to", prop("string", "The 0x wallet address you are about to pay.")),
-                ("amount_usd", prop("number", "Optional: how much you're about to pay, in US dollars.")),
-            ],
-            &["pay_to"],
-            true,
-        ),
-        tool(
-            "wallet_history",
-            "A seller wallet's record: payments it received on Base (buyers, returning buyers), delivery reports from buyers, and the paid services listed at it.",
-            vec![("wallet", prop("string", "The 0x wallet address."))],
-            &["wallet"],
             true,
         ),
         tool(
@@ -93,14 +99,10 @@ fn tools() -> Json {
             true,
         ),
         tool(
-            "report_delivery",
-            "After paying a seller (x402 or any USDC payment on Base): say whether the result arrived. Quote the payment transaction; it is checked on-chain, so only real buyers count.",
-            vec![
-                ("tx", prop("string", "The payment's transaction hash (0x…).")),
-                ("delivered", prop("boolean", "true if you got what you paid for.")),
-                ("pay_to", prop("string", "Optional: the wallet you paid.")),
-            ],
-            &["tx", "delivered"],
+            "register",
+            "Only needed to settle deals with other bots or claim a bot: create a free Keptvow identity in one call. Returns agent_id and a secret — save the secret, it is shown once.",
+            vec![("name", prop("string", "Optional name, 3-48 letters/digits/-/_/. — made up for you if left out."))],
+            &[],
             false,
         ),
         tool(

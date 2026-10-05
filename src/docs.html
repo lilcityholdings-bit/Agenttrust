@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Keptvow quickstart</title>
-<meta name="description" content="Settle a deal between two bots in three calls.">
+<title>Keptvow docs — check who your bot is about to pay</title>
+<meta name="description" content="One free call tells your bot whether a seller wallet is ok, careful or stop before it pays. JSON, MCP, npm and pip.">
 <style>
   :root {
     --bg: #f6f6f3; --panel: #ffffff; --ink: #1b1d1f; --muted: #62666b; --line: #dcdcd6;
@@ -60,8 +60,65 @@
 <body>
 <main>
   <p><a href="/">← Keptvow</a></p>
-  <h1>Quickstart: 3 steps</h1>
-  <p class="sub">Settle a deal between two bots, then check their scores. Everything is plain HTTP and JSON, so it works from any language.</p>
+  <h1>Check who your bot is about to pay</h1>
+  <p class="sub">One free call, no sign-up, no key. It answers <b>ok</b>, <b>careful</b> or <b>stop</b> from real payment history, delivery reports and daily checks that the seller answers. Plain HTTP and JSON, so it works from any language.</p>
+
+  <section>
+    <h2><span class="n">1</span>Ask before you pay</h2>
+    <p>When a seller answers <code>402 Payment Required</code>, take the wallet it asks to be paid at (<code>payTo</code>) and ask Keptvow.</p>
+    <div class="code"><button class="copy">Copy</button><pre data-tpl>curl "{URL}/v1/check?pay_to=0xSELLER_WALLET&amp;amount_usd=5"</pre></div>
+    <div class="code"><pre data-tpl>{
+  "verdict": "ok",            // ok | careful | stop
+  "advice": "A strong payment record: paid 84 times by 48 different buyers (18 came back) ...",
+  "evidence": { "payments": {...}, "delivery_reports": {...}, "services": {...} },
+  "wallet_page": "/wallets/0x..."
+}</pre></div>
+    <table>
+      <tr><td>ok</td><td>Many independent buyers paid this seller, came back, and got what they paid for, or it has a strong record of real deals. Pay.</td></tr>
+      <tr><td>careful</td><td>Not enough evidence that is hard to fake. Fine for small amounts; split anything big.</td></tr>
+      <tr><td>stop</td><td>Buyers paid and got nothing, or a bot behind the wallet broke deals. Don't pay.</td></tr>
+    </table>
+    <p class="muted">Add <code>amount_usd</code> so big payments need a stronger record. Up to 25 wallets at once: <code>POST /v1/check {"pay_to": ["0x…", "0x…"]}</code>. Ask for <code>?format=md</code> or <code>?format=text</code> for Markdown or a one-line answer. People can read the same answer at <code>/wallets/0x…</code>.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">2</span>Or let a guard do it for every payment</h2>
+    <p>Wrap your fetch once. It checks every seller before any money moves and throws instead of paying a wallet that says stop. It also reports whether each result arrived.</p>
+    <div class="code"><button class="copy">Copy</button><pre data-tpl># JavaScript
+npm install keptvow
+
+import { withKeptvow } from "keptvow";
+import { wrapFetchWithPayment } from "x402-fetch";
+const pay = wrapFetchWithPayment(withKeptvow(fetch), account);
+
+# Python
+pip install keptvow
+
+import keptvow
+r = session.get(url)
+if r.status_code == 402:
+    keptvow.guard(r)     # raises keptvow.KeptvowStop if the wallet says stop</pre></div>
+    <p class="muted">No package manager? Save <a href="/guard.js">/guard.js</a> and import it.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">3</span>Tell us whether it arrived</h2>
+    <p>After paying, say whether the result came. Quote the payment's transaction: it is checked on Base, so only real buyers count, once per payment. This is what lets honest sellers earn <b>ok</b> and flags the ones that take the money and deliver nothing. The guard does it for you.</p>
+    <div class="code"><button class="copy">Copy</button><pre data-tpl>curl -X POST {URL}/v1/outcomes -d '{"tx": "0xPAYMENT_TX", "delivered": true}'</pre></div>
+  </section>
+
+  <section>
+    <h2>Using an AI assistant? Add one URL</h2>
+    <p>Add <code data-text>{URL}/mcp</code> as an MCP server. The tool to call before paying is <code>check_payment</code>; the others are <code>wallet_history</code>, <code>search_bots</code>, <code>report_delivery</code> and <code>check_trust</code>. Agents can also read the <a href="/llms.txt">guide for AI agents</a>, the <a href="/openapi.json">OpenAPI description</a> and the <a href="/.well-known/agent.json">agent card</a>.</p>
+  </section>
+
+  <section>
+    <h2>Limits and plans</h2>
+    <p>Free: 300 checks an hour from one address, no key. Beyond that: prepaid credit at $0.001 a check, or <b>Watch</b> ($99 a month: 100,000 checks and alerts when a bot or wallet you rely on turns bad) or <b>Platform</b> ($499 a month: 1 million checks, up to 10,000 bots and wallets watched). Paying never buys a better score. <a href="/#pricing">See plans</a>.</p>
+  </section>
+
+  <h1 style="margin-top:34px">Build your own record: deals between bots</h1>
+  <p class="sub">Bots can also settle deals with each other through Keptvow. Clean settlements build the record that earns <b>good</b> and <b>excellent</b>.</p>
 
   <section>
     <h2>Before you start: register each bot (free)</h2>
@@ -71,7 +128,7 @@
   </section>
 
   <section>
-    <h2><span class="n">1</span>Open a deal</h2>
+    <h2><span class="n">A</span>Open a deal</h2>
     <p>Name the two bots and what could happen. The first bot opens it.</p>
     <div class="code"><button class="copy">Copy</button><pre data-tpl>curl -X POST {URL}/v1/agreements \
   -d '{
@@ -83,7 +140,7 @@
   </section>
 
   <section>
-    <h2><span class="n">2</span>Both bots say what happened</h2>
+    <h2><span class="n">B</span>Both bots say what happened</h2>
     <p>When the deal is done, each bot reports. If they say the same thing, it's settled.</p>
     <div class="code"><button class="copy">Copy</button><pre data-tpl>curl -X POST {URL}/v1/agreements/AGREEMENT_ID/report \
   -d '{"agent_id": "bob-bot", "outcome": "delivered", "secret": "BOB_SECRET"}'</pre></div>
@@ -97,7 +154,7 @@
   </section>
 
   <section>
-    <h2><span class="n">3</span>Check any bot</h2>
+    <h2><span class="n">C</span>Check any bot</h2>
     <p>No key needed. Do this before making a deal with a bot you don't know.</p>
     <div class="code"><button class="copy">Copy</button><pre data-tpl>curl {URL}/v1/trust/bob-bot</pre></div>
     <p class="muted">Look at <code>trust_level</code>: <b>unknown</b>, <b>caution</b>, <b>fair</b>, <b>good</b> or <b>excellent</b>, with the reasons listed. People can use the page instead: <a data-href="/trust/bob-bot" href="/trust/bob-bot">/trust/bob-bot</a></p>
