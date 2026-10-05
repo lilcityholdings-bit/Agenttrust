@@ -896,6 +896,34 @@ struct Nodes {
     preferred: usize,
 }
 
+/// How queries of each shape have fared, (answered, refused), keyed by how many wallets they
+/// named and how many blocks they covered: shows which of the two the nodes object to.
+static SHAPES: Mutex<BTreeMap<String, (usize, usize)>> = Mutex::new(BTreeMap::new());
+
+fn note_shape(wallets: usize, blocks: u64, answered: bool) {
+    let w = match wallets {
+        1 => "1w",
+        2..=5 => "2-5w",
+        6..=12 => "6-12w",
+        13..=50 => "13-50w",
+        _ => "51+w",
+    };
+    let b = match blocks {
+        0..=100 => "<=100b",
+        101..=250 => "<=250b",
+        251..=500 => "<=500b",
+        501..=1000 => "<=1000b",
+        _ => "<=2000b",
+    };
+    let mut m = SHAPES.lock().unwrap_or_else(|e| e.into_inner());
+    let e = m.entry(format!("{w}/{b}")).or_insert((0, 0));
+    if answered {
+        e.0 += 1;
+    } else {
+        e.1 += 1;
+    }
+}
+
 /// How each node has answered since the server started: (answered, refused, last refusal).
 static NODE_STATS: Mutex<BTreeMap<String, (usize, usize, String)>> = Mutex::new(BTreeMap::new());
 
@@ -1142,8 +1170,19 @@ fn report_progress() {
     };
     println!("{line}");
     println!("keptvow: {}", reader_line());
+    println!("keptvow: history query shapes (answered/refused): {}", shapes_line());
     println!("keptvow: sellers against the bar for ok: {}", spread_line(&spread));
     *BAR_SPREAD.lock().unwrap_or_else(|e| e.into_inner()) = spread;
+}
+
+fn shapes_line() -> String {
+    SHAPES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, (ok, bad))| format!("{k} {ok}/{bad}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One line on how reading history from Base is going.
@@ -1293,6 +1332,7 @@ fn fetch_logs(nodes: &mut Nodes, wallets: &[String], from: u64, to: u64, st: &mu
         let started = Instant::now();
         let answer = nodes.transfers_to(wallets, from, to);
         let took = started.elapsed().as_millis() as usize;
+        note_shape(wallets.len(), to - from + 1, answer.is_ok());
         let e = match answer {
             Ok(logs) => {
                 BF_OK.fetch_add(1, Ordering::Relaxed);
