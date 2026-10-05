@@ -1188,24 +1188,36 @@ fn shapes_line() -> String {
 
 /// One line on how reading history from Base is going.
 /// How fast wallets are being read this run, and how long the rest would take at that pace.
-fn pace_line(waiting: usize) -> String {
-    let done = BF_WALLETS_DONE.load(Ordering::Relaxed);
+/// `partial` is how many wallets' worth of the batches under way are already read.
+fn pace_line(waiting: usize, partial: f64) -> String {
+    let done = BF_WALLETS_DONE.load(Ordering::Relaxed) as f64 + partial;
     let hours = BF_STARTED.get().map_or(0.0, |t| t.elapsed().as_secs_f64() / 3600.0);
-    if done == 0 || hours <= 0.0 {
-        return "no batch finished yet, so no pace to report".into();
+    if done < 1.0 || hours <= 0.0 {
+        return "too early for a pace".into();
     }
-    let rate = done as f64 / hours;
-    format!("{done} wallets read since this start, about {rate:.0} an hour, so about {:.1} hours for the {waiting} waiting", waiting as f64 / rate)
+    let rate = done / hours;
+    let left = (waiting as f64 - partial).max(0.0);
+    format!("{done:.0} wallets' worth read since this start, about {rate:.0} an hour, so about {:.1} hours for the {left:.0} left", left / rate)
 }
 
 fn reader_line() -> String {
     let (ok, failed) = (BF_OK.load(Ordering::Relaxed), BF_FAILED.load(Ordering::Relaxed));
     let avg = |ms: &AtomicUsize, n: usize| if n == 0 { 0 } else { ms.load(Ordering::Relaxed) / n };
-    let (err, waiting) = {
+    let (err, waiting, partial) = {
         let l = lock();
-        (l.last_error.clone(), l.history_waiting())
+        // How much of each batch under way is read: its resume point between its first block
+        // (45 days before where it ends) and its last.
+        let partial: f64 = l
+            .backfill_active
+            .iter()
+            .map(|(_, u, f)| {
+                let first = u.saturating_sub(BACKFILL_BLOCKS);
+                if *u > first { ((*f).saturating_sub(first) as f64 / (*u - first) as f64).min(1.0) } else { 0.0 }
+            })
+            .sum();
+        (l.last_error.clone(), l.history_waiting(), partial)
     };
-    let pace = pace_line(waiting);
+    let pace = pace_line(waiting, partial);
     let nodes: Vec<String> = NODE_STATS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1214,7 +1226,7 @@ fn reader_line() -> String {
         .collect();
     format!(
         "history reader ({pace}): {ok} queries answered (avg {} ms), {failed} failed (avg {} ms), asking for {} blocks at a time, \
-         {} batches done, {} stopped early and requeued, {} wallets per query on the live scan; \
+         {} batches done, {} stopped early and requeued, {} wallets per query on the live scan, {} per query on history (largest refused: {}); \
          {} busy wallets read separately, {} too busy to read fully, {} queries split to fit, \
          {} retried of which {} then worked; last error: {}; nodes: {}",
         avg(&BF_OK_MS, ok),
@@ -1223,6 +1235,11 @@ fn reader_line() -> String {
         BF_BATCHES.load(Ordering::Relaxed),
         BF_STOPPED.load(Ordering::Relaxed),
         chunk_size(),
+        GROUP.load(Ordering::Relaxed),
+        match BAD_GROUP.load(Ordering::Relaxed) {
+            usize::MAX => "none".to_string(),
+            n => n.to_string(),
+        },
         BF_HOT.load(Ordering::Relaxed),
         BF_BUSY.load(Ordering::Relaxed),
         BF_SPLITS.load(Ordering::Relaxed),
