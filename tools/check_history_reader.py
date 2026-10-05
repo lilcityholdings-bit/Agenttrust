@@ -15,6 +15,7 @@ HEAD = 52_300_000
 TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 MAX_WALLETS = 20          # more than this in one query: HTTP 413
 MAX_SPAN = 2000           # wider than this: JSON-RPC range error
+MAX_LOGS = 150            # an answer with more logs than this: HTTP 413, like a busy wallet on a public node
 UNTIL = HEAD - 1000       # the reader is told to cover up to here
 FROM = HEAD - 40_000      # ...and from here (the resume point)
 random.seed(7)
@@ -25,6 +26,14 @@ for w in wallets:
     for _ in range(random.randint(0, 12)):
         # a spread of blocks: before FROM and after UNTIL must NOT be counted
         transfers.append((random.choice(buyers), w, random.randint(HEAD - 60_000, HEAD), 10_000 * random.randint(1, 9)))
+HOT, SUPER_HOT = wallets[0], wallets[1]
+# HOT: a payment every block for 3,000 blocks: answers fit only when asked in slices of about 125 blocks
+for blk in range(FROM + 5000, FROM + 8000):
+    transfers.append((random.choice(buyers), HOT, blk, 10_000))
+# SUPER_HOT: five payments a block for 400 blocks: too busy to read even in the narrowest slice
+for blk in range(FROM + 12000, FROM + 12400):
+    for _ in range(5):
+        transfers.append((random.choice(buyers), SUPER_HOT, blk, 10_000))
 def expected():
     out = {}
     for b, w, blk, u in transfers:
@@ -69,6 +78,10 @@ class H(BaseHTTPRequestHandler):
             if lo <= blk <= hi and t in want:
                 logs.append({"blockNumber": hex(blk), "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
                              "topics": [TRANSFER, "0x" + "0" * 24 + b[2:], t], "data": "0x" + "%064x" % u})
+        if len(logs) > MAX_LOGS:
+            with lock:
+                stats["ok"] -= 1; stats["too_many_logs"] = stats.get("too_many_logs", 0) + 1
+            return self._send(413, b"response too large")
         ok(logs)
 
 def main():
@@ -102,15 +115,20 @@ def main():
             sys.exit("history was not read in two minutes")
         exp = expected(); bad = 0; got_total = 0
         for w in wallets:
-            p = get(f"/v1/wallets/{w}")["evidence"]["payments"]
+            ev = get(f"/v1/wallets/{w}")["evidence"]
+            p = ev["payments"]
             got = (p["received"], round(p["volume_usd"] * 1_000_000)); want = tuple(exp.get(w, [0, 0]))
             got_total += got[0]
-            if got != want:
-                bad += 1; print("MISMATCH", w, "got", got, "expected", want)
-        print(f"{len(wallets)} wallets, {got_total} payments counted of {sum(v[0] for v in exp.values())} expected, "
-              f"{stats['413']} too-large and {stats['403']} blocked requests survived, "
-              f"{stats['max_wallets_ok']} wallets per query at the end")
-        if bad or stats["413"] == 0 or stats["403"] == 0:
+            if w == SUPER_HOT:
+                # too busy to read in full: flagged, and what was read is a floor, never an overcount
+                if not ev["history_incomplete"] or got[0] > want[0]:
+                    bad += 1; print("SUPER_HOT not flagged incomplete, or overcounted:", got, want, ev["history_incomplete"])
+            elif ev["history_incomplete"] or got != want:
+                bad += 1; print("MISMATCH", w, "got", got, "expected", want, "incomplete:", ev["history_incomplete"])
+        print(f"{len(wallets)} wallets, {got_total} payments counted of {sum(v[0] for v in exp.values())} expected "
+              f"(the unreadable wallet is a floor), {stats['413']} too-large, {stats.get('too_many_logs', 0)} too-busy and "
+              f"{stats['403']} blocked requests survived, {stats['queries']} queries in all")
+        if bad or stats["413"] == 0 or stats["403"] == 0 or stats.get("too_many_logs", 0) == 0:
             sys.exit("FAILED: " + ("mismatches above" if bad else "the fake node never exercised the failure paths"))
         print("ok")
     finally:

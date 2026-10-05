@@ -87,6 +87,9 @@ pub struct Seller {
     pub reports: HashMap<u32, (bool, u64)>,
     /// History before `backfilled_from` hasn't been read (0 = not yet read at all).
     pub backfilled_from: u64,
+    /// So busy that part of its history couldn't be read through the public nodes: what was read
+    /// is real, but the counts are lower than the truth.
+    pub busy: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -129,6 +132,8 @@ pub struct Ledger {
 pub struct Evidence {
     pub watched: bool,
     pub history_loading: bool,
+    /// The wallet is so busy that its history is only partly read (counts are a floor).
+    pub history_incomplete: bool,
     pub payments: u64,
     pub volume_usd: f64,
     pub buyers: usize,
@@ -167,6 +172,7 @@ impl Evidence {
         Json::obj(vec![
             ("watched", Json::Bool(self.watched)),
             ("history_loading", Json::Bool(self.history_loading)),
+            ("history_incomplete", Json::Bool(self.history_incomplete)),
             (
                 "payments",
                 Json::obj(vec![
@@ -203,6 +209,9 @@ impl Evidence {
             return "payment history is being read — check again in a few minutes".into();
         }
         let mut parts = Vec::new();
+        if self.history_incomplete {
+            parts.push("this wallet is so busy that only part of its payment history could be read, so the counts are a minimum".to_string());
+        }
         if self.payments > 0 {
             parts.push(format!(
                 "paid {} times by {} different buyers ({} came back) in the last {} days",
@@ -494,6 +503,7 @@ impl Ledger {
         let Some(s) = self.sellers.get(w) else { return e };
         e.watched = true;
         e.history_loading = s.backfilled_from == 0;
+        e.history_incomplete = s.busy;
         e.payments = s.payments;
         e.volume_usd = s.volume as f64 / 1e6;
         e.buyers = s.payers.len();
@@ -661,6 +671,7 @@ impl Ledger {
                     ("first_block", Json::num(s.first_block as f64)),
                     ("last_block", Json::num(s.last_block as f64)),
                     ("backfilled_from", Json::num(s.backfilled_from as f64)),
+                    ("busy", Json::Bool(s.busy)),
                     ("payers", Json::Array(payers)),
                     ("reports", Json::Array(reports)),
                 ])
@@ -735,6 +746,7 @@ impl Ledger {
                         first_block: n("first_block") as u64,
                         last_block: n("last_block") as u64,
                         backfilled_from: n("backfilled_from") as u64,
+                        busy: matches!(j.get("busy"), Some(Json::Bool(true))),
                         ..Seller::default()
                     };
                     if let Some(Json::Array(ps)) = j.get("payers") {
@@ -983,11 +995,7 @@ fn chunk_worked() {
     }
 }
 
-/// Whether a node refused the request for being too large (HTTP 413) — too many wallets in one
-/// query — rather than for asking about too many blocks.
-fn is_too_big(error: &str) -> bool {
-    error.contains("status code 413")
-}
+
 
 /// New payments to every watched wallet, every minute or so.
 fn scan_live(urls: &[String]) {
@@ -1023,6 +1031,8 @@ fn scan_live(urls: &[String]) {
                         l.apply_log(log);
                     }
                     i += chunk.len();
+                    drop(l);
+                    chunk_worked();
                 }
                 Err(_) if chunk.len() > 10 => shrink_chunk(),
                 Err(_) => {
@@ -1079,6 +1089,9 @@ static BF_FAILED_MS: AtomicUsize = AtomicUsize::new(0);
 static BF_SPAN: AtomicUsize = AtomicUsize::new(0);
 static BF_BATCHES: AtomicUsize = AtomicUsize::new(0);
 static BF_STOPPED: AtomicUsize = AtomicUsize::new(0);
+static BF_HOT: AtomicUsize = AtomicUsize::new(0);
+static BF_BUSY: AtomicUsize = AtomicUsize::new(0);
+static BF_SPLITS: AtomicUsize = AtomicUsize::new(0);
 
 /// Logs how far reading history has got, how many sellers have earned a strong record, and how
 /// many services were visited in the last day. Run from the history reader's thread, never on
@@ -1112,13 +1125,17 @@ fn reader_line() -> String {
     let err = lock().last_error.clone();
     format!(
         "history reader: {ok} queries answered (avg {} ms), {failed} failed (avg {} ms), asking for {} blocks at a time, \
-         {} batches done, {} stopped early and requeued, {} wallets per query; last error: {}",
+         {} batches done, {} stopped early and requeued, {} wallets per query on the live scan; \
+         {} busy wallets read separately, {} too busy to read fully, {} queries split to fit; last error: {}",
         avg(&BF_OK_MS, ok),
         avg(&BF_FAILED_MS, failed),
         BF_SPAN.load(Ordering::Relaxed),
         BF_BATCHES.load(Ordering::Relaxed),
         BF_STOPPED.load(Ordering::Relaxed),
         chunk_size(),
+        BF_HOT.load(Ordering::Relaxed),
+        BF_BUSY.load(Ordering::Relaxed),
+        BF_SPLITS.load(Ordering::Relaxed),
         if err.is_empty() { "none".to_string() } else { err.chars().take(160).collect() }
     )
 }
@@ -1177,15 +1194,89 @@ fn spread_line(j: &Json) -> String {
     )
 }
 
-/// The last 45 days of each newly watched wallet, a batch at a time. When a node keeps refusing,
-/// the batch goes back in the queue to resume where it stopped, with fewer wallets per query —
-/// a wallet is only marked as read once all 45 days are.
+/// Wallets the history reader takes from the queue at a time.
+const BATCH_WALLETS: usize = 200;
+/// The narrowest slice of blocks asked about for one wallet. A wallet whose payments in a slice
+/// this narrow are still too many for a public node to return is "busy".
+const MIN_SLICE: u64 = 100;
+/// Queries one busy wallet may use before it is given up on as too busy to read fully.
+const BUSY_WALLET_QUERIES: usize = 3_000;
+
+/// What happened while asking for one window: how many times a query had to be split, which
+/// wallets needed their blocks split (busy ones), and which couldn't be read at all.
+#[derive(Default)]
+struct Fetching {
+    splits: usize,
+    hot: Vec<String>,
+    busy: Vec<String>,
+    refusals: u32,
+}
+
+/// `wallets`' payments in [from, to]. When a node says the answer is too large, or complains
+/// about the query, the wallets are split in halves; a single wallet's blocks are split in halves
+/// too, down to MIN_SLICE. So a handful of very busy wallets cost a few extra queries and
+/// nothing else — the rest of the batch is read at full size. A plain HTTP refusal (blocked,
+/// rate-limited) is waited out and retried unchanged; `Err` only when that never ends.
+fn fetch_logs(nodes: &mut Nodes, wallets: &[String], from: u64, to: u64, st: &mut Fetching) -> Result<Vec<Json>, String> {
+    loop {
+        let started = Instant::now();
+        let answer = nodes.transfers_to(wallets, from, to);
+        let took = started.elapsed().as_millis() as usize;
+        let e = match answer {
+            Ok(logs) => {
+                BF_OK.fetch_add(1, Ordering::Relaxed);
+                BF_OK_MS.fetch_add(took, Ordering::Relaxed);
+                st.refusals = 0;
+                std::thread::sleep(Duration::from_millis(100));
+                return Ok(logs);
+            }
+            Err(e) => e,
+        };
+        BF_FAILED.fetch_add(1, Ordering::Relaxed);
+        BF_FAILED_MS.fetch_add(took, Ordering::Relaxed);
+        if is_refusal(&e) {
+            st.refusals += 1;
+            if st.refusals > 8 {
+                return Err(e);
+            }
+            std::thread::sleep(Duration::from_secs((2u64 << st.refusals.min(5)).min(60)));
+            continue;
+        }
+        st.splits += 1;
+        BF_SPLITS.fetch_add(1, Ordering::Relaxed);
+        if wallets.len() > 1 {
+            let (left, right) = wallets.split_at(wallets.len() / 2);
+            let mut logs = fetch_logs(nodes, left, from, to, st)?;
+            logs.extend(fetch_logs(nodes, right, from, to, st)?);
+            return Ok(logs);
+        }
+        let w = &wallets[0];
+        if !st.hot.contains(w) {
+            st.hot.push(w.clone());
+        }
+        if to - from + 1 > MIN_SLICE {
+            let mid = from + (to - from) / 2;
+            let mut logs = fetch_logs(nodes, wallets, from, mid, st)?;
+            logs.extend(fetch_logs(nodes, wallets, mid + 1, to, st)?);
+            return Ok(logs);
+        }
+        if !st.busy.contains(w) {
+            st.busy.push(w.clone());
+        }
+        return Ok(Vec::new());
+    }
+}
+
+/// The last 45 days of each newly watched wallet, a batch at a time. Wallets that turn out too
+/// busy to read alongside the others are taken out of the batch and read on their own in small
+/// slices afterwards. If the nodes keep refusing, the batch goes back in the queue to resume
+/// where each wallet stopped; a wallet is only marked as read once all its blocks are.
 fn scan_backfill(urls: &[String]) {
     let mut nodes = Nodes { urls: urls.to_vec(), preferred: 0 };
     loop {
         let batch: Vec<(String, u64, u64)> = {
             let mut l = lock();
-            let n = chunk_size().min(l.backfill.len());
+            let n = BATCH_WALLETS.min(l.backfill.len());
             let batch: Vec<_> = l.backfill.drain(..n).collect();
             l.backfill_active = batch.clone();
             batch
@@ -1209,112 +1300,163 @@ fn scan_backfill(urls: &[String]) {
         // From here on each wallet's range is fixed, so a restart resumes exactly where this left.
         let batch: Vec<(String, u64, u64)> = batch.into_iter().map(|(w, u, f)| (w, until_of(u), start_of(u, f))).collect();
         lock().backfill_active = batch.clone();
-        let until = batch.iter().map(|(_, u, _)| until_of(*u)).max().unwrap_or(head);
-        let start = batch.iter().map(|(_, u, f)| start_of(*u, *f)).min().unwrap_or(until);
-        let wallets: Vec<String> = batch.iter().map(|(w, _, _)| w.clone()).collect();
-        let mut from = start;
-        let mut span: u64 = max_logs_span();
-        let mut failures = 0;
-        let mut stopped_at = None;
-        'windows: while from <= until {
-            let to = until.min(from + span - 1);
-            BF_SPAN.store(span as usize, Ordering::Relaxed);
-            // Every wallet's payments in [from, to], a few wallets per query. Nothing is counted
-            // until all of them have answered, so whatever goes wrong halfway can simply be
-            // asked again without counting anything twice.
-            let mut collected: Vec<Json> = Vec::new();
-            let mut i = 0;
-            while i < wallets.len() {
-                let size = chunk_size().min(wallets.len() - i);
-                let started = Instant::now();
-                let answer = nodes.transfers_to(&wallets[i..i + size], from, to);
-                let took = started.elapsed().as_millis() as usize;
-                match answer {
-                    Ok(logs) => {
-                        BF_OK.fetch_add(1, Ordering::Relaxed);
-                        BF_OK_MS.fetch_add(took, Ordering::Relaxed);
-                        collected.extend(logs);
-                        i += size;
-                        failures = 0;
-                        chunk_worked();
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(e) => {
-                        BF_FAILED.fetch_add(1, Ordering::Relaxed);
-                        BF_FAILED_MS.fetch_add(took, Ordering::Relaxed);
-                        failures += 1;
-                        if is_too_big(&e) && chunk_size() > 10 {
-                            // "Request too large": send fewer wallets at once.
-                            shrink_chunk();
-                        } else if is_refusal(&e) {
-                            // Blocked or rate-limited: the same query will do once the node has
-                            // calmed down, so wait (longer each time) rather than ask for less.
-                            if failures > 8 {
-                                lock().last_error = format!("payment history: {e}");
-                                stopped_at = Some(from);
-                                break 'windows;
-                            }
-                            std::thread::sleep(Duration::from_secs((2u64 << failures.min(5)).min(60)));
-                        } else if span > 100 {
-                            // A complaint about the query itself: ask for fewer blocks.
-                            span /= 2;
-                            continue 'windows;
-                        } else if failures > 5 {
-                            lock().last_error = format!("payment history: {e}");
-                            stopped_at = Some(from);
-                            break 'windows;
-                        }
-                    }
-                }
-            }
+        let until = batch.iter().map(|(_, u, _)| *u).max().unwrap_or(head);
+        let start = batch.iter().map(|(_, _, f)| *f).min().unwrap_or(until);
+        let range_of = |w: &str| batch.iter().find(|(b, _, _)| b == w).map(|(_, u, f)| (*f, *u));
+        // Counts one answer's payments, only those inside the wallet's own range: later blocks
+        // the live scan reads, earlier ones an earlier attempt already did.
+        let count = |logs: &[Json]| {
             let mut l = lock();
-            for log in &collected {
-                // Only blocks inside each wallet's own range: later ones the live scan reads,
-                // earlier ones an earlier attempt already did.
+            for log in logs {
                 let block = log.get("blockNumber").and_then(|v| v.as_str()).and_then(hex_u64).unwrap_or(0);
                 let to_wallet = log
                     .get("topics")
                     .and_then(|t| if let Json::Array(t) = t { t.get(2).and_then(|v| v.as_str()).and_then(topic_address) } else { None });
-                let range = to_wallet
-                    .and_then(|w| batch.iter().find(|(b, _, _)| *b == w))
-                    .map(|(_, u, f)| (start_of(*u, *f), until_of(*u)));
-                if range.map_or(true, |(lo, hi)| block >= lo && block <= hi) {
+                let inside = to_wallet.and_then(|w| range_of(&w)).map_or(true, |(lo, hi)| block >= lo && block <= hi);
+                if inside {
                     l.apply_log(log);
                 }
             }
-            // Recorded with the payments it covers, under the same lock.
-            for (_, _, f) in l.backfill_active.iter_mut() {
-                *f = (*f).max(to + 1);
-            }
-            drop(l);
-            from = to + 1;
-            if collected.len() < 2_000 {
-                span = (span * 2).min(max_logs_span());
-            }
-        }
-        let mut l = lock();
-        l.backfill_active.clear();
-        match stopped_at {
-            Some(resume) => {
-                BF_STOPPED.fetch_add(1, Ordering::Relaxed);
-                // Everything before `resume` is counted; carry on from there later.
-                for (w, u, f) in batch {
-                    let lo = start_of(u, f);
-                    l.backfill.push_back((w, u, resume.max(lo)));
-                }
-                drop(l);
-                shrink_chunk();
-                std::thread::sleep(Duration::from_secs(60));
-            }
-            None => {
-                BF_BATCHES.fetch_add(1, Ordering::Relaxed);
-                for (w, u, _) in &batch {
-                    if let Some(s) = l.sellers.get_mut(w) {
-                        s.backfilled_from = until_of(*u).saturating_sub(BACKFILL_BLOCKS).max(1);
+        };
+        let mut active: Vec<String> = batch.iter().map(|(w, _, _)| w.clone()).collect();
+        let mut hot: Vec<String> = Vec::new();
+        let mut busy: Vec<String> = Vec::new();
+        let mut stopped = false;
+        let mut group = BATCH_WALLETS;
+        let mut clean_windows = 0;
+
+        // The main pass: everyone not busy, window by window.
+        let span = max_logs_span();
+        let mut from = start;
+        'windows: while from <= until {
+            let to = until.min(from + span - 1);
+            BF_SPAN.store(span as usize, Ordering::Relaxed);
+            // Nothing is counted until every wallet in the window has answered, so whatever
+            // goes wrong halfway can simply be asked again without counting anything twice.
+            let mut st = Fetching::default();
+            let mut collected: Vec<Json> = Vec::new();
+            for chunk in active.chunks(group.max(1)) {
+                match fetch_logs(&mut nodes, chunk, from, to, &mut st) {
+                    Ok(logs) => collected.extend(logs),
+                    Err(e) => {
+                        lock().last_error = format!("payment history: {e}");
+                        stopped = true;
+                        break 'windows;
                     }
                 }
-                l.dirty = true;
             }
+            count(&collected);
+            {
+                // Recorded with the payments it covers, under one lock.
+                let mut l = lock();
+                for (w, _, f) in l.backfill_active.iter_mut() {
+                    if active.contains(w) {
+                        *f = (*f).max(to + 1);
+                    }
+                }
+            }
+            // Busy wallets leave the main pass; their resume point stays just after this window.
+            for w in &st.busy {
+                if !busy.contains(w) {
+                    busy.push(w.clone());
+                }
+            }
+            for w in &st.hot {
+                if !hot.contains(w) && !busy.contains(w) {
+                    hot.push(w.clone());
+                }
+            }
+            active.retain(|w| !st.hot.contains(w) && !st.busy.contains(w));
+            // A split not explained by one wallet (the node refusing the request size) shrinks
+            // how many wallets go in a query; clean windows bring it back up.
+            if st.splits > st.hot.len() * 12 {
+                group = (group / 2).max(10);
+                clean_windows = 0;
+            } else {
+                clean_windows += 1;
+                if clean_windows >= 20 {
+                    group = (group + group / 4).min(BATCH_WALLETS);
+                    clean_windows = 0;
+                }
+            }
+            from = to + 1;
+        }
+        BF_HOT.fetch_add(hot.len(), Ordering::Relaxed);
+
+        // The busy wallets, one at a time, in small slices: wide while the answers stay small.
+        if !stopped {
+            for w in hot.clone() {
+                let Some((_, end)) = range_of(&w) else { continue };
+                let mut from_w = lock().backfill_active.iter().find(|(b, _, _)| *b == w).map_or(start, |(_, _, f)| *f);
+                let mut span_w: u64 = 250;
+                let mut queries = 0usize;
+                while from_w <= end {
+                    if queries > BUSY_WALLET_QUERIES {
+                        busy.push(w.clone());
+                        break;
+                    }
+                    let to_w = end.min(from_w + span_w - 1);
+                    BF_SPAN.store(span_w as usize, Ordering::Relaxed);
+                    let mut st = Fetching::default();
+                    match fetch_logs(&mut nodes, std::slice::from_ref(&w), from_w, to_w, &mut st) {
+                        Ok(logs) => {
+                            queries += 1 + st.splits;
+                            if st.busy.contains(&w) {
+                                busy.push(w.clone());
+                                break;
+                            }
+                            count(&logs);
+                            let mut l = lock();
+                            for (b, _, f) in l.backfill_active.iter_mut() {
+                                if *b == w {
+                                    *f = to_w + 1;
+                                }
+                            }
+                            drop(l);
+                            from_w = to_w + 1;
+                            span_w = if st.splits > 0 {
+                                (span_w / 2).max(MIN_SLICE)
+                            } else if logs.len() < 500 {
+                                (span_w * 2).min(span)
+                            } else {
+                                span_w
+                            };
+                        }
+                        Err(e) => {
+                            lock().last_error = format!("payment history: {e}");
+                            stopped = true;
+                            break;
+                        }
+                    }
+                }
+                if stopped {
+                    break;
+                }
+            }
+        }
+
+        let mut l = lock();
+        let resume: Vec<(String, u64, u64)> = std::mem::take(&mut l.backfill_active);
+        if stopped {
+            BF_STOPPED.fetch_add(1, Ordering::Relaxed);
+            // Each wallet carries on from where it got to.
+            for e in resume {
+                l.backfill.push_back(e);
+            }
+            drop(l);
+            std::thread::sleep(Duration::from_secs(60));
+        } else {
+            BF_BATCHES.fetch_add(1, Ordering::Relaxed);
+            BF_BUSY.fetch_add(busy.len(), Ordering::Relaxed);
+            for (w, u, _) in &batch {
+                if let Some(sl) = l.sellers.get_mut(w) {
+                    sl.backfilled_from = u.saturating_sub(BACKFILL_BLOCKS).max(1);
+                    if busy.contains(w) {
+                        sl.busy = true;
+                    }
+                }
+            }
+            l.dirty = true;
         }
     }
 }
@@ -1767,8 +1909,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_too_large_request_sends_fewer_wallets_and_they_creep_back() {
-        let too_big = "eth_getLogs failed: https://mainnet.base.org/: status code 413 | eth_getLogs failed: https://base-rpc.publicnode.com/: status code 403";
-        assert!(is_too_big(too_big) && !is_too_big("status code 403"));
         // Another test may be using the shared setting, so work from whatever it is now.
         *TOPIC_CHUNK.lock().unwrap() = 200;
         shrink_chunk();
@@ -1785,5 +1925,21 @@ pub(crate) mod tests {
         }
         assert_eq!(chunk_size(), MAX_CHUNK, "creeps back up, never past the ceiling");
         *TOPIC_CHUNK.lock().unwrap() = 200;
+    }
+
+    #[test]
+    fn a_wallet_too_busy_to_read_fully_says_so_and_keeps_what_was_read() {
+        let mut l = Ledger::default();
+        strong_seller(&mut l, &addr(0x71), STRONG_BUYERS as u64);
+        l.sellers.get_mut(&addr(0x71)).unwrap().busy = true;
+        let e = l.evidence(&addr(0x71));
+        assert!(e.history_incomplete && e.payments > 0);
+        assert!(e.summary().contains("only part of its payment history"), "{}", e.summary());
+        assert_eq!(e.to_json().get("history_incomplete"), Some(&Json::Bool(true)));
+        let mut buf = Vec::new();
+        l.write_lines(&mut buf).unwrap();
+        let back = Ledger::read_lines(std::io::Cursor::new(buf)).unwrap();
+        assert!(back.evidence(&addr(0x71)).history_incomplete, "the flag survives a restart");
+        assert!(!back.evidence(&addr(0x72)).history_incomplete);
     }
 }
