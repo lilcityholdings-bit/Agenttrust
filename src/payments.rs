@@ -966,6 +966,27 @@ fn chunk_size() -> usize {
 fn shrink_chunk() {
     let mut c = TOPIC_CHUNK.lock().unwrap_or_else(|e| e.into_inner());
     *c = (*c / 2).max(10);
+    CHUNK_STREAK.store(0, Ordering::Relaxed);
+}
+
+/// Queries answered in a row since the wallets-per-query last changed.
+static CHUNK_STREAK: AtomicUsize = AtomicUsize::new(0);
+const MAX_CHUNK: usize = 200;
+
+/// Notes a query that worked. After a run of them the number of wallets per query creeps back
+/// up (by a quarter), so one bad moment doesn't leave it small for good.
+fn chunk_worked() {
+    if CHUNK_STREAK.fetch_add(1, Ordering::Relaxed) + 1 >= 20 {
+        let mut c = TOPIC_CHUNK.lock().unwrap_or_else(|e| e.into_inner());
+        *c = (*c + (*c / 4).max(5)).min(MAX_CHUNK);
+        CHUNK_STREAK.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Whether a node refused the request for being too large (HTTP 413) — too many wallets in one
+/// query — rather than for asking about too many blocks.
+fn is_too_big(error: &str) -> bool {
+    error.contains("status code 413")
 }
 
 /// New payments to every watched wallet, every minute or so.
@@ -1195,67 +1216,81 @@ fn scan_backfill(urls: &[String]) {
         let mut span: u64 = max_logs_span();
         let mut failures = 0;
         let mut stopped_at = None;
-        while from <= until {
+        'windows: while from <= until {
             let to = until.min(from + span - 1);
             BF_SPAN.store(span as usize, Ordering::Relaxed);
-            let started = Instant::now();
-            let answer = nodes.transfers_to(&wallets, from, to);
-            let took = started.elapsed().as_millis() as usize;
-            if answer.is_ok() {
-                BF_OK.fetch_add(1, Ordering::Relaxed);
-                BF_OK_MS.fetch_add(took, Ordering::Relaxed);
-            } else {
-                BF_FAILED.fetch_add(1, Ordering::Relaxed);
-                BF_FAILED_MS.fetch_add(took, Ordering::Relaxed);
-            }
-            match answer {
-                Ok(logs) => {
-                    let mut l = lock();
-                    for log in &logs {
-                        // Only blocks inside each wallet's own range: later ones the live scan
-                        // reads, earlier ones an earlier attempt already did.
-                        let block = log.get("blockNumber").and_then(|v| v.as_str()).and_then(hex_u64).unwrap_or(0);
-                        let to_wallet = log
-                            .get("topics")
-                            .and_then(|t| if let Json::Array(t) = t { t.get(2).and_then(|v| v.as_str()).and_then(topic_address) } else { None });
-                        let range = to_wallet
-                            .and_then(|w| batch.iter().find(|(b, _, _)| *b == w))
-                            .map(|(_, u, f)| (start_of(*u, *f), until_of(*u)));
-                        if range.map_or(true, |(lo, hi)| block >= lo && block <= hi) {
-                            l.apply_log(log);
-                        }
+            // Every wallet's payments in [from, to], a few wallets per query. Nothing is counted
+            // until all of them have answered, so whatever goes wrong halfway can simply be
+            // asked again without counting anything twice.
+            let mut collected: Vec<Json> = Vec::new();
+            let mut i = 0;
+            while i < wallets.len() {
+                let size = chunk_size().min(wallets.len() - i);
+                let started = Instant::now();
+                let answer = nodes.transfers_to(&wallets[i..i + size], from, to);
+                let took = started.elapsed().as_millis() as usize;
+                match answer {
+                    Ok(logs) => {
+                        BF_OK.fetch_add(1, Ordering::Relaxed);
+                        BF_OK_MS.fetch_add(took, Ordering::Relaxed);
+                        collected.extend(logs);
+                        i += size;
+                        failures = 0;
+                        chunk_worked();
+                        std::thread::sleep(Duration::from_millis(100));
                     }
-                    // Recorded with the payments it covers, under the same lock.
-                    for (_, _, f) in l.backfill_active.iter_mut() {
-                        *f = (*f).max(to + 1);
-                    }
-                    from = to + 1;
-                    failures = 0;
-                    if logs.len() < 2_000 {
-                        span = (span * 2).min(max_logs_span());
-                    }
-                }
-                Err(e) => {
-                    failures += 1;
-                    if is_refusal(&e) {
-                        // Blocked or rate-limited: the same query will do once the node has
-                        // calmed down, so wait (longer each time) rather than ask for less.
-                        if failures > 8 {
+                    Err(e) => {
+                        BF_FAILED.fetch_add(1, Ordering::Relaxed);
+                        BF_FAILED_MS.fetch_add(took, Ordering::Relaxed);
+                        failures += 1;
+                        if is_too_big(&e) && chunk_size() > 10 {
+                            // "Request too large": send fewer wallets at once.
+                            shrink_chunk();
+                        } else if is_refusal(&e) {
+                            // Blocked or rate-limited: the same query will do once the node has
+                            // calmed down, so wait (longer each time) rather than ask for less.
+                            if failures > 8 {
+                                lock().last_error = format!("payment history: {e}");
+                                stopped_at = Some(from);
+                                break 'windows;
+                            }
+                            std::thread::sleep(Duration::from_secs((2u64 << failures.min(5)).min(60)));
+                        } else if span > 100 {
+                            // A complaint about the query itself: ask for fewer blocks.
+                            span /= 2;
+                            continue 'windows;
+                        } else if failures > 5 {
                             lock().last_error = format!("payment history: {e}");
                             stopped_at = Some(from);
-                            break;
+                            break 'windows;
                         }
-                        std::thread::sleep(Duration::from_secs((2u64 << failures.min(5)).min(60)));
-                    } else if span > 100 {
-                        span /= 2;
-                    } else if failures > 5 {
-                        lock().last_error = format!("payment history: {e}");
-                        stopped_at = Some(from);
-                        break;
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(200));
+            let mut l = lock();
+            for log in &collected {
+                // Only blocks inside each wallet's own range: later ones the live scan reads,
+                // earlier ones an earlier attempt already did.
+                let block = log.get("blockNumber").and_then(|v| v.as_str()).and_then(hex_u64).unwrap_or(0);
+                let to_wallet = log
+                    .get("topics")
+                    .and_then(|t| if let Json::Array(t) = t { t.get(2).and_then(|v| v.as_str()).and_then(topic_address) } else { None });
+                let range = to_wallet
+                    .and_then(|w| batch.iter().find(|(b, _, _)| *b == w))
+                    .map(|(_, u, f)| (start_of(*u, *f), until_of(*u)));
+                if range.map_or(true, |(lo, hi)| block >= lo && block <= hi) {
+                    l.apply_log(log);
+                }
+            }
+            // Recorded with the payments it covers, under the same lock.
+            for (_, _, f) in l.backfill_active.iter_mut() {
+                *f = (*f).max(to + 1);
+            }
+            drop(l);
+            from = to + 1;
+            if collected.len() < 2_000 {
+                span = (span * 2).min(max_logs_span());
+            }
         }
         let mut l = lock();
         l.backfill_active.clear();
@@ -1728,5 +1763,27 @@ pub(crate) mod tests {
         let too_wide = r#"eth_getLogs: {"code":-32602,"message":"range too large, max is 2000 blocks"}"#;
         assert!(!is_refusal(too_wide), "a range complaint is not a refusal");
         assert!(!is_refusal(&format!("{too_wide} | {blocked}")), "one node's range complaint still means ask for less");
+    }
+
+    #[test]
+    fn a_too_large_request_sends_fewer_wallets_and_they_creep_back() {
+        let too_big = "eth_getLogs failed: https://mainnet.base.org/: status code 413 | eth_getLogs failed: https://base-rpc.publicnode.com/: status code 403";
+        assert!(is_too_big(too_big) && !is_too_big("status code 403"));
+        // Another test may be using the shared setting, so work from whatever it is now.
+        *TOPIC_CHUNK.lock().unwrap() = 200;
+        shrink_chunk();
+        shrink_chunk();
+        assert_eq!(chunk_size(), 50);
+        for _ in 0..19 {
+            chunk_worked();
+        }
+        assert_eq!(chunk_size(), 50, "not until a run of twenty");
+        chunk_worked();
+        assert_eq!(chunk_size(), 62);
+        for _ in 0..2000 {
+            chunk_worked();
+        }
+        assert_eq!(chunk_size(), MAX_CHUNK, "creeps back up, never past the ceiling");
+        *TOPIC_CHUNK.lock().unwrap() = 200;
     }
 }
