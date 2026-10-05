@@ -1092,6 +1092,10 @@ static BF_STOPPED: AtomicUsize = AtomicUsize::new(0);
 static BF_HOT: AtomicUsize = AtomicUsize::new(0);
 static BF_BUSY: AtomicUsize = AtomicUsize::new(0);
 static BF_SPLITS: AtomicUsize = AtomicUsize::new(0);
+static BF_RETRIED: AtomicUsize = AtomicUsize::new(0);
+static BF_WALLETS_DONE: AtomicUsize = AtomicUsize::new(0);
+static BF_STARTED: OnceLock<Instant> = OnceLock::new();
+static BF_RETRY_FIXED: AtomicUsize = AtomicUsize::new(0);
 
 /// Logs how far reading history has got, how many sellers have earned a strong record, and how
 /// many services were visited in the last day. Run from the history reader's thread, never on
@@ -1119,14 +1123,30 @@ fn report_progress() {
 }
 
 /// One line on how reading history from Base is going.
+/// How fast wallets are being read this run, and how long the rest would take at that pace.
+fn pace_line(waiting: usize) -> String {
+    let done = BF_WALLETS_DONE.load(Ordering::Relaxed);
+    let hours = BF_STARTED.get().map_or(0.0, |t| t.elapsed().as_secs_f64() / 3600.0);
+    if done == 0 || hours <= 0.0 {
+        return "no batch finished yet, so no pace to report".into();
+    }
+    let rate = done as f64 / hours;
+    format!("{done} wallets read since this start, about {rate:.0} an hour, so about {:.1} hours for the {waiting} waiting", waiting as f64 / rate)
+}
+
 fn reader_line() -> String {
     let (ok, failed) = (BF_OK.load(Ordering::Relaxed), BF_FAILED.load(Ordering::Relaxed));
     let avg = |ms: &AtomicUsize, n: usize| if n == 0 { 0 } else { ms.load(Ordering::Relaxed) / n };
-    let err = lock().last_error.clone();
+    let (err, waiting) = {
+        let l = lock();
+        (l.last_error.clone(), l.history_waiting())
+    };
+    let pace = pace_line(waiting);
     format!(
-        "history reader: {ok} queries answered (avg {} ms), {failed} failed (avg {} ms), asking for {} blocks at a time, \
+        "history reader ({pace}): {ok} queries answered (avg {} ms), {failed} failed (avg {} ms), asking for {} blocks at a time, \
          {} batches done, {} stopped early and requeued, {} wallets per query on the live scan; \
-         {} busy wallets read separately, {} too busy to read fully, {} queries split to fit; last error: {}",
+         {} busy wallets read separately, {} too busy to read fully, {} queries split to fit, \
+         {} retried of which {} then worked; last error: {}",
         avg(&BF_OK_MS, ok),
         avg(&BF_FAILED_MS, failed),
         BF_SPAN.load(Ordering::Relaxed),
@@ -1136,6 +1156,8 @@ fn reader_line() -> String {
         BF_HOT.load(Ordering::Relaxed),
         BF_BUSY.load(Ordering::Relaxed),
         BF_SPLITS.load(Ordering::Relaxed),
+        BF_RETRIED.load(Ordering::Relaxed),
+        BF_RETRY_FIXED.load(Ordering::Relaxed),
         if err.is_empty() { "none".to_string() } else { err.chars().take(160).collect() }
     )
 }
@@ -1196,6 +1218,10 @@ fn spread_line(j: &Json) -> String {
 
 /// Wallets the history reader takes from the queue at a time.
 const BATCH_WALLETS: usize = 200;
+/// Wallets per query to begin with, and the most it climbs to. Public nodes refuse requests
+/// naming many wallets (half of the queries naming 200 failed; at 10 about one in ten did).
+const START_GROUP: usize = 25;
+const MAX_GROUP: usize = 100;
 /// The narrowest slice of blocks asked about for one wallet. A wallet whose payments in a slice
 /// this narrow are still too many for a public node to return is "busy".
 const MIN_SLICE: u64 = 100;
@@ -1218,6 +1244,7 @@ struct Fetching {
 /// nothing else — the rest of the batch is read at full size. A plain HTTP refusal (blocked,
 /// rate-limited) is waited out and retried unchanged; `Err` only when that never ends.
 fn fetch_logs(nodes: &mut Nodes, wallets: &[String], from: u64, to: u64, st: &mut Fetching) -> Result<Vec<Json>, String> {
+    let mut retries = 0u64;
     loop {
         let started = Instant::now();
         let answer = nodes.transfers_to(wallets, from, to);
@@ -1226,8 +1253,11 @@ fn fetch_logs(nodes: &mut Nodes, wallets: &[String], from: u64, to: u64, st: &mu
             Ok(logs) => {
                 BF_OK.fetch_add(1, Ordering::Relaxed);
                 BF_OK_MS.fetch_add(took, Ordering::Relaxed);
+                if retries > 0 {
+                    BF_RETRY_FIXED.fetch_add(1, Ordering::Relaxed);
+                }
                 st.refusals = 0;
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(150));
                 return Ok(logs);
             }
             Err(e) => e,
@@ -1240,6 +1270,14 @@ fn fetch_logs(nodes: &mut Nodes, wallets: &[String], from: u64, to: u64, st: &mu
                 return Err(e);
             }
             std::thread::sleep(Duration::from_secs((2u64 << st.refusals.min(5)).min(60)));
+            continue;
+        }
+        // Public nodes fail now and then for no reason that has to do with the query, so ask the
+        // same thing again (after a pause) before concluding it is too big.
+        if retries < 2 {
+            retries += 1;
+            BF_RETRIED.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(400 * retries));
             continue;
         }
         st.splits += 1;
@@ -1272,6 +1310,7 @@ fn fetch_logs(nodes: &mut Nodes, wallets: &[String], from: u64, to: u64, st: &mu
 /// slices afterwards. If the nodes keep refusing, the batch goes back in the queue to resume
 /// where each wallet stopped; a wallet is only marked as read once all its blocks are.
 fn scan_backfill(urls: &[String]) {
+    let _ = BF_STARTED.set(Instant::now());
     let mut nodes = Nodes { urls: urls.to_vec(), preferred: 0 };
     loop {
         let batch: Vec<(String, u64, u64)> = {
@@ -1322,7 +1361,7 @@ fn scan_backfill(urls: &[String]) {
         let mut hot: Vec<String> = Vec::new();
         let mut busy: Vec<String> = Vec::new();
         let mut stopped = false;
-        let mut group = BATCH_WALLETS;
+        let mut group = START_GROUP;
         let mut clean_windows = 0;
 
         // The main pass: everyone not busy, window by window.
@@ -1367,15 +1406,15 @@ fn scan_backfill(urls: &[String]) {
                 }
             }
             active.retain(|w| !st.hot.contains(w) && !st.busy.contains(w));
-            // A split not explained by one wallet (the node refusing the request size) shrinks
-            // how many wallets go in a query; clean windows bring it back up.
-            if st.splits > st.hot.len() * 12 {
+            // Any split means a query was too big for the node: fewer wallets per query from now
+            // on. Clean windows bring the number back up, a quarter at a time.
+            if st.splits > 0 {
                 group = (group / 2).max(10);
                 clean_windows = 0;
             } else {
                 clean_windows += 1;
-                if clean_windows >= 20 {
-                    group = (group + group / 4).min(BATCH_WALLETS);
+                if clean_windows >= 10 {
+                    group = (group + group / 4).min(MAX_GROUP);
                     clean_windows = 0;
                 }
             }
@@ -1447,6 +1486,7 @@ fn scan_backfill(urls: &[String]) {
             std::thread::sleep(Duration::from_secs(60));
         } else {
             BF_BATCHES.fetch_add(1, Ordering::Relaxed);
+            BF_WALLETS_DONE.fetch_add(batch.len(), Ordering::Relaxed);
             BF_BUSY.fetch_add(busy.len(), Ordering::Relaxed);
             for (w, u, _) in &batch {
                 if let Some(sl) = l.sellers.get_mut(w) {
