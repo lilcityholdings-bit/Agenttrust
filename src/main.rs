@@ -808,6 +808,7 @@ fn health_checks(now: i64) -> (Json, Vec<String>) {
         ("wallets_history_read", Json::num(history_read as f64)),
         ("wallets_history_waiting", Json::num(history_waiting as f64)),
         ("sellers_with_strong_record", if strong == usize::MAX { Json::Null } else { Json::num(strong as f64) }),
+        ("sellers_against_the_bar", payments::BAR_SPREAD.lock().unwrap_or_else(|e| e.into_inner()).clone()),
         ("delivery_reports_waiting", Json::num(payments::report_queue().lock().unwrap_or_else(|e| e.into_inner()).len() as f64)),
         ("services_catalogued", Json::num(services as f64)),
         ("payment_scan_blocks_behind", Json::num(pay_behind as f64)),

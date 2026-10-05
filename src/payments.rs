@@ -376,18 +376,96 @@ impl Ledger {
     /// evidence. Groups the services by wallet once, so it stays quick with tens of thousands
     /// of both.
     pub fn strong_sellers(&self) -> Vec<(String, Evidence)> {
+        self.evidence_where(|s| s.payers.len() >= STRONG_BUYERS).into_iter().filter(|(_, e)| e.strong()).collect()
+    }
+
+    /// The evidence for every seller `keep` lets through, grouping services by wallet once.
+    fn evidence_where(&self, keep: impl Fn(&Seller) -> bool) -> Vec<(String, Evidence)> {
         let mut by_wallet: HashMap<&str, Vec<&Service>> = HashMap::new();
         for s in self.services.values() {
             by_wallet.entry(s.pay_to.as_str()).or_default().push(s);
         }
         self.sellers
             .iter()
-            .filter(|(_, s)| s.payers.len() >= STRONG_BUYERS)
-            .filter_map(|(w, _)| {
-                let e = self.evidence_with(w, by_wallet.get(w.as_str()).map_or(&[][..], |v| v));
-                e.strong().then(|| (w.clone(), e))
-            })
+            .filter(|(_, s)| keep(s))
+            .map(|(w, _)| (w.clone(), self.evidence_with(w, by_wallet.get(w.as_str()).map_or(&[][..], |v| v))))
             .collect()
+    }
+
+    /// How the sellers whose history is fully read stand against the bar for "ok": how many
+    /// are near it, which part holds the rest back, and how many would pass at lower bars.
+    /// For deciding where the bar belongs with real numbers rather than guesses.
+    pub fn bar_spread(&self) -> Json {
+        let all = self.evidence_where(|s| s.backfilled_from != 0 && s.payments > 0);
+        let clean = |e: &Evidence| !e.reports_bad() && e.probes_mismatch == 0;
+        let passes = |e: &Evidence, est: usize, rep: usize, days: u64| {
+            e.established_buyers >= est && e.repeat_buyers >= rep && e.span_days >= days && clean(e)
+        };
+        let count = |f: &dyn Fn(&Evidence) -> bool| all.iter().filter(|(_, e)| f(e)).count();
+        let bucket = |field: fn(&Evidence) -> usize, edges: &[(usize, &str)]| {
+            Json::obj(
+                edges
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (lo, label))| {
+                        let hi = if i == 0 { usize::MAX } else { edges[i - 1].0 };
+                        (*label, Json::num(all.iter().filter(|(_, e)| (*lo..hi).contains(&field(e))).count() as f64))
+                    })
+                    .collect(),
+            )
+        };
+        let (est, rep, days) = (STRONG_BUYERS, STRONG_REPEAT, STRONG_SPAN_DAYS);
+        let strong = count(&|e| e.strong());
+        let close = count(&|e| !e.strong() && passes(e, est / 2, rep / 2, days / 2));
+        let not_strong: Vec<&Evidence> = all.iter().map(|(_, e)| e).filter(|e| !e.strong()).collect();
+        let short = |f: &dyn Fn(&Evidence) -> bool| Json::num(not_strong.iter().filter(|e| f(e)).count() as f64);
+        let lower: Vec<Json> = [(20, 7, 14), (15, 5, 14), (10, 5, 7), (5, 3, 7)]
+            .iter()
+            .map(|&(a, b, c)| {
+                Json::obj(vec![
+                    ("established_buyers", Json::num(a as f64)),
+                    ("repeat_buyers", Json::num(b as f64)),
+                    ("days_active", Json::num(c as f64)),
+                    ("sellers", Json::num(count(&|e| passes(e, a, b, c)) as f64)),
+                ])
+            })
+            .collect();
+        let mut best: Vec<&(String, Evidence)> = all.iter().filter(|(_, e)| clean(e)).collect();
+        best.sort_by(|a, b| (b.1.established_buyers, b.1.repeat_buyers).cmp(&(a.1.established_buyers, a.1.repeat_buyers)));
+        let best: Vec<Json> = best
+            .iter()
+            .take(5)
+            .map(|(w, e)| {
+                Json::obj(vec![
+                    ("wallet", Json::str(w.clone())),
+                    ("established_buyers", Json::num(e.established_buyers as f64)),
+                    ("repeat_buyers", Json::num(e.repeat_buyers as f64)),
+                    ("buyers", Json::num(e.buyers as f64)),
+                    ("days_active", Json::num(e.span_days as f64)),
+                ])
+            })
+            .collect();
+        Json::obj(vec![
+            ("sellers_paid", Json::num(all.len() as f64)),
+            ("strong", Json::num(strong as f64)),
+            ("close", Json::num(close as f64)),
+            ("bar", Json::obj(vec![
+                ("established_buyers", Json::num(est as f64)),
+                ("repeat_buyers", Json::num(rep as f64)),
+                ("days_active", Json::num(days as f64)),
+            ])),
+            ("established_buyers", bucket(|e| e.established_buyers, &[(30, "30+"), (15, "15-29"), (5, "5-14"), (1, "1-4"), (0, "0")])),
+            ("repeat_buyers", bucket(|e| e.repeat_buyers, &[(10, "10+"), (5, "5-9"), (1, "1-4"), (0, "0")])),
+            ("all_buyers", bucket(|e| e.buyers, &[(30, "30+"), (15, "15-29"), (5, "5-14"), (1, "1-4")])),
+            ("short_of", Json::obj(vec![
+                ("established_buyers", short(&|e| e.established_buyers < est)),
+                ("repeat_buyers", short(&|e| e.repeat_buyers < rep)),
+                ("days_active", short(&|e| e.span_days < days)),
+                ("clean_record", short(&|e| !clean(e))),
+            ])),
+            ("would_pass_at", Json::Array(lower)),
+            ("best", Json::Array(best)),
+        ])
     }
 
     /// How far reading history has got: wallets whose 45 days are read, and wallets watched.
@@ -950,20 +1028,68 @@ pub static STRONG_SELLERS: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// many services were visited in the last day. Run from the history reader's thread, never on
 /// a request.
 fn report_progress() {
-    let line = {
+    let (line, spread) = {
         let l = lock();
         let (read, watched) = l.history_progress();
         let strong = l.strong_sellers().len();
         STRONG_SELLERS.store(strong, Ordering::Relaxed);
-        format!(
+        let spread = l.bar_spread();
+        let line = format!(
             "keptvow: payment history: {read} of {watched} wallets read ({} waiting); {strong} sellers with a strong record; \
              {} of {} services checked in the last day",
             l.history_waiting(),
             l.probed_since(now_ms() - PROBE_EVERY_MS),
             l.services.len()
-        )
+        );
+        (line, spread)
     };
     println!("{line}");
+    println!("keptvow: sellers against the bar for ok: {}", spread_line(&spread));
+    *BAR_SPREAD.lock().unwrap_or_else(|e| e.into_inner()) = spread;
+}
+
+/// The last count of how sellers stand against the bar for "ok" (see `Ledger::bar_spread`).
+pub static BAR_SPREAD: Mutex<Json> = Mutex::new(Json::Null);
+
+/// The spread as one log line.
+fn spread_line(j: &Json) -> String {
+    let n = |path: &[&str]| {
+        let mut cur = Some(j);
+        for k in path {
+            cur = cur.and_then(|c| c.get(k));
+        }
+        cur.and_then(|v| v.as_f()).unwrap_or(0.0) as usize
+    };
+    let lower: Vec<String> = match j.get("would_pass_at") {
+        Some(Json::Array(a)) => a
+            .iter()
+            .map(|x| {
+                let g = |k: &str| x.get(k).and_then(|v| v.as_f()).unwrap_or(0.0) as usize;
+                format!("{}/{}/{}d: {}", g("established_buyers"), g("repeat_buyers"), g("days_active"), g("sellers"))
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    format!(
+        "{} sellers paid (history read); {} strong, {} close (half of every part); established buyers 30+ {}, 15-29 {}, 5-14 {}, 1-4 {}, 0 {}; \
+         repeat buyers 10+ {}, 5-9 {}; held back by established buyers {}, repeat buyers {}, days active {}, bad reports {}; \
+         would pass at {}",
+        n(&["sellers_paid"]),
+        n(&["strong"]),
+        n(&["close"]),
+        n(&["established_buyers", "30+"]),
+        n(&["established_buyers", "15-29"]),
+        n(&["established_buyers", "5-14"]),
+        n(&["established_buyers", "1-4"]),
+        n(&["established_buyers", "0"]),
+        n(&["repeat_buyers", "10+"]),
+        n(&["repeat_buyers", "5-9"]),
+        n(&["short_of", "established_buyers"]),
+        n(&["short_of", "repeat_buyers"]),
+        n(&["short_of", "days_active"]),
+        n(&["short_of", "clean_record"]),
+        lower.join(", ")
+    )
 }
 
 /// The last 45 days of each newly watched wallet, a batch at a time. When a node keeps refusing,
@@ -1488,5 +1614,31 @@ pub(crate) mod tests {
         assert_eq!(back.sellers[&lost].payments, 0, "its partial row is cleared, so nothing is counted twice");
         let pid = back.payer_ids[&addr(0x5000)];
         assert_eq!(back.payer_reach[pid as usize].0, 0, "and the buyer's reach no longer counts it");
+    }
+
+    #[test]
+    fn the_spread_shows_who_is_near_the_bar_and_what_holds_them_back() {
+        let mut l = Ledger::default();
+        strong_seller(&mut l, &addr(0x61), STRONG_BUYERS as u64);
+        strong_seller(&mut l, &addr(0x62), 15);
+        strong_seller(&mut l, &addr(0x63), 3);
+        let j = l.bar_spread();
+        let n = |path: &[&str]| {
+            let mut cur = Some(&j);
+            for k in path {
+                cur = cur.and_then(|c| c.get(k));
+            }
+            cur.and_then(|v| v.as_f()).unwrap_or(-1.0) as i64
+        };
+        assert_eq!(n(&["sellers_paid"]), 3, "only sellers whose history is read count");
+        assert_eq!((n(&["strong"]), n(&["close"])), (1, 1));
+        assert_eq!((n(&["established_buyers", "30+"]), n(&["established_buyers", "15-29"]), n(&["established_buyers", "1-4"])), (1, 1, 1));
+        assert_eq!(n(&["short_of", "established_buyers"]), 2);
+        assert_eq!(n(&["short_of", "repeat_buyers"]), 1, "three buyers who came back are short of ten");
+        let Some(Json::Array(lower)) = j.get("would_pass_at") else { panic!() };
+        let at = |i: usize| lower[i].get("sellers").and_then(|v| v.as_f()).unwrap() as i64;
+        assert_eq!((at(0), at(1), at(3)), (1, 2, 2), "20/7/14 lets one through, 15/5/14 two, 5/3/7 still two");
+        let line = spread_line(&j);
+        assert!(line.contains("1 strong, 1 close") && line.contains("15/5/14d: 2"), "{line}");
     }
 }
