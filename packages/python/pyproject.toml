@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keptvow"
+version = "0.1.0"
+description = "Check who your AI agent is about to pay before an x402 payment goes out: ok, careful or stop."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+dependencies = []
+keywords = ["x402", "ai-agents", "payments", "trust", "erc-8004", "base", "usdc"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+Source = "https://github.com/lilcityholdings-bit/Agenttrust/tree/main/packages/python"

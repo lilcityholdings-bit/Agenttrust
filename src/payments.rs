@@ -22,6 +22,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,7 @@ const MAX_PAYERS_PER_SELLER: usize = 20_000;
 /// Catalogued services kept.
 const MAX_SERVICES: usize = 50_000;
 const PROBE_EVERY_MS: i64 = 24 * 3_600_000;
+const PROBERS: usize = 4;
 const CATALOG_EVERY: Duration = Duration::from_secs(6 * 3_600);
 
 // The bar for a strong record from payment history alone (see the module notes).
@@ -109,7 +111,12 @@ pub struct Ledger {
     payer_reach: Vec<(u32, u64)>,
     pub services: BTreeMap<String, Service>,
     /// Watched wallets whose history still has to be read: (wallet, read up to this block).
-    backfill: VecDeque<(String, u64)>,
+    /// Wallets whose history is still to read: (wallet, read up to this block, resume from this
+    /// block — 0 for the full 45 days).
+    backfill: VecDeque<(String, u64, u64)>,
+    /// The batch being read right now, with how far it has got: saved with the queue, so a
+    /// restart mid-batch carries on from there instead of losing those wallets.
+    backfill_active: Vec<(String, u64, u64)>,
     pub reports_seen: HashSet<String>,
     pub last_error: String,
     pub last_ok_ms: i64,
@@ -282,7 +289,7 @@ impl Ledger {
             return false;
         }
         self.sellers.insert(w.clone(), Seller::default());
-        self.backfill.push_back((w, self.cursor));
+        self.backfill.push_back((w, self.cursor, 0));
         self.dirty = true;
         true
     }
@@ -362,6 +369,43 @@ impl Ledger {
     pub fn evidence(&self, wallet: &str) -> Evidence {
         let w = wallet.to_ascii_lowercase();
         let services: Vec<&Service> = self.services.values().filter(|s| s.pay_to == w).collect();
+        self.evidence_with(&w, &services)
+    }
+
+    /// Every seller whose payment record is strong enough for "ok" on its own, with its
+    /// evidence. Groups the services by wallet once, so it stays quick with tens of thousands
+    /// of both.
+    pub fn strong_sellers(&self) -> Vec<(String, Evidence)> {
+        let mut by_wallet: HashMap<&str, Vec<&Service>> = HashMap::new();
+        for s in self.services.values() {
+            by_wallet.entry(s.pay_to.as_str()).or_default().push(s);
+        }
+        self.sellers
+            .iter()
+            .filter(|(_, s)| s.payers.len() >= STRONG_BUYERS)
+            .filter_map(|(w, _)| {
+                let e = self.evidence_with(w, by_wallet.get(w.as_str()).map_or(&[][..], |v| v));
+                e.strong().then(|| (w.clone(), e))
+            })
+            .collect()
+    }
+
+    /// How far reading history has got: wallets whose 45 days are read, and wallets watched.
+    pub fn history_progress(&self) -> (usize, usize) {
+        (self.sellers.values().filter(|s| s.backfilled_from != 0).count(), self.sellers.len())
+    }
+
+    /// Wallets whose history is still to read, including the batch being read now.
+    pub fn history_waiting(&self) -> usize {
+        self.backfill.len() + self.backfill_active.len()
+    }
+
+    /// Services visited since `since_ms`.
+    pub fn probed_since(&self, since_ms: i64) -> usize {
+        self.services.values().filter(|s| s.probe.checks > 0 && s.probe.at_ms >= since_ms).count()
+    }
+
+    fn evidence_with(&self, w: &str, services: &[&Service]) -> Evidence {
         let mut e = Evidence {
             services: services.len(),
             probes_ok: services.iter().filter(|s| s.probe.result == "ok").count(),
@@ -369,7 +413,7 @@ impl Ledger {
             probes_mismatch: services.iter().filter(|s| s.probe.result == "mismatch").count(),
             ..Evidence::default()
         };
-        let Some(s) = self.sellers.get(&w) else { return e };
+        let Some(s) = self.sellers.get(w) else { return e };
         e.watched = true;
         e.history_loading = s.backfilled_from == 0;
         e.payments = s.payments;
@@ -465,8 +509,17 @@ impl Ledger {
         }
     }
 
-    /// The next service due a probe, if any.
-    fn next_probe(&self, now_ms: i64) -> Option<(String, String, String)> {
+    /// The next service due a probe, if any. It is marked as visited now, so the probers
+    /// working in parallel never pick the same one; the result is filled in when it arrives.
+    fn next_probe(&mut self, now_ms: i64) -> Option<(String, String, String)> {
+        let next = self.next_due(now_ms)?;
+        if let Some(s) = self.services.get_mut(&next.0) {
+            s.probe.at_ms = now_ms;
+        }
+        Some(next)
+    }
+
+    fn next_due(&self, now_ms: i64) -> Option<(String, String, String)> {
         self.services
             .values()
             .filter(|s| now_ms - s.probe.at_ms > PROBE_EVERY_MS)
@@ -493,7 +546,13 @@ impl Ledger {
                 ("catalog_at_ms", Json::num(self.catalog_at_ms as f64)),
                 (
                     "backfill",
-                    Json::Array(self.backfill.iter().map(|(w, b)| Json::Array(vec![Json::str(w.clone()), Json::num(*b as f64)])).collect()),
+                    Json::Array(
+                        self.backfill
+                            .iter()
+                            .chain(self.backfill_active.iter())
+                            .map(|(w, b, f)| Json::Array(vec![Json::str(w.clone()), Json::num(*b as f64), Json::num(*f as f64)]))
+                            .collect(),
+                    ),
                 ),
             ])
             .to_string()
@@ -565,6 +624,7 @@ impl Ledger {
     fn read_lines(input: impl std::io::BufRead) -> Option<Ledger> {
         let mut l = Ledger::default();
         let mut payer_first: Vec<(String, u32, u64, String)> = Vec::new();
+        let mut queued: Vec<(String, u64, u64)> = Vec::new();
         for line in input.lines() {
             let line = line.ok()?;
             if line.trim().is_empty() {
@@ -582,7 +642,8 @@ impl Ledger {
                         for x in b {
                             if let Json::Array(p) = x {
                                 if let (Some(w), Some(until)) = (p.first().and_then(|v| v.as_str()), p.get(1).and_then(|v| v.as_f())) {
-                                    l.backfill.push_back((w.to_string(), until as u64));
+                                    let from = p.get(2).and_then(|v| v.as_f()).unwrap_or(0.0);
+                                    queued.push((w.to_string(), until as u64, from as u64));
                                 }
                             }
                         }
@@ -649,6 +710,28 @@ impl Ledger {
                 }
                 _ => {}
             }
+        }
+        // A batch that was mid-read and got through all its blocks is done.
+        for (w, until, from) in queued {
+            if until > 0 && from > until {
+                if let Some(s) = l.sellers.get_mut(&w) {
+                    s.backfilled_from = until.saturating_sub(BACKFILL_BLOCKS).max(1);
+                }
+            } else {
+                l.backfill.push_back((w, until, from));
+            }
+        }
+        // Wallets whose history was never read and that aren't queued were lost from the queue
+        // by an older version when it restarted mid-batch. Their rows hold only what the live
+        // scan saw, so they are cleared and read again in full, up to where the live scan resumes.
+        let in_queue: HashSet<&str> = l.backfill.iter().map(|(w, _, _)| w.as_str()).collect();
+        let lost: Vec<String> = l.sellers.iter().filter(|(w, s)| s.backfilled_from == 0 && !in_queue.contains(w.as_str())).map(|(w, _)| w.clone()).collect();
+        let lost_set: HashSet<&str> = lost.iter().map(|w| w.as_str()).collect();
+        payer_first.retain(|(_, _, _, w)| !lost_set.contains(w.as_str()));
+        let cursor = l.cursor;
+        for w in &lost {
+            l.sellers.insert(w.clone(), Seller::default());
+            l.backfill.push_back((w.clone(), cursor, 0));
         }
         // Reach (how many sellers each buyer paid) and first sighting are rebuilt from the rows.
         for (_, pid, fb, _) in payer_first {
@@ -785,7 +868,10 @@ pub fn start(dir: PathBuf, rpc_urls: Vec<String>, catalog_urls: Vec<String>) {
     let urls = rpc_urls.clone();
     crate::supervise("the payment history reader", move || scan_backfill(&urls));
     crate::supervise("the service catalog reader", move || read_catalog(&catalog_urls));
-    crate::supervise("the service prober", probe_services);
+    // Four at a time: one alone can't visit tens of thousands of services in a day.
+    for _ in 0..PROBERS {
+        crate::supervise("the service prober", probe_services);
+    }
     crate::supervise("the delivery report checker", move || check_reports(&rpc_urls));
 }
 
@@ -856,47 +942,105 @@ fn scan_live(urls: &[String]) {
     }
 }
 
-/// The last 45 days of each newly watched wallet, a batch at a time.
+/// Sellers with a strong enough payment record for "ok" on their own, as last counted by the
+/// history reader (`usize::MAX` until the first count).
+pub static STRONG_SELLERS: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Logs how far reading history has got, how many sellers have earned a strong record, and how
+/// many services were visited in the last day. Run from the history reader's thread, never on
+/// a request.
+fn report_progress() {
+    let line = {
+        let l = lock();
+        let (read, watched) = l.history_progress();
+        let strong = l.strong_sellers().len();
+        STRONG_SELLERS.store(strong, Ordering::Relaxed);
+        format!(
+            "keptvow: payment history: {read} of {watched} wallets read ({} waiting); {strong} sellers with a strong record; \
+             {} of {} services checked in the last day",
+            l.history_waiting(),
+            l.probed_since(now_ms() - PROBE_EVERY_MS),
+            l.services.len()
+        )
+    };
+    println!("{line}");
+}
+
+/// The last 45 days of each newly watched wallet, a batch at a time. When a node keeps refusing,
+/// the batch goes back in the queue to resume where it stopped, with fewer wallets per query —
+/// a wallet is only marked as read once all 45 days are.
 fn scan_backfill(urls: &[String]) {
     let mut nodes = Nodes { urls: urls.to_vec(), preferred: 0 };
+    let mut last_report: Option<Instant> = None;
+    let mut reported_done = false;
     loop {
-        let batch: Vec<(String, u64)> = {
+        let due = last_report.map_or(true, |t| t.elapsed() > Duration::from_secs(600));
+        let batch: Vec<(String, u64, u64)> = {
             let mut l = lock();
             let n = chunk_size().min(l.backfill.len());
-            l.backfill.drain(..n).collect()
+            let batch: Vec<_> = l.backfill.drain(..n).collect();
+            l.backfill_active = batch.clone();
+            batch
         };
         if batch.is_empty() {
+            // Once more when the queue empties, then every ten minutes while anything changes.
+            if !reported_done || due {
+                report_progress();
+                last_report = Some(Instant::now());
+                reported_done = true;
+            }
             std::thread::sleep(Duration::from_secs(30));
             continue;
         }
+        reported_done = false;
+        if due {
+            report_progress();
+            last_report = Some(Instant::now());
+        }
         let Ok(head) = nodes.head() else {
-            lock().backfill.extend(batch);
+            let mut l = lock();
+            l.backfill_active.clear();
+            l.backfill.extend(batch);
+            drop(l);
             std::thread::sleep(Duration::from_secs(30));
             continue;
         };
-        // Up to where the live scan had read when each was added (or now, if it hadn't begun).
-        let until = batch.iter().map(|(_, u)| if *u == 0 { head } else { *u }).max().unwrap_or(head);
-        let start = until.saturating_sub(BACKFILL_BLOCKS);
-        let wallets: Vec<String> = batch.iter().map(|(w, _)| w.clone()).collect();
+        // Each wallet is read up to where the live scan had got when it was added (or now, if it
+        // hadn't begun), from 45 days before that — or from where an earlier attempt stopped.
+        let until_of = |u: u64| if u == 0 { head } else { u };
+        let start_of = |u: u64, f: u64| if f > 0 { f } else { until_of(u).saturating_sub(BACKFILL_BLOCKS) };
+        // From here on each wallet's range is fixed, so a restart resumes exactly where this left.
+        let batch: Vec<(String, u64, u64)> = batch.into_iter().map(|(w, u, f)| (w, until_of(u), start_of(u, f))).collect();
+        lock().backfill_active = batch.clone();
+        let until = batch.iter().map(|(_, u, _)| until_of(*u)).max().unwrap_or(head);
+        let start = batch.iter().map(|(_, u, f)| start_of(*u, *f)).min().unwrap_or(until);
+        let wallets: Vec<String> = batch.iter().map(|(w, _, _)| w.clone()).collect();
         let mut from = start;
         let mut span: u64 = 20_000;
         let mut failures = 0;
+        let mut stopped_at = None;
         while from <= until {
             let to = until.min(from + span - 1);
             match nodes.transfers_to(&wallets, from, to) {
                 Ok(logs) => {
                     let mut l = lock();
                     for log in &logs {
-                        // Only blocks up to each wallet's own start point; later ones the live
-                        // scan reads.
+                        // Only blocks inside each wallet's own range: later ones the live scan
+                        // reads, earlier ones an earlier attempt already did.
                         let block = log.get("blockNumber").and_then(|v| v.as_str()).and_then(hex_u64).unwrap_or(0);
                         let to_wallet = log
                             .get("topics")
                             .and_then(|t| if let Json::Array(t) = t { t.get(2).and_then(|v| v.as_str()).and_then(topic_address) } else { None });
-                        let limit = to_wallet.and_then(|w| batch.iter().find(|(b, _)| *b == w)).map(|(_, u)| if *u == 0 { head } else { *u });
-                        if limit.map_or(true, |u| block <= u) {
+                        let range = to_wallet
+                            .and_then(|w| batch.iter().find(|(b, _, _)| *b == w))
+                            .map(|(_, u, f)| (start_of(*u, *f), until_of(*u)));
+                        if range.map_or(true, |(lo, hi)| block >= lo && block <= hi) {
                             l.apply_log(log);
                         }
+                    }
+                    // Recorded with the payments it covers, under the same lock.
+                    for (_, _, f) in l.backfill_active.iter_mut() {
+                        *f = (*f).max(to + 1);
                     }
                     from = to + 1;
                     failures = 0;
@@ -904,11 +1048,13 @@ fn scan_backfill(urls: &[String]) {
                         span = (span * 2).min(50_000);
                     }
                 }
-                Err(_) => {
+                Err(e) => {
                     failures += 1;
                     if span > 500 {
                         span /= 2;
                     } else if failures > 5 {
+                        lock().last_error = format!("payment history: {e}");
+                        stopped_at = Some(from);
                         break;
                     }
                 }
@@ -916,12 +1062,27 @@ fn scan_backfill(urls: &[String]) {
             std::thread::sleep(Duration::from_millis(200));
         }
         let mut l = lock();
-        for (w, _) in &batch {
-            if let Some(s) = l.sellers.get_mut(w) {
-                s.backfilled_from = start.max(1);
+        l.backfill_active.clear();
+        match stopped_at {
+            Some(resume) => {
+                // Everything before `resume` is counted; carry on from there later.
+                for (w, u, f) in batch {
+                    let lo = start_of(u, f);
+                    l.backfill.push_back((w, u, resume.max(lo)));
+                }
+                drop(l);
+                shrink_chunk();
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            None => {
+                for (w, u, _) in &batch {
+                    if let Some(s) = l.sellers.get_mut(w) {
+                        s.backfilled_from = until_of(*u).saturating_sub(BACKFILL_BLOCKS).max(1);
+                    }
+                }
+                l.dirty = true;
             }
         }
-        l.dirty = true;
     }
 }
 
@@ -1252,5 +1413,80 @@ pub(crate) mod tests {
             e.history_loading = false;
             e
         });
+    }
+
+    #[test]
+    fn strong_sellers_match_one_by_one_checks_and_count_progress() {
+        let mut l = Ledger::default();
+        strong_seller(&mut l, &addr(0x51), STRONG_BUYERS as u64);
+        strong_seller(&mut l, &addr(0x52), STRONG_BUYERS as u64);
+        strong_seller(&mut l, &addr(0x53), 3);
+        // A seller whose listed service asks to be paid elsewhere is never strong.
+        l.services.insert(
+            "https://x.example/a".into(),
+            Service { url: "https://x.example/a".into(), pay_to: addr(0x52), probe: Probe { result: "mismatch".into(), ..Probe::default() }, ..Service::default() },
+        );
+        let mut fast: Vec<String> = l.strong_sellers().into_iter().map(|(w, _)| w).collect();
+        fast.sort();
+        let mut slow: Vec<String> = l.sellers.keys().filter(|w| l.evidence(w).strong()).cloned().collect();
+        slow.sort();
+        assert_eq!(fast, slow);
+        assert_eq!(fast, vec![addr(0x51)]);
+        let (read, watched) = l.history_progress();
+        assert_eq!((read, watched), (3, l.sellers.len()), "only the three sellers had their history read");
+        assert_eq!(l.history_waiting(), watched, "every watched wallet was queued (the helper marks three as read directly)");
+    }
+
+    #[test]
+    fn unfinished_history_resumes_where_it_stopped_after_a_restart() {
+        let mut l = Ledger::default();
+        l.backfill.push_back((addr(1), 900, 0));
+        l.backfill.push_back((addr(2), 900, 450));
+        let mut buf = Vec::new();
+        l.write_lines(&mut buf).unwrap();
+        let back = Ledger::read_lines(std::io::Cursor::new(buf)).unwrap();
+        assert_eq!(back.backfill, l.backfill);
+        // Files written before resume points existed still load.
+        let old = format!("{{\"kind\":\"header\",\"version\":1,\"cursor\":5,\"head\":5,\"catalog_at_ms\":0,\"backfill\":[[\"{}\",9]]}}\n", addr(3));
+        let back = Ledger::read_lines(std::io::Cursor::new(old.into_bytes())).unwrap();
+        assert_eq!(back.backfill.front(), Some(&(addr(3), 9, 0)));
+    }
+
+    #[test]
+    fn parallel_probers_never_pick_the_same_service() {
+        let mut l = Ledger::default();
+        for n in 0..3 {
+            let url = format!("https://s{n}.example/");
+            l.services.insert(url.clone(), Service { url, pay_to: addr(n), ..Service::default() });
+        }
+        let now = 10 * PROBE_EVERY_MS;
+        let picks: HashSet<String> = (0..3).filter_map(|_| l.next_probe(now)).map(|p| p.0).collect();
+        assert_eq!(picks.len(), 3);
+        assert!(l.next_probe(now).is_none(), "all three are taken until tomorrow");
+    }
+
+    #[test]
+    fn a_restart_mid_read_neither_loses_wallets_nor_counts_payments_twice() {
+        let mut l = Ledger::default();
+        l.cursor = 5_000;
+        let (lost, done, midway) = (addr(0x10), addr(0x11), addr(0x12));
+        for w in [&lost, &done, &midway] {
+            l.watch(w);
+        }
+        l.backfill.clear();
+        // An older version dropped `lost` from the queue while reading it; the live scan has
+        // since seen one payment to it.
+        l.apply_log(&transfer_log(&addr(0x5000), &lost, 10_000, 4_990));
+        // `done` was read to the end and `midway` halfway when the restart came.
+        l.backfill_active = vec![(done.clone(), 4_000, 4_001), (midway.clone(), 4_000, 2_500)];
+        let mut buf = Vec::new();
+        l.write_lines(&mut buf).unwrap();
+        let back = Ledger::read_lines(std::io::Cursor::new(buf)).unwrap();
+        assert!(back.sellers[&done].backfilled_from > 0, "a finished batch counts as read");
+        assert!(back.backfill.contains(&(midway.clone(), 4_000, 2_500)), "a half-read wallet resumes where it stopped");
+        assert!(back.backfill.contains(&(lost.clone(), 5_000, 0)), "a lost wallet is read again, up to where the live scan resumes");
+        assert_eq!(back.sellers[&lost].payments, 0, "its partial row is cleared, so nothing is counted twice");
+        let pid = back.payer_ids[&addr(0x5000)];
+        assert_eq!(back.payer_reach[pid as usize].0, 0, "and the buyer's reach no longer counts it");
     }
 }

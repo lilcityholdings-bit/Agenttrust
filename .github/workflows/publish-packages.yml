@@ -1,0 +1,60 @@
+# Publishes the install packages: `npm install keptvow` and `pip install keptvow`.
+# Runs only when started by hand (Actions tab → "Publish install packages" → Run workflow), so
+# nothing is published without the owner's say-so. Bump "version" in packages/npm/package.json
+# and packages/python/pyproject.toml before each run.
+#
+# One-time setup:
+#   npm:  make an npm account, create an "Automation" access token, and add it to this
+#         repository as the secret NPM_TOKEN (Settings → Secrets and variables → Actions).
+#   PyPI: make a PyPI account and add a "pending publisher" for project "keptvow" with this
+#         repository, workflow file publish-packages.yml and environment "pypi". No token needed.
+name: Publish install packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      which:
+        description: "Which to publish"
+        type: choice
+        options: [both, npm, pypi]
+        default: both
+
+jobs:
+  npm:
+    if: inputs.which != 'pypi'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Build and test
+        working-directory: packages/npm
+        run: node build.mjs && node test.mjs && git diff --exit-code index.js
+      - name: Publish
+        working-directory: packages/npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  pypi:
+    if: inputs.which != 'npm'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Test and build
+        working-directory: packages/python
+        run: |
+          PYTHONPATH=src python -m unittest discover -s tests
+          python -m pip install build
+          python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/python/dist

@@ -1,2 +1,6 @@
 /target
 /data
+packages/python/dist/
+packages/python/build/
+packages/python/src/*.egg-info/
+__pycache__/

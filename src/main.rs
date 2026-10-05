@@ -794,16 +794,20 @@ fn health_checks(now: i64) -> (Json, Vec<String>) {
             problems.push(format!("memory is at {used:.0} MB of {limit:.0} MB — raise the limit or trim stored data soon"));
         }
     }
-    let (watched, services, pay_behind, pay_error) = {
+    let (watched, services, pay_behind, pay_error, (history_read, _), history_waiting) = {
         let l = payments::lock();
-        (l.sellers.len(), l.services.len(), l.head.saturating_sub(l.cursor), l.last_error.clone())
+        (l.sellers.len(), l.services.len(), l.head.saturating_sub(l.cursor), l.last_error.clone(), l.history_progress(), l.history_waiting())
     };
+    let strong = payments::STRONG_SELLERS.load(Ordering::Relaxed);
     if pay_behind > 1_800 {
         problems.push(format!("the payment scanner is {pay_behind} blocks behind"));
     }
     let checks = Json::obj(vec![
         ("memory_mb", rss_mb.map(|m| Json::num(m.round())).unwrap_or(Json::Null)),
         ("wallets_watched", Json::num(watched as f64)),
+        ("wallets_history_read", Json::num(history_read as f64)),
+        ("wallets_history_waiting", Json::num(history_waiting as f64)),
+        ("sellers_with_strong_record", if strong == usize::MAX { Json::Null } else { Json::num(strong as f64) }),
         ("delivery_reports_waiting", Json::num(payments::report_queue().lock().unwrap_or_else(|e| e.into_inner()).len() as f64)),
         ("services_catalogued", Json::num(services as f64)),
         ("payment_scan_blocks_behind", Json::num(pay_behind as f64)),
@@ -884,19 +888,15 @@ fn leaders_html(now: i64) -> String {
     }
     let mut rows: Vec<(String, String, usize, usize)> = {
         let l = payments::lock();
-        l.sellers
-            .keys()
-            .filter_map(|w| {
-                let e = l.evidence(w);
-                if !e.strong() {
-                    return None;
-                }
+        l.strong_sellers()
+            .into_iter()
+            .map(|(w, e)| {
                 let name = l
-                    .services_of(w)
+                    .services_of(&w)
                     .first()
                     .map(|s| if s.provider.is_empty() { host_of(&s.url) } else { s.provider.clone() })
                     .unwrap_or_default();
-                Some((w.clone(), name, e.established_buyers, e.repeat_buyers))
+                (w, name, e.established_buyers, e.repeat_buyers)
             })
             .collect()
     };
@@ -927,9 +927,18 @@ fn host_of(url: &str) -> String {
 fn public_stats(engine: &Engine, now: i64) -> Json {
     let (keptvow_bots, settled, _) = engine.stats();
     let registry_bots = chain::index().lock().unwrap_or_else(|e| e.into_inner()).agents.len();
+    let (wallets, (history_read, _), services) = {
+        let l = payments::lock();
+        (l.sellers.len(), l.history_progress(), l.services.len())
+    };
+    let strong = payments::STRONG_SELLERS.load(Ordering::Relaxed);
     let m = metrics::lock();
     Json::obj(vec![
         ("bots_rated", Json::num((registry_bots + keptvow_bots) as f64)),
+        ("seller_wallets_watched", Json::num(wallets as f64)),
+        ("seller_wallets_history_read", Json::num(history_read as f64)),
+        ("sellers_with_strong_record", Json::num(if strong == usize::MAX { 0.0 } else { strong as f64 })),
+        ("paid_services_catalogued", Json::num(services as f64)),
         ("registry_bots", Json::num(registry_bots as f64)),
         ("registry_bots_claimed", Json::num(engine.count_verified("erc8004") as f64)),
         ("keptvow_bots", Json::num(keptvow_bots as f64)),
@@ -3201,6 +3210,17 @@ mod tests {
         assert_eq!(route(&e, req("POST", "/v1/outcomes", &[], &tx), PROD).status, 202);
         let w = body_json(&route(&e, req("GET", &format!("/v1/wallets/{honest}"), &[], ""), PROD));
         assert!(w.get("evidence").is_some() && matches!(w.get("services"), Some(Json::Array(_))));
+    }
+
+    #[test]
+    fn the_install_packages_ship_the_same_guard_the_site_serves() {
+        let url = "https://agenttrust-production-381e.up.railway.app";
+        assert!(
+            include_str!("../packages/npm/index.js") == GUARD_JS.replace("{URL}", url),
+            "packages/npm/index.js is out of date — run `node packages/npm/build.mjs`"
+        );
+        assert!(include_str!("../packages/npm/build.mjs").contains(url));
+        assert!(include_str!("../packages/python/src/keptvow/__init__.py").contains(&format!("DEFAULT_URL = \"{url}\"")));
     }
 
     #[test]

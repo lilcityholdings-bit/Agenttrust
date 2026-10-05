@@ -1,0 +1,23 @@
+{
+  "name": "keptvow",
+  "version": "0.1.0",
+  "description": "Check who your AI agent is about to pay before an x402 payment goes out: ok, careful or stop, from real payment history and delivery reports.",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "engines": { "node": ">=18" },
+  "keywords": ["x402", "ai-agents", "payments", "trust", "erc-8004", "base", "usdc", "agent-safety"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/lilcityholdings-bit/Agenttrust.git", "directory": "packages/npm" },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test.mjs"
+  }
+}
