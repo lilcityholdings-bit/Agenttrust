@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 HEAD = 52_300_000
 TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 MAX_WALLETS = 8           # more than this in one query: HTTP 413 (the readers start at 12, so they must learn)
-MAX_SPAN = 2000           # wider than this: JSON-RPC range error
+MAX_SPAN = 500            # wider than this: refused, as Base's public node does (measured)
 MAX_LOGS = 150            # an answer with more logs than this: HTTP 413, like a busy wallet on a public node
 UNTIL = HEAD - 1000       # the reader is told to cover up to here
 FROM = HEAD - 40_000      # ...and from here (the resume point)
@@ -70,7 +70,7 @@ class H(BaseHTTPRequestHandler):
                 burst["left"] -= 1; stats["403"] += 1; return self._send(403, b"forbidden")
             if hi - lo + 1 > MAX_SPAN:
                 stats["range"] += 1
-                return self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "range too large"}}).encode())
+                return self._send(413, b"range too large")
             stats["ok"] += 1; stats["max_wallets_ok"] = max(stats["max_wallets_ok"], len(tops))
         want = set(tops); logs = []
         for b, w, blk, u in transfers:

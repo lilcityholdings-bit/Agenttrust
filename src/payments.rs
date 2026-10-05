@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1106,9 +1106,10 @@ fn scan_live(urls: &[String]) {
     }
 }
 
-/// The most blocks one history query asks for. Base's own public node refuses more than 2,000,
-/// so that is the default; `BASE_LOGS_SPAN` raises it for a paid node that allows more.
-const DEFAULT_LOGS_SPAN: u64 = 2_000;
+/// The most blocks one history query asks for. Measured on Base's public node: 500 blocks
+/// answers (nine in ten), 1,000 and 2,000 never do, whatever the number of wallets. A paid node
+/// allows more: `BASE_LOGS_SPAN` raises it (and it falls back by itself if refused).
+const DEFAULT_LOGS_SPAN: u64 = 500;
 
 fn logs_span_from(setting: Option<&str>) -> u64 {
     setting.and_then(|v| v.trim().parse::<u64>().ok()).map_or(DEFAULT_LOGS_SPAN, |n| n.clamp(100, 50_000))
@@ -1218,7 +1219,7 @@ fn reader_line() -> String {
          {} retried of which {} then worked; last error: {}; nodes: {}",
         avg(&BF_OK_MS, ok),
         avg(&BF_FAILED_MS, failed),
-        BF_SPAN.load(Ordering::Relaxed),
+        SPAN_NOW.load(Ordering::Relaxed),
         BF_BATCHES.load(Ordering::Relaxed),
         BF_STOPPED.load(Ordering::Relaxed),
         chunk_size(),
@@ -1301,6 +1302,10 @@ fn history_readers() -> usize {
 /// naming many wallets (half of the queries naming 200 failed; at 10 about one in ten did).
 const MAX_GROUP: usize = 100;
 const MIN_GROUP: usize = 5;
+/// The blocks per query in use now, shared by every reader. It only ever shrinks (when a node
+/// refuses what it was asked), so no reader keeps probing above what the node allows.
+static SPAN_NOW: AtomicU64 = AtomicU64::new(DEFAULT_LOGS_SPAN);
+
 /// The wallets per query in use now, shared by every reader, and the smallest size a node has
 /// refused (the size is never raised to that again).
 static GROUP: AtomicUsize = AtomicUsize::new(12);
@@ -1394,7 +1399,9 @@ fn fetch_logs(nodes: &mut Nodes, wallets: &[String], from: u64, to: u64, st: &mu
 /// slices afterwards. If the nodes keep refusing, the batch goes back in the queue to resume
 /// where each wallet stopped; a wallet is only marked as read once all its blocks are.
 fn scan_backfill(urls: &[String]) {
-    let _ = BF_STARTED.set(Instant::now());
+    if BF_STARTED.set(Instant::now()).is_ok() {
+        SPAN_NOW.store(max_logs_span(), Ordering::Relaxed);
+    }
     let mut nodes = Nodes { urls: urls.to_vec(), preferred: 0 };
     loop {
         let batch: Vec<(String, u64, u64)> = {
@@ -1453,9 +1460,9 @@ fn scan_backfill(urls: &[String]) {
         let mut clean_windows = 0;
 
         // The main pass: everyone not busy, window by window.
-        let span = max_logs_span();
         let mut from = start;
         'windows: while from <= until {
+            let span = SPAN_NOW.load(Ordering::Relaxed).max(MIN_SLICE);
             let to = until.min(from + span - 1);
             BF_SPAN.store(span as usize, Ordering::Relaxed);
             // Nothing is counted until every wallet in the window has answered, so whatever
@@ -1494,6 +1501,11 @@ fn scan_backfill(urls: &[String]) {
                     hot.push(w.clone());
                 }
             }
+            // If a quarter of the wallets (at least) each needed their blocks split, the window
+            // itself is too wide for this node: every reader asks for half as many from now on.
+            if active.len() >= 8 && st.hot.len() * 4 >= active.len() {
+                SPAN_NOW.store((span / 2).max(MIN_SLICE), Ordering::Relaxed);
+            }
             active.retain(|w| !st.hot.contains(w) && !st.busy.contains(w));
             // Any split means a query was too big for the node: fewer wallets per query from now
             // on. Clean windows bring the number back up, a quarter at a time.
@@ -1509,6 +1521,12 @@ fn scan_backfill(urls: &[String]) {
                     let next = (cur + (cur / 4).max(1)).min(MAX_GROUP).min(ceiling);
                     if next > cur {
                         GROUP.store(next, Ordering::Relaxed);
+                    } else if ceiling < MAX_GROUP {
+                        // Held back only by one refusal long ago: allow a slightly bigger try.
+                        let bad = BAD_GROUP.load(Ordering::Relaxed);
+                        if bad != usize::MAX {
+                            BAD_GROUP.store(bad + bad / 4 + 1, Ordering::Relaxed);
+                        }
                     }
                     clean_windows = 0;
                 }
@@ -1551,7 +1569,7 @@ fn scan_backfill(urls: &[String]) {
                             span_w = if st.splits > 0 {
                                 (span_w / 2).max(MIN_SLICE)
                             } else if logs.len() < 500 {
-                                (span_w * 2).min(span)
+                                (span_w * 2).min(SPAN_NOW.load(Ordering::Relaxed))
                             } else {
                                 span_w
                             };
@@ -2029,10 +2047,10 @@ pub(crate) mod tests {
 
     #[test]
     fn history_queries_ask_for_what_nodes_allow_and_wait_when_refused() {
-        // Base's own public node refuses more than 2,000 blocks, so that is the default.
-        assert_eq!(logs_span_from(None), 2_000);
+        // Measured: Base's public node answers 500 blocks and refuses 1,000, so that is the default.
+        assert_eq!(logs_span_from(None), 500);
         assert_eq!(logs_span_from(Some("10000")), 10_000);
-        assert_eq!(logs_span_from(Some("nonsense")), 2_000);
+        assert_eq!(logs_span_from(Some("nonsense")), 500);
         assert_eq!((logs_span_from(Some("5")), logs_span_from(Some("999999"))), (100, 50_000));
         // A blocked or rate-limited node is waited for; a complaint about the query shrinks it.
         let blocked = "eth_getLogs failed: https://base-rpc.publicnode.com/: status code 403";
