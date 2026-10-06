@@ -539,6 +539,7 @@ pub fn wallet_page(j: &Json, base: &str) -> String {
                 "down" => ("bad", "not answering".to_string()),
                 "mismatch" => ("bad", "asks to be paid at a different wallet".to_string()),
                 "unclear" => ("muted", "answered without asking for payment".to_string()),
+                "optout" => ("muted", "the owner asked not to be checked".to_string()),
                 other => ("muted", other.to_string()),
             };
             let desc = st(sv.get("description"));
@@ -637,6 +638,42 @@ pub fn leaders_section(rows: &[(String, String, usize, usize)]) -> String {
     format!(
         r#"<section class="block"><h2>Most trusted sellers right now</h2><p class="lead">Paid by the most established buyers — who keep coming back.</p><div class="leaders">{list}</div></section>"#
     )
+}
+
+/// `/bot` — what KeptvowBot is, for the people who find it in their server logs. Says only what
+/// the checker really does (see `probe_services` in payments.rs).
+pub fn bot_info_page(base: &str) -> String {
+    let body = r#"<h1>KeptvowBot</h1>
+<p class="sub">The visitor in your logs that calls itself <span class="mono">KeptvowBot/1.0</span>.</p>
+<section>
+<h2>What it is</h2>
+<p>Keptvow tells AI agents whether a seller is safe to pay before they send money. KeptvowBot is the part that checks, once a day, that a paid service listed in the public x402 service catalog is really there and really asks to be paid at the wallet it lists.</p>
+</section>
+<section>
+<h2>What it does</h2>
+<ul class="reasons">
+<li>Visits each listed service about <b>once a day</b>, with one ordinary request (a GET, or a POST with an empty <span class="mono">{}</span> body for services listed as POST).</li>
+<li>Looks only at whether you answer, and whether the payment request in the answer names the wallet you listed. It reads at most the first 256 KB of the answer and keeps none of it, only the result: <i>answering</i>, <i>not answering</i>, or <i>asks to be paid at a different wallet</i>.</li>
+<li>Reads your <span class="mono">/robots.txt</span> first, at most once a day per site.</li>
+<li>Shows the result on the public page for your wallet, so buyers can see it and you can see what they see.</li>
+</ul>
+</section>
+<section>
+<h2>What it never does</h2>
+<ul class="reasons">
+<li>It never pays, never signs in, and never sends your customers' data anywhere.</li>
+<li>It never follows more than two redirects, and never visits private or internal addresses.</li>
+</ul>
+</section>
+<section>
+<h2>Don't want visits?</h2>
+<p>Add this to your site's <span class="mono">robots.txt</span>:</p>
+<div class="code">User-agent: KeptvowBot
+Disallow: /</div>
+<p class="muted">You can also list only the paths to keep it away from. It takes effect on the next visit (within a day). A service that opts out is shown as "the owner asked not to be checked", which is neutral: it can't earn a good record from checks, and it isn't marked down either.</p>
+<p class="muted">Look up your wallet: <a href="/">paste it into the search box</a>. See how checks work: <a href="/docs">docs</a>.</p>
+</section>"#;
+    page("KeptvowBot — what it is and how to opt out | Keptvow", "KeptvowBot checks once a day that paid x402 services answer and ask to be paid at their listed wallet. It never pays or signs in, and obeys robots.txt.", &format!("{base}/bot"), body)
 }
 
 /// Bot pages per sitemap file (the format allows 50,000).

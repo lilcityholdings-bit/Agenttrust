@@ -32,7 +32,7 @@ from typing import Any, Callable, Iterable, Optional
 __all__ = ["check", "guard", "report_outcome", "payment_options", "KeptvowStop", "DEFAULT_URL"]
 __version__ = "0.1.0"
 
-DEFAULT_URL = "https://agenttrust-production-381e.up.railway.app"
+DEFAULT_URL = "https://keptvow.com"
 
 # USDC (6 decimals) on Base, Base Sepolia and Ethereum, so prices can be judged in dollars.
 _USDC = {

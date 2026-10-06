@@ -1,6 +1,6 @@
 // Keptvow guard — checks who you are about to pay before an x402 payment goes out.
 //
-//   npm install keptvow          (or save this file from https://agenttrust-production-381e.up.railway.app/guard.js)
+//   npm install keptvow          (or save this file from https://keptvow.com/guard.js)
 //
 //   import { withKeptvow } from "keptvow";
 //   import { wrapFetchWithPayment } from "x402-fetch";
@@ -9,7 +9,7 @@
 //   await pay("https://seller.example/api");   // throws KeptvowStop instead of paying a bad actor
 //
 // When a seller answers 402 Payment Required, every wallet it asks to be paid at is checked at
-// https://agenttrust-production-381e.up.railway.app/v1/check. A wallet with a bad record stops the payment before any money moves.
+// https://keptvow.com/v1/check. A wallet with a bad record stops the payment before any money moves.
 //
 // After a paid request it also tells Keptvow, in the background, whether the result arrived —
 // quoting the payment's transaction from the PAYMENT-RESPONSE header, so only real buyers are
@@ -27,7 +27,7 @@
 //          { reportOutcomes: true } false turns off the delivery reports
 //          { apiKey, baseUrl }
 
-const KEPTVOW = "https://agenttrust-production-381e.up.railway.app";
+const KEPTVOW = "https://keptvow.com";
 
 // USDC (6 decimals) on Base, Base Sepolia and Ethereum, so amounts can be judged in dollars.
 const USDC = new Set([

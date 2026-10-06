@@ -349,6 +349,7 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
             | ("GET", [".well-known", ..])
             | ("GET", ["stats"])
             | ("GET", ["go"])
+            | ("GET", ["bot"])
             | ("GET", ["v1", "pricing"])
             | ("GET", ["billing", "done"])
             | ("POST", ["mcp"])
@@ -1227,6 +1228,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             return Response { status: 200, content_type: "application/xml; charset=utf-8", body: botpages::sitemap_wallets(&wallets, &base_url(&req)) };
         }
         ("GET", ["go"]) => return go_to(req.q("q").unwrap_or("")),
+        ("GET", ["bot"]) => return Response::html(botpages::bot_info_page(&base_url(&req))),
         ("GET", ["sitemaps", file]) => {
             let Some(n) = file.strip_suffix(".xml").and_then(|n| n.parse::<usize>().ok()) else { return err(404, "no such sitemap") };
             let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
@@ -3218,7 +3220,7 @@ mod tests {
 
     #[test]
     fn the_install_packages_ship_the_same_guard_the_site_serves() {
-        let url = "https://agenttrust-production-381e.up.railway.app";
+        let url = "https://keptvow.com";
         assert!(
             include_str!("../packages/npm/index.js") == GUARD_JS.replace("{URL}", url),
             "packages/npm/index.js is out of date — run `node packages/npm/build.mjs`"
@@ -3259,6 +3261,9 @@ mod tests {
         assert!(go("erc8004:8453:42").contains("/bots/base/42") && go("#7").contains("/bots/base/7"));
         assert!(go("weather <bots>").contains("/bots?q=weather%20%3Cbots%3E"));
         assert!(route(&e, req("GET", "/sitemap.xml", &[], ""), PROD).body.contains("/sitemaps/wallets.xml"));
+        // The page the service checker's name links to exists, and says how to opt out.
+        let bot = route(&e, req("GET", "/bot", &html, ""), PROD);
+        assert!(bot.status == 200 && bot.body.contains("User-agent: KeptvowBot") && bot.body.contains("robots.txt"));
         // The leaders board names sellers safely and stays hidden when empty.
         assert_eq!(botpages::leaders_section(&[]), "");
         let board = botpages::leaders_section(&[(seller.clone(), "<b>Evil</b>".into(), 40, 12)]);

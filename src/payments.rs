@@ -66,7 +66,8 @@ pub struct Payer {
 pub struct Probe {
     pub at_ms: i64,
     /// "ok" (asked for payment at the listed wallet), "mismatch" (asked to be paid elsewhere),
-    /// "down" (no answer or a server error), "unclear" (answered, but not with a payment request).
+    /// "down" (no answer or a server error), "unclear" (answered, but not with a payment request),
+    /// "optout" (its robots.txt asks bots like this one to stay away, so it was not visited).
     pub result: String,
     pub status: u16,
     pub latency_ms: u32,
@@ -1687,6 +1688,108 @@ fn read_catalog(urls: &[String]) {
 }
 
 /// Visits each catalogued service about once a day, without paying.
+/// What each site's robots.txt says about KeptvowBot: the (allow, path) rules that apply to it,
+/// kept for a day per site.
+static ROBOTS: Mutex<BTreeMap<String, (i64, Vec<(bool, String)>)>> = Mutex::new(BTreeMap::new());
+
+/// The rules in `robots` that apply to KeptvowBot: those of the group naming it if there is one,
+/// otherwise those of the `*` group.
+fn robots_rules(robots: &str) -> Vec<(bool, String)> {
+    let (mut named, mut star): (Vec<(bool, String)>, Vec<(bool, String)>) = (Vec::new(), Vec::new());
+    let (mut named_seen, mut agents, mut in_rules) = (false, Vec::<String>::new(), false);
+    for line in robots.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some((key, value)) = line.split_once(':') else { continue };
+        let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
+        match key.as_str() {
+            "user-agent" => {
+                if in_rules {
+                    agents.clear();
+                    in_rules = false;
+                }
+                agents.push(value.to_ascii_lowercase());
+                named_seen |= value.eq_ignore_ascii_case("keptvowbot");
+            }
+            "allow" | "disallow" => {
+                in_rules = true;
+                let rule = (key == "allow", value.to_string());
+                if agents.iter().any(|a| a == "keptvowbot") {
+                    named.push(rule.clone());
+                }
+                if agents.iter().any(|a| a == "*") {
+                    star.push(rule);
+                }
+            }
+            _ => {}
+        }
+    }
+    if named_seen {
+        named
+    } else {
+        star
+    }
+}
+
+/// Whether `pattern` (a robots.txt path rule: `*` matches anything, a trailing `$` anchors the
+/// end) matches the start of `path`.
+fn robots_match(pattern: &str, path: &str) -> bool {
+    let (pattern, anchored) = pattern.strip_suffix('$').map_or((pattern, false), |p| (p, true));
+    fn go(p: &[u8], t: &[u8], anchored: bool) -> bool {
+        match p.split_first() {
+            None => !anchored || t.is_empty(),
+            Some((b'*', rest)) => (0..=t.len()).any(|i| go(rest, &t[i..], anchored)),
+            Some((c, rest)) => t.first() == Some(c) && go(rest, &t[1..], anchored),
+        }
+    }
+    go(pattern.as_bytes(), path.as_bytes(), anchored)
+}
+
+/// Whether the rules let KeptvowBot fetch `path`: the longest matching rule wins, and allow wins a
+/// tie. An empty `Disallow` allows everything.
+fn robots_allow(rules: &[(bool, String)], path: &str) -> bool {
+    let mut best: Option<(usize, bool)> = None;
+    for (allow, pattern) in rules {
+        if pattern.is_empty() || !robots_match(pattern, path) {
+            continue;
+        }
+        if best.map_or(true, |(len, a)| pattern.len() > len || (pattern.len() == len && *allow && !a)) {
+            best = Some((pattern.len(), *allow));
+        }
+    }
+    best.map_or(true, |(_, allow)| allow)
+}
+
+/// Whether the site that hosts `url` lets KeptvowBot visit it. A site with no robots.txt, or one
+/// that can't be read, allows it. Each site's file is read at most once a day.
+fn robots_ok(agent: &ureq::Agent, url: &str, now: i64) -> bool {
+    let Some(rest) = url.split_once("://") else { return true };
+    let (origin, path) = match rest.1.find('/') {
+        Some(i) => (format!("{}://{}", rest.0, &rest.1[..i]), rest.1[i..].to_string()),
+        None => (format!("{}://{}", rest.0, rest.1), "/".to_string()),
+    };
+    let cached = ROBOTS.lock().unwrap_or_else(|e| e.into_inner()).get(&origin).filter(|(at, _)| now - at < 24 * 3_600_000).cloned();
+    let rules = match cached {
+        Some((_, rules)) => rules,
+        None => {
+            let rules = match agent.get(&format!("{origin}/robots.txt")).call() {
+                Ok(r) if r.status() == 200 => {
+                    let mut text = String::new();
+                    let _ = r.into_reader().take(128 * 1024).read_to_string(&mut text);
+                    robots_rules(&text)
+                }
+                _ => Vec::new(),
+            };
+            let mut m = ROBOTS.lock().unwrap_or_else(|e| e.into_inner());
+            if m.len() > 20_000 {
+                m.clear();
+            }
+            m.insert(origin, (now, rules.clone()));
+            rules
+        }
+    };
+    robots_allow(&rules, &path)
+}
+
 fn probe_services() {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
@@ -1700,6 +1803,12 @@ fn probe_services() {
             std::thread::sleep(Duration::from_secs(60));
             continue;
         };
+        // A site that asks bots like this one to stay away is left alone.
+        if !robots_ok(&agent, &url, now_ms()) {
+            lock().record_probe(&url, "optout", 0, 0, now_ms());
+            std::thread::sleep(Duration::from_millis(300));
+            continue;
+        }
         let started = Instant::now();
         let req = if method == "POST" { agent.post(&url).set("Content-Type", "application/json") } else { agent.get(&url) };
         let res = if method == "POST" { req.send_string("{}") } else { req.call() };
@@ -2118,5 +2227,29 @@ pub(crate) mod tests {
         let back = Ledger::read_lines(std::io::Cursor::new(buf)).unwrap();
         assert!(back.evidence(&addr(0x71)).history_incomplete, "the flag survives a restart");
         assert!(!back.evidence(&addr(0x72)).history_incomplete);
+    }
+
+    #[test]
+    fn robots_txt_is_read_the_way_crawlers_read_it() {
+        let allowed = |robots: &str, path: &str| robots_allow(&robots_rules(robots), path);
+        // Nothing said, or only an empty Disallow: everything is allowed.
+        assert!(allowed("", "/x") && allowed("User-agent: *\nDisallow:\n", "/x"));
+        // The * group applies when none names us; a group naming us replaces it.
+        assert!(!allowed("User-agent: *\nDisallow: /\n", "/api"));
+        assert!(allowed("User-agent: *\nDisallow: /\n\nUser-agent: KeptvowBot\nDisallow:\n", "/api"));
+        assert!(!allowed("User-agent: *\nAllow: /\n\nUser-agent: keptvowbot\nDisallow: /\n", "/api"));
+        // Several agents sharing one group; comments and case are ignored.
+        assert!(!allowed("# hi\nUser-agent: GoogleBot\nUser-agent: KeptvowBot # us\nDISALLOW: /private\n", "/private/a"));
+        assert!(allowed("User-agent: GoogleBot\nUser-agent: KeptvowBot\nDisallow: /private\n", "/public"));
+        // The longest matching rule wins; allow wins a tie.
+        let rules = "User-agent: *\nDisallow: /api\nAllow: /api/free\n";
+        assert!(!allowed(rules, "/api/paid") && allowed(rules, "/api/free/x"));
+        assert!(allowed("User-agent: *\nDisallow: /a\nAllow: /a\n", "/a"));
+        // Wildcards and the end anchor.
+        assert!(!allowed("User-agent: *\nDisallow: /*.json$\n", "/data.json"));
+        assert!(allowed("User-agent: *\nDisallow: /*.json$\n", "/data.json?x=1"));
+        assert!(!allowed("User-agent: *\nDisallow: /v1/*/pay\n", "/v1/abc/pay"));
+        // A rule for another bot says nothing about us.
+        assert!(allowed("User-agent: BadBot\nDisallow: /\n", "/api"));
     }
 }
