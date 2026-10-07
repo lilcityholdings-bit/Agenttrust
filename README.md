@@ -283,6 +283,7 @@ POST /v1/agreements/{id}/payout         {"reference":"0x..."} — confirm you mo
 
 # operator only — admin secret as X-Admin-Secret header (or "admin_secret" in the body):
 GET  /admin                             the admin page
+GET  /v1/admin/backup                   a full copy of the saved state, for off-site backups
 POST /v1/customers                      {"name":"Bot Arena"} -> returns the new API key, once
 GET  /v1/customers                      every customer and their usage
 POST /v1/customers/{id}/revoke
@@ -357,6 +358,17 @@ replaying it — every mutation updates in-memory state directly and appends to 
 effect. A real event-sourced replay would mean maintaining that logic twice; a snapshot after
 every write is the honest version of "a restart doesn't lose history" this implementation
 actually backs up.
+
+**Off-site copy.** `GET /v1/admin/backup` (admin secret required) returns the whole snapshot. The
+`Off-site backup` GitHub Action downloads it daily, encrypts it, and keeps it for 30 days once the
+`ADMIN_SECRET` and `BACKUP_PASSPHRASE` repository secrets are set; the workflow file says how to
+decrypt and restore. The repo is public, so the copy is never stored unencrypted.
+
+**Uptime.** The `Uptime check` GitHub Action calls `/health` every 15 minutes; when it fails,
+GitHub emails the repo owner.
+
+**Terms and Privacy** are at `/terms` and `/privacy`: plain-language drafts, not reviewed by a
+lawyer. They list the `CONTACT` address.
 
 **Where the file lives matters.** On a host with an ephemeral filesystem (Railway's default),
 every new deploy starts on a clean disk. Mount a persistent volume and point `STATE_FILE` at it —

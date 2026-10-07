@@ -1,0 +1,23 @@
+# Checks the live service every 15 minutes. If /health doesn't answer, this run fails and
+# GitHub emails the repo owner. Scheduled runs only start once this file is on the main branch.
+name: Uptime check
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check /health
+        env:
+          URL: ${{ vars.KEPTVOW_URL || 'https://keptvow.com' }}
+        run: |
+          curl -fsS --max-time 20 --retry 3 --retry-delay 20 --retry-all-errors "$URL/health" > /dev/null
+          echo "up: $URL"

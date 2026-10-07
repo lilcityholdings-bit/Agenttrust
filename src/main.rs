@@ -54,6 +54,8 @@ const TRUST_PAGE: &str = include_str!("trust.html");
 /// The home page people see at `/`, and the 3-step developer quickstart at `/docs`.
 const HOME_PAGE: &str = include_str!("home.html");
 const DOCS_PAGE: &str = include_str!("docs.html");
+const TERMS_PAGE: &str = include_str!("terms.html");
+const PRIVACY_PAGE: &str = include_str!("privacy.html");
 
 /// The guide for AI agents, served at `/llms.txt` and `/skill.md`: everything a bot needs to
 /// use the service, in the form models read best.
@@ -341,6 +343,8 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
         (method, segments),
         ("GET", [])
             | ("GET", ["docs"])
+            | ("GET", ["terms"])
+            | ("GET", ["privacy"])
             | ("GET", ["health"])
             | ("GET", ["health", "deep"])
             | ("GET", ["admin"])
@@ -628,6 +632,32 @@ fn registry_profile(engine: &Engine, agent_ref: &str, now: i64) -> Option<Json> 
 }
 
 /// Any bot's profile: a Keptvow id, or `erc8004:8453:<n>` for a bot in the on-chain registry.
+/// The Terms and Privacy pages, with the operator's contact filled in.
+fn legal_page(template: &str) -> String {
+    let contact = contact().unwrap_or_else(|| "the contact address on the home page".to_string());
+    template.replace("{{contact}}", &html_escape(&contact))
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// A bot checking a stranger with no record gets a ready-made invitation to pass on, so every
+/// lookup of an unregistered bot is a chance for it to join.
+fn with_invite(profile: Json, base: &str) -> Json {
+    let Json::Object(mut map) = profile else { return profile };
+    if map.get("known") == Some(&Json::Bool(false)) {
+        map.insert(
+            "invite".to_string(),
+            Json::str(format!(
+                "This bot has no record here yet. Ask it to register free in one call: \
+                 POST {base}/v1/register {{\"name\":\"its-name\"}}. Guide: {base}/llms.txt"
+            )),
+        );
+    }
+    Json::Object(map)
+}
+
 fn any_profile(engine: &Engine, agent_id: &str, now: i64) -> Json {
     if agent_id.get(..8).map_or(false, |p| p.eq_ignore_ascii_case("erc8004:")) {
         return registry_profile(engine, agent_id, now).unwrap_or_else(|| {
@@ -1163,7 +1193,7 @@ fn badge_svg(score: i64, level: &str, verified: bool) -> String {
 
 /// Operator-only endpoints, gated by the admin secret rather than a customer key.
 fn is_admin_route(segments: &[&str]) -> bool {
-    matches!(segments, ["v1", "customers", ..] | ["v1", "sources"])
+    matches!(segments, ["v1", "customers", ..] | ["v1", "sources"] | ["v1", "admin", ..])
 }
 
 fn body_of(req: &Request) -> Result<Json, Response> {
@@ -1366,6 +1396,16 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
     match (req.method.as_str(), segments.as_slice()) {
         ("GET", ["admin"]) => Response::html(ADMIN_PAGE.to_string()),
         ("GET", ["docs"]) => Response::html(DOCS_PAGE.to_string()),
+        ("GET", ["terms"]) => Response::html(legal_page(TERMS_PAGE)),
+        ("GET", ["privacy"]) => Response::html(legal_page(PRIVACY_PAGE)),
+        // A full copy of the saved state, for keeping an off-site backup. It holds hashed
+        // secrets and every customer record, so it is admin-only like the rest of /v1/admin.
+        ("GET", ["v1", "admin", "backup"]) => {
+            if let Err(e) = engine.check_admin(admin_secret_of(&req, &body)) {
+                return err(401, e);
+            }
+            ok(engine.to_snapshot())
+        }
         // A browser gets the home page; a bot or script asking for JSON gets the status below.
         ("GET", []) if req.header("accept").map(|a| a.contains("text/html")).unwrap_or(false) => {
             let (agents, _, _) = engine.stats();
@@ -1800,7 +1840,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
 
         ("GET", ["v1", "trust", agent_id]) => {
             let base = base_url(&req);
-            shaped(&req, any_profile(&engine, agent_id, now), |p| formats::profile_markdown(p, &base), formats::profile_text)
+            shaped(&req, with_invite(any_profile(&engine, agent_id, now), &base), |p| formats::profile_markdown(p, &base), formats::profile_text)
         }
 
         ("GET", ["v1", "trust", agent_id, "badge.svg"]) => {
@@ -3794,6 +3834,38 @@ mod tests {
         let r = route(&e, req("POST", &format!("/v1/agreements/{id}/report"), &h, far), PROD);
         let result = json::parse(&r.body).unwrap();
         assert_eq!(result.get("result").unwrap().as_str(), Some("waiting"), "bob still gets his window: {}", r.body);
+    }
+
+    #[test]
+    fn the_admin_backup_download_needs_the_admin_secret() {
+        let e = engine();
+        assert_eq!(route(&e, req("GET", "/v1/admin/backup", &[], ""), PROD).status, 401);
+        let r = route(&e, req("GET", "/v1/admin/backup", &[("X-Admin-Secret", "adm")], ""), PROD);
+        assert_eq!(r.status, 200);
+        assert!(Engine::from_snapshot(&body_json(&r)).is_ok(), "the download is a loadable snapshot");
+    }
+
+    #[test]
+    fn terms_and_privacy_pages_are_served_with_the_contact_filled_in() {
+        let e = engine();
+        for path in ["/terms", "/privacy"] {
+            let r = route(&e, req("GET", path, &[], ""), PROD);
+            assert_eq!(r.status, 200, "{path}");
+            assert!(r.content_type.starts_with("text/html"));
+            assert!(!r.body.contains("{{contact}}"), "{path} left a placeholder");
+        }
+    }
+
+    #[test]
+    fn looking_up_an_unregistered_bot_returns_an_invitation() {
+        let e = engine();
+        let h = [("Host", "trust.example.com"), ("Accept", "application/json")];
+        let r = route(&e, req("GET", "/v1/trust/stranger-bot", &h, ""), PROD);
+        let invite = body_json(&r).get("invite").and_then(|v| v.as_str()).map(|s| s.to_string()).expect("invite");
+        assert!(invite.contains("https://trust.example.com/v1/register"), "{invite}");
+        route(&e, req("POST", "/v1/register", &[], r#"{"name":"known-bot"}"#), PROD);
+        let r = route(&e, req("GET", "/v1/trust/known-bot", &[("Accept", "application/json")], ""), PROD);
+        assert!(body_json(&r).get("invite").is_none(), "a registered bot needs no invitation");
     }
 }
 

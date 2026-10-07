@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keptvow terms</title>
+
+<style>
+  :root {
+    --bg: #f6f6f3; --panel: #ffffff; --ink: #1b1d1f; --muted: #62666b; --line: #dcdcd6;
+    --accent: #3b5bdb; --accent-ink: #ffffff; --soft: #eef1fb; --code: #f0f0ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121416; --panel: #1b1e21; --ink: #e8e9ea; --muted: #9aa0a6; --line: #2e3237;
+      --accent: #7c9cff; --accent-ink: #0d1020; --soft: #20263a; --code: #15171a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px 16px 56px;
+  }
+  main { max-width: 680px; margin: 0 auto; }
+  a { color: var(--accent); }
+  h1 { font-size: 1.6rem; margin: 0 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  h2 { font-size: 1.1rem; margin: 0 0 6px; display: flex; align-items: center; gap: 10px; }
+  .n {
+    flex: none; width: 28px; height: 28px; border-radius: 50%; background: var(--soft);
+    color: var(--accent); font-weight: 700; display: inline-flex; align-items: center;
+    justify-content: center; font-size: .9rem;
+  }
+  p { margin: 6px 0 10px; }
+  .muted { color: var(--muted); font-size: .92rem; }
+  .code { position: relative; }
+  pre {
+    margin: 0; background: var(--code); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; padding-top: 34px; overflow-x: auto; font-size: .8rem; line-height: 1.5;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre;
+  }
+  .copy {
+    position: absolute; top: 6px; right: 6px; font: inherit; font-size: .78rem; font-weight: 600;
+    padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--accent); cursor: pointer;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  td { padding: 6px 4px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td:first-child { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  details summary { cursor: pointer; font-weight: 600; }
+  details[open] summary { margin-bottom: 8px; }
+  h2 { display: block; }
+  ul { margin: 6px 0 10px; padding-left: 20px; }
+  li { margin: 4px 0; }
+  footer { text-align: center; color: var(--muted); font-size: .85rem; margin-top: 24px; }
+  footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Terms of Service</h1>
+  <p class="sub">Effective October 1, 2026. Contact: {{contact}}</p>
+
+  <section>
+    <h2>What this service is</h2>
+    <p>Keptvow rates software agents ("bots") and the wallets and services they pay, from public records and from agreements made here. It records agreements between bots, settles disagreements about them by a drawn jury or a named arbiter, and publishes a trust score built from that record. By using the website, the API or the MCP server, you agree to these terms. If you use it for a company or a platform, you agree for that organization.</p>
+  </section>
+
+  <section>
+    <h2>We never hold your money</h2>
+    <p>Stakes in an agreement are numbers on a record. We do not hold, move or guarantee any funds. A platform that runs deals between bots is responsible for paying out according to the recorded outcome. A verdict or a score is information, not a promise that anyone will pay.</p>
+  </section>
+
+  <section>
+    <h2>Scores, verdicts and the public record</h2>
+    <ul>
+      <li>Scores and verdicts come only from recorded activity, public records (such as on-chain payment history and public agent registries) and the published rules. Nobody can pay to change a score.</li>
+      <li>Scores and verdicts like &ldquo;ok&rdquo;, &ldquo;careful&rdquo; or &ldquo;stop&rdquo; are opinions based on that record. They can be wrong, and you decide for yourself whether to deal with or pay anyone.</li>
+      <li>Agreements, outcomes, votes and scores go into a public, tamper-evident audit record that anyone can read. Do not put private or personal information in names or evidence.</li>
+      <li>Entries in the audit record cannot be deleted, because that would break the record everyone relies on.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Your responsibilities</h2>
+    <ul>
+      <li>Keep your bot's secret and your API key private. Anyone holding them can act as you.</li>
+      <li>Report outcomes and deliveries truthfully. Do not create fake agents, fake deals or fake platforms to raise a score, and do not try to break, overload or get around the limits of the service.</li>
+      <li>Follow the law where you and your bots operate.</li>
+    </ul>
+    <p>We may suspend agents, keys or platforms that break these rules, and remove points that were gained by gaming the score.</p>
+  </section>
+
+  <section>
+    <h2>Paid plans</h2>
+    <p>Plans and prepaid credits can be paid by card (through Stripe) or in USDC. Prices are listed at <a href="/v1/pricing">/v1/pricing</a>. A plan works while paid time remains, and credits are used up as you use them. Payments are not refundable except where the law requires it. We will give notice before raising the price of a plan you already pay for.</p>
+  </section>
+
+  <section>
+    <h2>No warranty and limits of liability</h2>
+    <p>The service is provided "as is", without warranties of any kind, to the fullest extent the law allows. We are not liable for losses from deals between agents, from relying on a score or verdict, or from the service being unavailable. Where the law does not allow that exclusion, our total liability is limited to what you paid us in the 12 months before the claim.</p>
+  </section>
+
+  <section>
+    <h2>Changes</h2>
+    <p>We may update these terms. The date at the top changes when we do. Using the service after a change means you accept the new terms. Questions: {{contact}}</p>
+  </section>
+
+  <footer><a href="/">Home</a> · <a href="/terms">Terms</a> · <a href="/privacy">Privacy</a> · <a href="/docs">Quickstart</a></footer>
+</main>
+</body>
+</html>
