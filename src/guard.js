@@ -25,7 +25,13 @@
 //          { failOpen: true }      false blocks when Keptvow can't be reached
 //          { onCheck: fn }         called with each check result, e.g. for logging
 //          { reportOutcomes: true } false turns off the delivery reports
+//          { cache: true }         false asks Keptvow every time
 //          { apiKey, baseUrl }
+//
+// Every answer is signed by Keptvow (result.signed, checkable at {URL}/.well-known/keptvow-signer.json)
+// and says how long it stays fresh, so a bot paying the same seller again within five minutes
+// reuses the answer instead of asking again. With a key, the same seller is billed at most once
+// a day, and the delivery reports sent with that key make its checks free.
 
 const KEPTVOW = "{URL}";
 
@@ -57,17 +63,29 @@ function paymentOptions(res, body) {
   return [];
 }
 
+// Answers still fresh, by base, wallet and amount: reused until their signed "Valid until".
+const fresh = new Map();
+const CACHE_MAX = 1000;
+
 /**
  * Asks Keptvow about one wallet before paying it. Resolves to
- * { verdict: "ok" | "careful" | "stop", advice, evidence, matches, wallet_page }.
+ * { verdict: "ok" | "careful" | "stop", advice, evidence, matches, wallet_page, signed }.
  */
-export async function check(payTo, { amountUsd, apiKey, baseUrl, fetch: fetchImpl = globalThis.fetch } = {}) {
+export async function check(payTo, { amountUsd, apiKey, baseUrl, cache = true, fetch: fetchImpl = globalThis.fetch } = {}) {
   const base = (baseUrl || KEPTVOW).replace(/\/$/, "");
+  const key = `${base} ${String(payTo).trim().toLowerCase()} ${amountUsd ?? ""}`;
+  const hit = cache && fresh.get(key);
+  if (hit && hit.until > Date.now()) return hit.result;
   const q = new URLSearchParams({ pay_to: payTo });
   if (amountUsd != null) q.set("amount_usd", String(amountUsd));
   const r = await fetchImpl.call(globalThis, `${base}/v1/check?${q}`, { headers: apiKey ? { "X-Api-Key": apiKey } : {} });
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || `Keptvow answered ${r.status}`);
+  const until = j.signed && Number(j.signed.valid_until_ms);
+  if (cache && until > Date.now()) {
+    if (fresh.size >= CACHE_MAX) fresh.delete(fresh.keys().next().value);
+    fresh.set(key, { until, result: j });
+  }
   return j;
 }
 
@@ -102,7 +120,7 @@ export function withKeptvow(fetchImpl = globalThis.fetch, options = {}) {
       .then(() =>
         call(`${base}/v1/outcomes`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: options.apiKey ? { "Content-Type": "application/json", "X-Api-Key": options.apiKey } : { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         }),
       )
@@ -125,7 +143,7 @@ export function withKeptvow(fetchImpl = globalThis.fetch, options = {}) {
       const amountUsd = units != null && USDC.has(String(option.asset || "").toLowerCase()) ? Number(units) / 1e6 : undefined;
       let result;
       try {
-        result = await check(option.payTo, { amountUsd, apiKey: options.apiKey, baseUrl: base, fetch: call });
+        result = await check(option.payTo, { amountUsd, apiKey: options.apiKey, baseUrl: base, cache: options.cache !== false, fetch: call });
       } catch (e) {
         if (failOpen) continue;
         throw e;

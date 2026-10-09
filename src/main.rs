@@ -18,6 +18,7 @@ mod attest;
 mod autopay;
 mod botpages;
 mod chain;
+mod fair;
 mod formats;
 mod billing;
 mod hash;
@@ -27,6 +28,8 @@ mod metrics;
 mod jury;
 mod mcp;
 mod payments;
+mod replies;
+mod signer;
 mod store;
 mod trust;
 mod verify;
@@ -183,6 +186,8 @@ fn saver(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
             payments::save_now();
             watch::save_if_dirty();
             metrics::save_if_dirty();
+            fair::save_if_dirty(now_ms());
+            replies::save_if_dirty();
             println!("agenttrust: stop signal — everything saved, exiting");
             std::process::exit(0);
         }
@@ -366,6 +371,24 @@ fn is_lookup(method: &str, segments: &[&str]) -> bool {
             | ("GET", ["v1", "check"])
             | ("GET", ["v1", "wallets", _])
     )
+}
+
+/// What a metered read is about, so a key pays for each seller or bot at most once a day (see
+/// fair.rs). A wallet is the same seller whichever address form or endpoint names it.
+fn lookup_target(req: &Request, segments: &[&str]) -> Option<String> {
+    if !is_lookup(&req.method, segments) {
+        return None;
+    }
+    Some(match segments {
+        ["v1", "check"] => wallet_target(req.q("pay_to").unwrap_or("")),
+        ["v1", "wallets", w] => wallet_target(w),
+        ["v1", "bots"] => format!("bots?{}&{}&{}", req.q("q").unwrap_or("").trim().to_lowercase(), req.q("sort").unwrap_or(""), req.q("offset").unwrap_or("0")),
+        _ => segments.join("/").to_lowercase(),
+    })
+}
+
+fn wallet_target(w: &str) -> String {
+    w.trim().to_ascii_lowercase()
 }
 
 /// Endpoints that act for a platform, so they need its key.
@@ -738,6 +761,7 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
         ("evidence", evidence.to_json()),
         ("matches", Json::Array(matches)),
         ("wallet_page", Json::str(format!("/wallets/{wallet}"))),
+        ("signed", signer::verdict(&wallet, verdict, amount_usd, now)),
     ]))
 }
 
@@ -848,8 +872,60 @@ fn wallet_json(engine: &Engine, wallet: &str, now: i64) -> Result<Json, String> 
         .collect();
     if let Json::Object(m) = &mut j {
         m.insert("services".into(), Json::Array(services));
+        let reply = replies::lock().get(&wallet.trim().to_ascii_lowercase()).map(|r| r.to_json()).unwrap_or(Json::Null);
+        m.insert("seller_reply".into(), reply);
     }
     Ok(j)
+}
+
+/// A seller answering its wallet page, signed with that wallet. Sent without a signature, the
+/// answer is the exact text to sign.
+fn post_reply(req: &Request, wallet: &str, body: &Json, now: i64) -> Response {
+    let Ok(wallet) = verify::normalize("eth", wallet) else { return err(400, "that isn't a wallet address") };
+    if !rate_ok("reply", req.client_ip(), 30, now) {
+        return err(429, "too many replies from this address this hour");
+    }
+    let text = match replies::clean(body.get("text").and_then(|v| v.as_str()).unwrap_or("")) {
+        Ok(t) => t,
+        Err(e) => return err(400, &e),
+    };
+    let review = matches!(body.get("review"), Some(Json::Bool(true)));
+    let Some(sig) = body.get("signature").and_then(|v| v.as_str()) else {
+        let at = now / 1000;
+        return Response::json(
+            400,
+            Json::obj(vec![
+                ("error", Json::str("signature is required: sign sign_this with this wallet (personal_sign), then send it back with the same text, review and signed_at")),
+                ("sign_this", Json::str(replies::message(&wallet, at, review, &text))),
+                ("signed_at", Json::num(at as f64)),
+            ])
+            .to_string(),
+        );
+    };
+    let Some(sig) = hex_bytes(sig) else { return err(400, "signature must be 0x followed by hex") };
+    let Some(at) = body.get("signed_at").and_then(|v| v.as_f()).map(|t| t as i64) else {
+        return err(400, "signed_at is required: the time in the signed text, in unix seconds");
+    };
+    match replies::lock().post(&wallet, &text, at, review, &sig, now) {
+        Ok(()) => Response::json(
+            201,
+            Json::obj(vec![
+                ("status", Json::str("posted")),
+                ("page", Json::str(format!("{}/wallets/{wallet}", base_url(req)))),
+                ("review", Json::str(if review { "requested — a person will re-read this wallet's record" } else { "not requested" })),
+            ])
+            .to_string(),
+        ),
+        Err(e) => err(400, &e),
+    }
+}
+
+fn hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let h = s.trim().strip_prefix("0x")?;
+    if h.len() % 2 != 0 {
+        return None;
+    }
+    (0..h.len()).step_by(2).map(|i| u8::from_str_radix(h.get(i..i + 2)?, 16).ok()).collect()
 }
 
 /// Where the search box sends what was typed: a wallet to its page, a bot number (or
@@ -1185,7 +1261,11 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 return err(429, "too many searches from this address this hour — try again later");
             }
             if let Some(cid) = &customer_id {
-                engine.lock().unwrap_or_else(|e| e.into_inner()).meter_lookup(cid, now);
+                if let Some(target) = lookup_target(&req, &segments) {
+                    if fair::lock().charge(cid, &target, now) {
+                        engine.lock().unwrap_or_else(|e| e.into_inner()).meter_lookup(cid, now);
+                    }
+                }
             }
             let mut idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
             idx.prepare_search();
@@ -1262,8 +1342,10 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
 
     let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cid) = &customer_id {
-        if is_lookup(method, &segments) {
-            engine.meter_lookup(cid, now);
+        if let Some(target) = lookup_target(&req, &segments) {
+            if fair::lock().charge(cid, &target, now) {
+                engine.meter_lookup(cid, now);
+            }
         }
     }
 
@@ -1442,9 +1524,11 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     None => Json::obj(vec![("pay_to", w.clone()), ("error", Json::str("not a string"))]),
                 })
                 .collect();
-            for _ in 1..results.len() {
-                if let Some(cid) = &customer_id {
-                    engine.meter_lookup(cid, now);
+            if let Some(cid) = &customer_id {
+                for w in wallets.iter().filter_map(|w| w.as_str()) {
+                    if fair::lock().charge(cid, &wallet_target(w), now) {
+                        engine.meter_lookup(cid, now);
+                    }
                 }
             }
             ok(Json::obj(vec![("results", Json::Array(results))]))
@@ -1623,7 +1707,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 _ => return err(400, "send delivered (true/false) or the HTTP status the paid request got"),
             };
             let pay_to = body.get("pay_to").and_then(|v| v.as_str()).and_then(|p| verify::normalize("eth", p).ok());
-            if !payments::queue_report(payments::PendingReport { tx, delivered, pay_to, attempts: 0 }) {
+            if !payments::queue_report(payments::PendingReport { tx, delivered, pay_to, attempts: 0, customer: customer_id.clone() }) {
                 return err(503, "the report queue is full or already has this payment — try again later");
             }
             Response::json(
@@ -1634,6 +1718,31 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 ])
                 .to_string(),
             )
+        }
+        ("POST", ["v1", "wallets", wallet, "reply"]) => post_reply(&req, wallet, &body, now),
+        // Review requests from sellers, for the operator; and recording a review's result.
+        ("GET", ["v1", "reviews"]) => {
+            if let Err(e) = engine.check_admin(admin_secret_of(&req, &body)) {
+                return err(401, e);
+            }
+            let open: Vec<Json> = replies::lock()
+                .open_reviews()
+                .into_iter()
+                .map(|(w, r)| Json::obj(vec![("wallet", Json::str(w)), ("reply", r.to_json())]))
+                .collect();
+            ok(Json::obj(vec![("open", Json::Array(open))]))
+        }
+        ("POST", ["v1", "reviews", wallet]) => {
+            if let Err(e) = engine.check_admin(admin_secret_of(&req, &body)) {
+                return err(401, e);
+            }
+            let Some(note) = body.get("note").and_then(|v| v.as_str()).filter(|n| !n.trim().is_empty() && n.len() <= 500) else {
+                return err(400, "note is required: what the review found, in a sentence or two (shown on the wallet page)");
+            };
+            match replies::lock().decide(&wallet.to_ascii_lowercase(), note, now) {
+                Ok(()) => ok(Json::obj(vec![("status", Json::str("reviewed"))])),
+                Err(e) => err(404, &e),
+            }
         }
         ("GET", ["v1", "wallets", wallet]) => match wallet_json(&engine, wallet, now) {
             Ok(j) => {
@@ -1663,6 +1772,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         ("GET", ["openapi.json"]) => ok(formats::openapi(&base_url(&req))),
         ("GET", [".well-known", "agent.json"]) | ("GET", [".well-known", "agent-card.json"]) => ok(formats::agent_card(&base_url(&req))),
         ("GET", [".well-known", "mcp.json"]) => ok(formats::mcp_pointer(&base_url(&req))),
+        ("GET", [".well-known", "keptvow-signer.json"]) => ok(signer::info(&base_url(&req))),
         ("GET", ["guard.js"]) => Response {
             status: 200,
             content_type: "text/javascript; charset=utf-8",
@@ -2769,6 +2879,18 @@ fn background(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
         watch::save_if_dirty();
         metrics::save_if_dirty();
 
+        // Checks given back for delivery reports come off the bills they were charged to.
+        let refunds = fair::lock().take_refunds();
+        if !refunds.is_empty() {
+            let mut e = engine.lock().unwrap_or_else(|e| e.into_inner());
+            for (cid, n) in refunds {
+                e.refund_lookups(&cid, n, now);
+            }
+            dirty = true;
+        }
+        fair::save_if_dirty(now);
+        replies::save_if_dirty();
+
         if tick % 180 == 0 && engine.lock().unwrap_or_else(|e| e.into_inner()).prune_unpaid(now) > 0 {
             dirty = true;
         }
@@ -2838,6 +2960,9 @@ fn main() -> std::io::Result<()> {
     let data_dir = path.parent().map(|d| d.to_path_buf()).unwrap_or_default();
     watch::load(data_dir.clone());
     metrics::load(data_dir.clone());
+    fair::load(data_dir.clone());
+    replies::load(data_dir.clone());
+    signer::load(data_dir.clone());
     chain::start(data_dir.clone(), autopay::base_rpc_urls());
     payments::start(data_dir, autopay::base_rpc_urls(), catalog_urls());
 
@@ -3787,10 +3912,88 @@ mod settlement_tests {
         for _ in 0..3 {
             assert_eq!(route(&e, from("203.0.113.9", key), PROD).status, 200);
         }
+        let mut other = req("GET", "/v1/trust/otherbot", key, "");
+        other.headers.insert("x-real-ip".into(), "203.0.113.9".into());
+        assert_eq!(route(&e, other, PROD).status, 200);
         let now = now_ms();
         let engine = e.lock().unwrap_or_else(|e| e.into_inner());
         let used = engine.customer(&cus).unwrap().usage.get(&billing::month_of(now)).unwrap().lookups;
-        assert_eq!(used, 3);
+        assert_eq!(used, 2, "the same bot three times today is one check; another bot is a second");
+    }
+
+    #[test]
+    fn a_seller_can_answer_its_wallet_page_and_ask_for_a_review() {
+        let e = Mutex::new(Engine::with_admin_secret("adm"));
+        let (key, wallet) = replies::tests::wallet(9);
+        let ask = format!(r#"{{"text":"Down for maintenance Oct 3. <b>Refunds</b> via support.","review":true}}"#);
+        let r = route(&e, req("POST", &format!("/v1/wallets/{wallet}/reply"), "", &ask), PROD);
+        assert_eq!(r.status, 400);
+        let j = json::parse(&r.body).unwrap();
+        let msg = j.get("sign_this").and_then(|v| v.as_str()).unwrap().to_string();
+        let at = j.get("signed_at").and_then(|v| v.as_f()).unwrap() as i64;
+        assert!(msg.contains(&wallet) && msg.contains("Review requested: yes"), "{msg}");
+        let sig: String = replies::tests::sign(&key, &msg).iter().map(|b| format!("{b:02x}")).collect();
+        let signed = format!(
+            r#"{{"text":"Down for maintenance Oct 3. <b>Refunds</b> via support.","review":true,"signed_at":{at},"signature":"0x{sig}"}}"#
+        );
+        // Someone else's wallet can't take the reply.
+        let other = replies::tests::wallet(10).1;
+        assert_eq!(route(&e, req("POST", &format!("/v1/wallets/{other}/reply"), "", &signed), PROD).status, 400);
+        let r = route(&e, req("POST", &format!("/v1/wallets/{wallet}/reply"), "", &signed), PROD);
+        assert_eq!(r.status, 201, "{}", r.body);
+        let data = json::parse(&route(&e, req("GET", &format!("/v1/wallets/{wallet}"), "", ""), PROD).body).unwrap();
+        assert_eq!(data.get("seller_reply").and_then(|r| r.get("review")).and_then(|r| r.get("status")).and_then(|v| v.as_str()), Some("requested"));
+        let mut page = req("GET", &format!("/wallets/{wallet}"), "", "");
+        page.headers.insert("accept".into(), "text/html".into());
+        let html = route(&e, page, PROD).body;
+        assert!(html.contains("The seller's reply") && html.contains("&lt;b&gt;Refunds"), "shown word for word, never as markup");
+        // The operator sees the request and records the review, which the page then shows.
+        let mut list = req("GET", "/v1/reviews", "", "");
+        list.headers.insert("x-admin-secret".into(), "adm".into());
+        assert!(route(&e, list, PROD).body.contains(&wallet));
+        let decide = route(&e, req("POST", &format!("/v1/reviews/{wallet}"), "", r#"{"admin_secret":"adm","note":"Record re-read; the verdict stands."}"#), PROD);
+        assert_eq!(decide.status, 200, "{}", decide.body);
+        let mut page = req("GET", &format!("/wallets/{wallet}"), "", "");
+        page.headers.insert("accept".into(), "text/html".into());
+        assert!(route(&e, page, PROD).body.contains("the verdict stands"));
+    }
+
+    #[test]
+    fn a_key_pays_once_a_day_per_seller_and_a_delivery_report_gives_it_back() {
+        let e = Mutex::new(Engine::with_admin_secret("adm"));
+        let key = "at_live_fair";
+        let cus = e.lock().unwrap().create_customer("fair", key, 0);
+        let seller = "0x00000000000000000000000000000000000000aa";
+        let used = |e: &Mutex<Engine>| {
+            let g = e.lock().unwrap();
+            let u = g.customer(&cus).unwrap().usage.get(&billing::month_of(now_ms())).copied().unwrap_or_default();
+            (u.lookups, u.billed_lookups())
+        };
+        let check = |w: &str| {
+            let mut r = req("GET", "/v1/check", key, "");
+            r.query.insert("pay_to".into(), w.into());
+            route(&e, r, PROD).status
+        };
+        // One seller, named three ways, checked four times: one check.
+        assert_eq!(check(seller), 200);
+        assert_eq!(check(&format!("0X{}", seller[2..].to_uppercase())), 200);
+        assert_eq!(route(&e, req("GET", &format!("/v1/wallets/{seller}"), key, ""), PROD).status, 200);
+        let batch = format!(r#"{{"pay_to":["{seller}","0x00000000000000000000000000000000000000bb","0x00000000000000000000000000000000000000bb"]}}"#);
+        assert_eq!(route(&e, req("POST", "/v1/check", key, &batch), PROD).status, 200);
+        assert_eq!(used(&e), (2, 2), "two sellers, two checks");
+        // A verified report about a payment to that seller gives its check back.
+        fair::lock().reported(&cus, seller, now_ms());
+        for (cid, n) in fair::lock().take_refunds() {
+            e.lock().unwrap().refund_lookups(&cid, n, now_ms());
+        }
+        assert_eq!(used(&e), (2, 1));
+        assert_eq!(check(seller), 200);
+        assert_eq!(used(&e), (2, 1), "and it stays free today");
+        let statement = {
+            let g = e.lock().unwrap();
+            g.statement_json(g.customer(&cus).unwrap(), now_ms())
+        };
+        assert!(statement.to_string().contains("\"checks_refunded\":1"), "{statement:?}");
     }
 
     #[test]

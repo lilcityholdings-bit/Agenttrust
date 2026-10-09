@@ -15,6 +15,11 @@ whether the result arrived:
     ...
     keptvow.report_outcome(paid_response)   # in the background; never raises
 
+Every answer is signed by Keptvow (result["signed"], checkable at
+https://keptvow.com/.well-known/keptvow-signer.json) and says how long it stays fresh, so checking
+the same seller again within five minutes reuses the answer. With a key, the same seller is billed
+at most once a day, and delivery reports sent with that key make its checks free.
+
 Free, no sign-up, no key. No dependencies. Set KEPTVOW_URL to use another Keptvow address.
 """
 
@@ -24,6 +29,7 @@ import base64
 import json
 import os
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,26 +75,47 @@ def _request(method: str, url: str, body: Optional[dict], headers: dict, timeout
             return e.code, {}
 
 
+# Answers still fresh, by base, wallet and amount: reused until their signed "Valid until".
+_fresh: dict = {}
+_fresh_lock = threading.Lock()
+_CACHE_MAX = 1000
+
+
 def check(
     pay_to: str,
     amount_usd: Optional[float] = None,
     *,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
+    cache: bool = True,
     timeout: float = 5.0,
 ) -> dict:
     """Asks Keptvow about one wallet before paying it.
 
-    Returns {"verdict": "ok" | "careful" | "stop", "advice": ..., "evidence": ..., ...}.
+    Returns {"verdict": "ok" | "careful" | "stop", "advice": ..., "evidence": ..., "signed": ...}.
+    A fresh answer for the same wallet and amount is reused unless cache=False.
     Raises RuntimeError when Keptvow refuses the question (e.g. not a wallet address).
     """
+    base = _base(base_url)
+    key = (base, pay_to.strip().lower(), amount_usd)
+    if cache:
+        with _fresh_lock:
+            hit = _fresh.get(key)
+        if hit and hit[0] > time.time() * 1000:
+            return hit[1]
     q = {"pay_to": pay_to}
     if amount_usd is not None:
         q["amount_usd"] = str(amount_usd)
     headers = {"X-Api-Key": api_key} if api_key else {}
-    status, j = _request("GET", f"{_base(base_url)}/v1/check?{urllib.parse.urlencode(q)}", None, headers, timeout)
+    status, j = _request("GET", f"{base}/v1/check?{urllib.parse.urlencode(q)}", None, headers, timeout)
     if status >= 400:
         raise RuntimeError(j.get("error") or f"Keptvow answered {status}")
+    until = (j.get("signed") or {}).get("valid_until_ms") if isinstance(j, dict) else None
+    if cache and isinstance(until, (int, float)) and until > time.time() * 1000:
+        with _fresh_lock:
+            if len(_fresh) >= _CACHE_MAX:
+                _fresh.pop(next(iter(_fresh)))
+            _fresh[key] = (until, j)
     return j
 
 
@@ -127,6 +154,7 @@ def guard(
     on_check: Optional[Callable[[dict], None]] = None,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
+    cache: bool = True,
     timeout: float = 5.0,
 ) -> list[dict]:
     """Checks every wallet a 402 Payment Required answer asks to be paid at.
@@ -149,7 +177,7 @@ def guard(
             except (TypeError, ValueError):
                 amount = None
         try:
-            result = check(pay_to, amount, api_key=api_key, base_url=base_url, timeout=timeout)
+            result = check(pay_to, amount, api_key=api_key, base_url=base_url, cache=cache, timeout=timeout)
         except Exception:
             if fail_open:
                 continue
@@ -167,6 +195,7 @@ def report_outcome(
     *,
     delivered: Optional[bool] = None,
     pay_to: Optional[str] = None,
+    api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     background: bool = True,
     timeout: float = 5.0,
@@ -175,8 +204,8 @@ def report_outcome(
 
     Pass the paid response (its PAYMENT-RESPONSE receipt names the transaction, and its status
     says whether it delivered), or a transaction hash with delivered=True/False. Keptvow checks
-    the payment on-chain, so only real buyers count. Never raises; returns False when there was
-    nothing to report.
+    the payment on-chain, so only real buyers count. With api_key, that seller's checks on the
+    key come back free. Never raises; returns False when there was nothing to report.
     """
     body: dict = {}
     if isinstance(response_or_tx, str):
@@ -208,7 +237,7 @@ def report_outcome(
 
     def send() -> None:
         try:
-            _request("POST", url, body, {}, timeout)
+            _request("POST", url, body, {"X-Api-Key": api_key} if api_key else {}, timeout)
         except Exception:
             pass
 

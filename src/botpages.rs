@@ -95,6 +95,7 @@ const STYLE: &str = r#"
   .formats a { background: var(--soft); color: var(--accent); padding: 3px 10px; border-radius: 999px; text-decoration: none; font-weight: 600; }
   .svc { padding: 10px 0; border-bottom: 1px solid var(--line); }
   .svc:last-child { border-bottom: 0; }
+  .reply { margin: 8px 0; padding: 10px 14px; border-left: 3px solid var(--line); white-space: normal; overflow-wrap: anywhere; }
   .svc .top { display: flex; gap: 10px; align-items: baseline; justify-content: space-between; }
   .svc .price { font-weight: 700; white-space: nowrap; }
   details summary { cursor: pointer; color: var(--accent); }
@@ -586,6 +587,23 @@ pub fn wallet_page(j: &Json, base: &str) -> String {
     } else {
         format!(r#"<div class="list">{bots}</div>"#)
     };
+    let reply = match j.get("seller_reply") {
+        Some(r @ Json::Object(_)) => {
+            let review = match r.get("review").and_then(|v| v.get("status")).and_then(|v| v.as_str()) {
+                Some("requested") => r#"<p class="muted">The seller asked for a review of this verdict. A person will re-read the record.</p>"#.to_string(),
+                Some("reviewed") => format!(
+                    r#"<p class="muted"><b>Reviewed:</b> {}</p>"#,
+                    esc(&st(r.get("review").and_then(|v| v.get("note"))))
+                ),
+                _ => String::new(),
+            };
+            format!(
+                r#"<section><h2>The seller's reply</h2><blockquote class="reply">{}</blockquote><p class="muted">Written by whoever holds this wallet — signed with it, shown word for word. It doesn't change the verdict: that comes from payments and buyers' reports.</p>{review}</section>"#,
+                esc(&st(r.get("text"))).replace('\n', "<br>")
+            )
+        }
+        _ => String::new(),
+    };
     let body = format!(
         r#"<h1>Should I pay this wallet?</h1>
 <p class="sub mono">{wallet}</p>
@@ -597,6 +615,7 @@ pub fn wallet_page(j: &Json, base: &str) -> String {
 <div class="stats">{tiles}</div>
 <p class="muted">Read straight from USDC payments on Base. <b>Established</b> buyers have paid at least three different sellers for two weeks or more — hard to fake with fresh wallets.</p>
 </section>
+{reply}
 <section><h2>Did buyers get what they paid for?</h2>{reports}</section>
 {services}
 <section><h2>Bots paid at this wallet</h2>{bots}</section>
@@ -604,7 +623,8 @@ pub fn wallet_page(j: &Json, base: &str) -> String {
 <h2>Check it from code, before every payment</h2>
 <div class="code">curl "{base}/v1/check?pay_to={wallet}&amp;amount_usd=5"</div>
 <p class="muted">Free. Or wrap your x402 fetch with <a href="/guard.js">guard.js</a> and it checks every seller for you. <a href="/docs">All the ways to connect</a>.</p>
-</section>"#,
+</section>
+<section><h2>Is this your wallet?</h2><p class="muted">You can answer what this page says, and ask for a person to review the verdict. Sign your reply with this wallet so buyers know it's really you — <a href="/docs#reply">how to reply</a>.</p></section>"#,
         wallet = esc(&wallet),
         word = verdict.to_uppercase(),
         advice = esc(&st(j.get("advice"))),

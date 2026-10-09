@@ -4,9 +4,11 @@ import assert from "node:assert/strict";
 import { check, withKeptvow, KeptvowStop } from "./index.js";
 
 const SCAM = "0x" + "c3".repeat(20);
+const SIGNED = "0x" + "5e".repeat(20);
 const GOOD = "0x" + "a1".repeat(20);
 const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const seen = [];
+const outcomeKeys = [];
 
 async function fake(url, init = {}) {
   const u = new URL(url);
@@ -14,9 +16,13 @@ async function fake(url, init = {}) {
   const json = (status, body, headers = {}) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
   if (u.pathname === "/v1/check") {
     const payTo = u.searchParams.get("pay_to");
-    return json(200, { pay_to: payTo, verdict: payTo === SCAM ? "stop" : "ok", advice: "test", amount_usd: Number(u.searchParams.get("amount_usd")) });
+    const signed = payTo === SIGNED ? { message: "m", signature: "0x", signer: "0x", valid_until_ms: Date.now() + 60_000 } : undefined;
+    return json(200, { pay_to: payTo, verdict: payTo === SCAM ? "stop" : "ok", advice: "test", amount_usd: Number(u.searchParams.get("amount_usd")), signed });
   }
-  if (u.pathname === "/v1/outcomes") return json(202, { status: "queued", body: JSON.parse(init.body) });
+  if (u.pathname === "/v1/outcomes") {
+    outcomeKeys.push((init.headers || {})["X-Api-Key"]);
+    return json(202, { status: "queued", body: JSON.parse(init.body) });
+  }
   if (u.hostname === "scam.example") return json(402, { accepts: [{ payTo: SCAM, maxAmountRequired: "2000000", asset: USDC }] });
   if (u.hostname === "good.example") {
     if (init.paid) return json(200, { data: 1 }, { "payment-response": btoa(JSON.stringify({ success: true, transaction: "0x" + "ab".repeat(32) })) });
@@ -43,6 +49,19 @@ const paid = await guarded("https://good.example/x", { paid: true });
 assert.equal(paid.status, 200);
 await new Promise((ok) => setTimeout(ok, 10));
 assert.ok(seen.includes("/v1/outcomes"), "the delivery is reported");
+
+// A fresh signed answer is reused instead of asking again; cache: false always asks.
+const asked = () => seen.filter((s) => s.includes(`pay_to=${SIGNED}`)).length;
+await check(SIGNED, { baseUrl: base, fetch: fake });
+await check(SIGNED, { baseUrl: base, fetch: fake });
+assert.equal(asked(), 1, "the second check reused the signed answer");
+await check(SIGNED, { baseUrl: base, fetch: fake, cache: false });
+assert.equal(asked(), 2);
+
+// With a key, the delivery report carries it, so that seller's checks come back free.
+await withKeptvow(fake, { baseUrl: base, apiKey: "k_test" })("https://good.example/x", { paid: true });
+await new Promise((ok) => setTimeout(ok, 10));
+assert.equal(outcomeKeys.at(-1), "k_test");
 
 // Keptvow unreachable: pays on by default, blocks when failOpen is false.
 const down = () => Promise.reject(new Error("offline"));

@@ -164,6 +164,8 @@ pub struct Usage {
     pub agreements: u64,
     pub disputes: u64,
     pub lookups: u64,
+    /// Checks given back after the customer reported what happened (see fair.rs).
+    pub refunded: u64,
 }
 
 impl Usage {
@@ -172,12 +174,18 @@ impl Usage {
             ("agreements", Json::num(self.agreements as f64)),
             ("disputes", Json::num(self.disputes as f64)),
             ("lookups", Json::num(self.lookups as f64)),
+            ("checks_refunded", Json::num(self.refunded as f64)),
         ])
     }
 
     pub fn from_json(j: &Json) -> Usage {
         let n = |k: &str| j.get(k).and_then(|v| v.as_f()).unwrap_or(0.0) as u64;
-        Usage { agreements: n("agreements"), disputes: n("disputes"), lookups: n("lookups") }
+        Usage { agreements: n("agreements"), disputes: n("disputes"), lookups: n("lookups"), refunded: n("checks_refunded") }
+    }
+
+    /// Lookups that are billed: every one counted, less those given back.
+    pub fn billed_lookups(&self) -> u64 {
+        self.lookups.saturating_sub(self.refunded)
     }
 }
 
@@ -200,12 +208,34 @@ pub fn invoice(p: &Pricing, u: &Usage) -> Vec<Line> {
     if u.disputes > 0 {
         lines.push(Line { what: format!("{} escalated disputes", u.disputes), mills: u.disputes as i64 * p.dispute_mills });
     }
-    let extra_lookups = u.lookups.saturating_sub(p.included_lookups);
+    let extra_lookups = u.billed_lookups().saturating_sub(p.included_lookups);
     if extra_lookups > 0 {
         lines.push(Line {
             what: format!("{extra_lookups} trust lookups over the {} included", p.included_lookups),
             mills: extra_lookups as i64 * p.lookup_mills,
         });
+    }
+    lines
+}
+
+/// Plans from smallest to largest. Pay-as-you-go credits first, then the monthly plans.
+const LADDER: [&str; 3] = ["credits", "watch", "platform"];
+
+/// A month's bill under the "never overcharged" promise: the customer's own plan, unless the
+/// same use would have cost less on a bigger plan — then the bigger plan's price, as a credit
+/// line. Never a smaller plan's price: a plan's fee is what makes a platform count as
+/// independent in trust scores (see the top of this file), so that floor stays.
+pub fn fair_invoice(tier: &str, p: &Pricing, u: &Usage) -> Vec<Line> {
+    let mut lines = invoice(p, u);
+    let own = total(&lines);
+    let Some(at) = LADDER.iter().position(|t| *t == tier) else { return lines };
+    let cheaper = LADDER[at + 1..]
+        .iter()
+        .filter_map(|t| Some((*t, total(&invoice(&Pricing::for_tier(t)?, u)))))
+        .filter(|(_, m)| *m < own)
+        .min_by_key(|(_, m)| *m);
+    if let Some((t, m)) = cheaper {
+        lines.push(Line { what: format!("Never overcharged: billed at the {} price for this use", Pricing::tier_label(t)), mills: m - own });
     }
     lines
 }
@@ -297,8 +327,37 @@ mod tests {
     fn a_quiet_month_is_just_the_plan_and_overage_is_metered() {
         let p = Pricing::default();
         assert_eq!(total(&invoice(&p, &Usage::default())), 29_000);
-        let busy = Usage { agreements: 600, disputes: 3, lookups: 12_500 };
+        let busy = Usage { agreements: 600, disputes: 3, lookups: 12_500, refunded: 0 };
         // $29 + 100 × $0.02 + 3 × $0.50 + 2,500 × $0.001 = $35.00
         assert_eq!(total(&invoice(&p, &busy)), 29_000 + 2_000 + 1_500 + 2_500);
+    }
+
+    #[test]
+    fn checks_given_back_come_off_the_bill() {
+        let p = Pricing::for_tier("credits").unwrap();
+        let u = Usage { lookups: 1_000, refunded: 400, ..Usage::default() };
+        assert_eq!(total(&invoice(&p, &u)), 600);
+        let back = Usage::from_json(&crate::json::parse(&u.to_json().to_string()).unwrap());
+        assert_eq!(back, u);
+    }
+
+    #[test]
+    fn nobody_pays_more_than_a_bigger_plan_would_have_cost() {
+        let watch = Pricing::for_tier("watch").unwrap();
+        // A quiet month on Watch is just Watch.
+        assert_eq!(total(&fair_invoice("watch", &watch, &Usage { lookups: 5_000, ..Usage::default() })), 99_000);
+        // 900,000 checks: $99 + 800,000 × $0.001 = $899 on Watch, but Platform covers it for $499.
+        let heavy = Usage { lookups: 900_000, ..Usage::default() };
+        assert_eq!(total(&invoice(&watch, &heavy)), 899_000);
+        let fair = fair_invoice("watch", &watch, &heavy);
+        assert_eq!(total(&fair), 499_000);
+        assert!(fair.last().unwrap().what.contains("Never overcharged"));
+        // Pay-as-you-go is capped the same way, and a plan is never billed below its own fee.
+        let credits = Pricing::for_tier("credits").unwrap();
+        assert_eq!(total(&fair_invoice("credits", &credits, &Usage { lookups: 2_000, ..Usage::default() })), 2_000);
+        assert_eq!(total(&fair_invoice("credits", &credits, &heavy)), 499_000);
+        assert_eq!(total(&fair_invoice("platform", &Pricing::for_tier("platform").unwrap(), &Usage::default())), 499_000);
+        // Operator-issued customers from before plans existed keep their own price list.
+        assert_eq!(total(&fair_invoice("", &Pricing::default(), &heavy)), total(&invoice(&Pricing::default(), &heavy)));
     }
 }

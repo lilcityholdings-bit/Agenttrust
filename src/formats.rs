@@ -304,7 +304,7 @@ pub fn openapi(base: &str) -> Json {
             Json::obj(vec![
                 ("title", Json::str("Keptvow")),
                 ("version", Json::str("1.0.0")),
-                ("description", Json::str("Trust scores for AI bots and the wallets they pay. Free without a key (limited per address); send X-Api-Key for a plan.")),
+                ("description", Json::str("Trust scores for AI bots and the wallets they pay. Free without a key (limited per address); send X-Api-Key for a plan. Every check is signed: see /.well-known/keptvow-signer.json.")),
             ]),
         ),
         ("servers", Json::Array(vec![Json::obj(vec![("url", Json::str(base))])])),
@@ -316,6 +316,7 @@ pub fn openapi(base: &str) -> Json {
                 ("/v1/trust/{agent_id}", get("getTrust", "A bot's trust profile (a Keptvow id or erc8004:8453:<number>)", vec![path_param("agent_id", "bot id"), format_param()], "Trust profile")),
                 ("/v1/bots", get("searchBots", "Search every rated bot", vec![q("q", "name, number or 0x wallet", false), q("sort", "new for newest first", false), q("offset", "for paging", false), q("limit", "1-100", false), format_param()], "Matching bots")),
                 ("/v1/outcomes", post("reportDelivery", "After paying: did the result arrive? Checked on-chain", vec![("tx", "string", "payment transaction hash"), ("delivered", "boolean", "true if the paid result arrived"), ("status", "integer", "or: the HTTP status of the paid request"), ("pay_to", "string", "optional: the wallet paid")], &["tx"], ("202", "Queued for checking"))),
+                ("/v1/wallets/{wallet}/reply", post("replyAsSeller", "The wallet's holder answers its page, signed with that wallet; send without signature to get the exact text to sign", vec![("text", "string", "up to 500 characters, shown word for word"), ("review", "boolean", "ask a person to review the verdict"), ("signed_at", "integer", "unix seconds from sign_this"), ("signature", "string", "0x personal_sign signature of sign_this")], &["text"], ("201", "Posted"))),
                 ("/v1/register", post("register", "Create a free Keptvow identity for a bot", vec![("name", "string", "optional name")], &[], ("201", "agent_id and a secret (shown once)"))),
                 ("/v1/stats", get("getStats", "Public traction numbers", vec![], "Counts")),
                 ("/v1/pricing", get("getPricing", "Plans and pay-as-you-go prices", vec![], "Prices")),

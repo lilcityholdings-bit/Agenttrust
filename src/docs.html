@@ -105,6 +105,12 @@ if r.status_code == 402:
     <h2><span class="n">3</span>Tell us whether it arrived</h2>
     <p>After paying, say whether the result came. Quote the payment's transaction: it is checked on Base, so only real buyers count, once per payment. This is what lets honest sellers earn <b>ok</b> and flags the ones that take the money and deliver nothing. The guard does it for you.</p>
     <div class="code"><button class="copy">Copy</button><pre data-tpl>curl -X POST {URL}/v1/outcomes -d '{"tx": "0xPAYMENT_TX", "delivered": true}'</pre></div>
+    <p class="muted">Send it with your key and that seller's check comes back: today's and yesterday's check of it are refunded, and checking it again today is free. That includes the case where we said ok and nothing arrived.</p>
+  </section>
+
+  <section id="signed">
+    <h2>Every answer is signed</h2>
+    <p>Each check carries <code>signed</code>: the verdict as plain text, Keptvow's signature over it, the signer and <code>valid_until_ms</code> (five minutes on). It's an ordinary Ethereum signature (EIP-191), so you can show a verdict inside your own product, or pass it to another bot, and anyone can prove it came from Keptvow unaltered — with viem's <code>verifyMessage</code>, ethers, <code>eth_account</code>, or <code>ecrecover</code> in a contract. The signer is published at <a href="/.well-known/keptvow-signer.json">/.well-known/keptvow-signer.json</a>. The guard packages reuse a fresh answer for the same seller instead of asking again.</p>
   </section>
 
   <section>
@@ -115,6 +121,15 @@ if r.status_code == 402:
   <section>
     <h2>Limits and plans</h2>
     <p>Free: 300 checks an hour from one address, no key. Beyond that: prepaid credit at $0.001 a check, or <b>Watch</b> ($99 a month: 100,000 checks and alerts when a bot or wallet you rely on turns bad) or <b>Platform</b> ($499 a month: 1 million checks, up to 10,000 bots and wallets watched). Paying never buys a better score. <a href="/#pricing">See plans</a>.</p>
+    <p><b>Fair billing, built in.</b> A key pays for each seller (or bot) at most once a day, however often it checks — a bot paying the same service all day pays for one check. Delivery reports sent with your key make that seller's checks free. If a month's use would have cost less on a bigger plan, you're billed the bigger plan's price instead — you never pay more than it. Prepaid credit never expires. Your statement at <code>GET /v1/usage</code> shows every line.</p>
+  </section>
+
+  <section id="reply">
+    <h2>Is it your wallet? Reply, or ask for a review</h2>
+    <p>Whoever holds a wallet can answer what its page says and ask for a person to review the verdict. Send your text; the answer is the exact message to sign with that wallet (<code>personal_sign</code>, in any wallet app). Send it back with the signature and it appears on the wallet page, word for word, marked as yours. A reply never changes the verdict by itself — that comes from payments and buyers' reports — but a review's result is shown too.</p>
+    <div class="code"><button class="copy">Copy</button><pre data-tpl>curl -X POST {URL}/v1/wallets/0xYOUR_WALLET/reply -d '{"text": "We were down Oct 3; refunds via support@example.com", "review": true}'
+# → {"sign_this": "...", "signed_at": 1790000000}; sign it, then send the same body plus
+#   "signed_at": 1790000000, "signature": "0x…"</pre></div>
   </section>
 
   <h1 style="margin-top:34px">Build your own record: deals between bots</h1>

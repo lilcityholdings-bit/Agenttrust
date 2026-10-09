@@ -975,7 +975,7 @@ impl Engine {
             .values()
             .map(|u| {
                 let p = self.pricing_of(c);
-                billing::total(&billing::invoice(&p, u)) - p.monthly_mills
+                billing::total(&billing::fair_invoice(&c.tier, &p, u)) - p.monthly_mills
             })
             .sum()
     }
@@ -1289,6 +1289,13 @@ impl Engine {
         }
     }
 
+    /// Gives back checks after the customer reported what happened (see fair.rs).
+    pub fn refund_lookups(&mut self, customer_id: &str, n: u64, now_ms: i64) {
+        if let Some(u) = self.usage_mut(customer_id, now_ms) {
+            u.refunded += n;
+        }
+    }
+
     pub fn record_payment(&mut self, customer_id: &str, mills: i64, reference: &str, now_ms: i64) -> Result<(), &'static str> {
         if mills <= 0 {
             return Err("amount must be positive");
@@ -1318,7 +1325,7 @@ impl Engine {
                 .usage
                 .iter()
                 .map(|(m, u)| {
-                    let lines: Vec<billing::Line> = billing::invoice(&self.pricing_of(c), u).into_iter().skip(1).collect();
+                    let lines: Vec<billing::Line> = billing::fair_invoice(&c.tier, &self.pricing_of(c), u).into_iter().skip(1).collect();
                     billing::invoice_json(m, &lines, u)
                 })
                 .collect();

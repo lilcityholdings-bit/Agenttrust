@@ -12,6 +12,11 @@ export interface CheckResult {
   matches: Record<string, unknown>[];
   /** A page people can open: prefix with the Keptvow address. */
   wallet_page: string;
+  /**
+   * Keptvow's signature over this verdict (EIP-191 personal_sign), so it can be passed on and
+   * still be proven genuine. The signer is published at /.well-known/keptvow-signer.json.
+   */
+  signed: { message: string; signature: string; signer: string; valid_until_ms: number };
 }
 
 export interface CheckOptions {
@@ -20,6 +25,8 @@ export interface CheckOptions {
   /** A Watch, Platform or credits key. Not needed for the free tier. */
   apiKey?: string;
   baseUrl?: string;
+  /** false asks Keptvow every time instead of reusing a fresh signed answer. Default true. */
+  cache?: boolean;
   fetch?: typeof fetch;
 }
 
@@ -35,6 +42,9 @@ export interface GuardOptions {
   onCheck?: (result: CheckResult) => void;
   /** false turns off the background delivery reports. Default true. */
   reportOutcomes?: boolean;
+  /** false asks Keptvow every time instead of reusing a fresh signed answer. Default true. */
+  cache?: boolean;
+  /** With a key, delivery reports make that seller's checks free. */
   apiKey?: string;
   baseUrl?: string;
 }

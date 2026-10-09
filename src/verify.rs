@@ -230,7 +230,7 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

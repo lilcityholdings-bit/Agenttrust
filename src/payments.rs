@@ -1851,6 +1851,8 @@ pub struct PendingReport {
     pub tx: String,
     pub delivered: bool,
     pub pay_to: Option<String>,
+    /// The key it was sent with: a verified report gives that customer the seller's check back.
+    pub customer: Option<String>,
     /// Tries so far: a node that's down, or a transaction not yet visible, is tried again later.
     pub attempts: u8,
 }
@@ -1911,7 +1913,10 @@ fn check_reports(urls: &[String]) {
             }
             Ok(receipt) => {
                 if let Some((payer, seller, block)) = payment_in_receipt(&receipt, r.pay_to.as_deref()) {
-                    lock().apply_report(&r.tx, &payer, &seller, block, r.delivered);
+                    let counted = lock().apply_report(&r.tx, &payer, &seller, block, r.delivered);
+                    if let (true, Some(cid)) = (counted, &r.customer) {
+                        crate::fair::lock().reported(cid, &seller, now_ms());
+                    }
                 }
             }
             Err(_) => {}

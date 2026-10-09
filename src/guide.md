@@ -28,7 +28,11 @@ The evidence is real: USDC payments the wallet received on Base (different buyer
 POST {URL}/v1/outcomes {"tx":"0xPAYMENT_TX","delivered":true}
 ```
 
-The transaction is checked on-chain, so only real buyers count. guard.js does this by itself.
+The transaction is checked on-chain, so only real buyers count. guard.js does this by itself. Sent with your `X-Api-Key`, it also gives that seller's check back (today's and yesterday's), and checking it again today is free.
+
+**Every answer is signed.** `signed` holds the verdict as text, Keptvow's EIP-191 signature, the `signer` and `valid_until_ms` (5 minutes on). Reuse the answer until then; pass it on and anyone can verify it (viem `verifyMessage`, ethers, `eth_account`, or `ecrecover` on-chain). Signer: `{URL}/.well-known/keptvow-signer.json`.
+
+**Seller? Answer your page.** `POST {URL}/v1/wallets/0xYOUR_WALLET/reply {"text":"…","review":true}` returns `sign_this`; sign it with that wallet (`personal_sign`) and send the same body plus `signed_at` and `signature`. It shows on the wallet page, word for word; `review: true` asks a person to re-read the record.
 
 ## Fastest path (MCP)
 
@@ -138,7 +142,9 @@ curl -X POST {URL}/v1/platforms -H 'Content-Type: application/json' -d '{"name":
 curl -X POST {URL}/v1/credits -H 'Content-Type: application/json' -d '{"amount_usd":10}'
 ```
 
-Pay the exact USDC amount it returns; the key works the moment it lands and until the credit is used. Top up with the same call plus your `X-Api-Key`. (Credit keys skip the free limits but don't count as a paying platform.)
+Pay the exact USDC amount it returns; the key works the moment it lands and until the credit is used — credit never expires. Top up with the same call plus your `X-Api-Key`. (Credit keys skip the free limits but don't count as a paying platform.)
+
+**Fair billing:** a key pays for each seller or bot at most once a day, however often it checks; delivery reports sent with the key make that seller's checks free; and a month never costs more than the next plan up would have for the same use. `GET {URL}/v1/usage` shows every line.
 
 **Watch alerts** (Watch and Platform plans): list the bots and wallets you depend on and hear when one changes standing.
 

@@ -4,12 +4,14 @@ running Keptvow server for real."""
 import base64
 import json
 import os
+import time
 import unittest
 
 import keptvow
 
 SCAM = "0x" + "c3" * 20
 GOOD = "0x" + "a1" * 20
+SIGNED = "0x" + "5e" * 20
 USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 
 
@@ -28,6 +30,8 @@ class FakeResponse:
 class Test(unittest.TestCase):
     def setUp(self):
         self.calls = []
+        self.report_headers = []
+        keptvow._fresh.clear()
         self.real = keptvow._request
 
         def fake(method, url, body, headers, timeout):
@@ -36,7 +40,9 @@ class Test(unittest.TestCase):
                 q = dict(p.split("=", 1) for p in url.split("?", 1)[1].split("&"))
                 if q["pay_to"] == "down":
                     raise OSError("offline")
-                return 200, {"pay_to": q["pay_to"], "verdict": "stop" if q["pay_to"] == SCAM else "ok", "advice": "test"}
+                signed = {"valid_until_ms": (time.time() + 60) * 1000} if q["pay_to"] == SIGNED else None
+                return 200, {"pay_to": q["pay_to"], "verdict": "stop" if q["pay_to"] == SCAM else "ok", "advice": "test", "signed": signed}
+            self.report_headers.append(headers)
             return 202, {"status": "queued"}
 
         keptvow._request = fake
@@ -72,6 +78,20 @@ class Test(unittest.TestCase):
         self.assertFalse(keptvow.report_outcome(FakeResponse(200, {}, {})), "no receipt, nothing to report")
         self.assertTrue(keptvow.report_outcome("0x" + "cd" * 32, delivered=False, background=False))
         self.assertEqual(self.calls[-1][2], {"tx": "0x" + "cd" * 32, "delivered": False})
+
+    def test_a_fresh_signed_answer_is_reused(self):
+        keptvow.check(SIGNED)
+        keptvow.check(SIGNED.upper().replace("0X", "0x"))
+        self.assertEqual(sum(1 for c in self.calls if SIGNED in c[1].lower()), 1)
+        keptvow.check(SIGNED, cache=False)
+        self.assertEqual(sum(1 for c in self.calls if SIGNED in c[1].lower()), 2)
+        keptvow.check(GOOD)
+        keptvow.check(GOOD)
+        self.assertEqual(sum(1 for c in self.calls if GOOD in c[1]), 2, "unsigned answers are never reused")
+
+    def test_a_report_sent_with_a_key_carries_it(self):
+        keptvow.report_outcome("0x" + "ab" * 32, delivered=True, api_key="k_test", background=False)
+        self.assertEqual(self.report_headers[-1].get("X-Api-Key"), "k_test")
 
 
 @unittest.skipUnless(os.environ.get("KEPTVOW_TEST_URL"), "set KEPTVOW_TEST_URL to test against a server")
