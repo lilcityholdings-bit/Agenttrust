@@ -653,6 +653,8 @@ const SEARCHES_PER_HOUR: u32 = 300;
 
 /// Above this, a bot with only a `fair` record is worth a second look before paying.
 const CAREFUL_ABOVE_USD: f64 = 100.0;
+/// Up to this, a payment record that meets the lighter small-payment bar is enough for "ok".
+const SMALL_PAYMENT_USD: f64 = 5.0;
 
 /// "Should I pay this wallet?" Finds every bot tied to the address a seller asked to be paid
 /// at — a Keptvow account that proved it owns the wallet, and registry bots that list it as
@@ -700,6 +702,7 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
     // The worst record decides: one wallet behind a scam bot and a clean one is still a risk.
     let worst = matches.iter().map(|p| level_of(p)).min_by_key(|l| rank(l));
     let big = amount_usd.map_or(false, |a| a > CAREFUL_ABOVE_USD);
+    let small = amount_usd.map_or(false, |a| a <= SMALL_PAYMENT_USD);
     // What the chain says about this wallet as a seller. A wallet nobody watched before starts
     // being watched now: its history is read in the background and the next check has it.
     let evidence = {
@@ -724,6 +727,17 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
         _ if evidence.strong() => (
             "careful",
             format!("A strong payment record ({}), but over ${CAREFUL_ABOVE_USD:.0} consider splitting the payment.", evidence.summary()),
+        ),
+        _ if evidence.strong_for_small() && small => (
+            "ok",
+            format!("A solid payment record for a payment this size (up to ${SMALL_PAYMENT_USD:.0}): {}.", evidence.summary()),
+        ),
+        _ if evidence.strong_for_small() => (
+            "careful",
+            format!(
+                "Fine for payments up to ${SMALL_PAYMENT_USD:.0} — a solid record ({}), but not yet long enough for more.",
+                evidence.summary()
+            ),
         ),
         None => (
             "careful",
@@ -3329,6 +3343,14 @@ mod tests {
         assert_eq!(verdict(&check(&honest, "500")), "careful", "history alone never clears a big payment");
         let bad = check(&scam, "5");
         assert_eq!(verdict(&bad), "stop", "{}", bad.to_string());
+
+        // A shorter record is enough for small payments only.
+        let modest = payments::tests::addr(0x5a11);
+        payments::tests::strong_seller(&mut payments::lock(), &modest, payments::SMALL_BUYERS as u64);
+        assert_eq!(verdict(&check(&modest, "2")), "ok", "{}", check(&modest, "2").to_string());
+        let more = check(&modest, "20");
+        assert_eq!(verdict(&more), "careful");
+        assert!(more.get("advice").and_then(|v| v.as_str()).unwrap().contains("up to $5"), "{}", more.to_string());
 
         // A wallet nobody watched starts being watched by the first check.
         let fresh = payments::tests::addr(0xf7e54);

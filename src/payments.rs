@@ -51,6 +51,11 @@ const CATALOG_EVERY: Duration = Duration::from_secs(6 * 3_600);
 pub const STRONG_BUYERS: usize = 30;
 pub const STRONG_REPEAT: usize = 10;
 pub const STRONG_SPAN_DAYS: u64 = 14;
+// A lighter bar for small payments, where a wrong "ok" costs a few dollars. Read against the
+// whole history in October 2026: 2 sellers met the full bar, 56 this one.
+pub const SMALL_BUYERS: usize = 10;
+pub const SMALL_REPEAT: usize = 5;
+pub const SMALL_SPAN_DAYS: u64 = 7;
 const ESTABLISHED_REACH: u32 = 3;
 const ESTABLISHED_AGE_BLOCKS: u64 = 14 * DAY_BLOCKS;
 /// Distinct buyers who must have reported before reports can say "stop".
@@ -158,6 +163,15 @@ impl Evidence {
         self.established_buyers >= STRONG_BUYERS
             && self.repeat_buyers >= STRONG_REPEAT
             && self.span_days >= STRONG_SPAN_DAYS
+            && !self.reports_bad()
+            && self.probes_mismatch == 0
+    }
+
+    /// A record strong enough for small payments (see `SMALL_BUYERS`).
+    pub fn strong_for_small(&self) -> bool {
+        self.established_buyers >= SMALL_BUYERS
+            && self.repeat_buyers >= SMALL_REPEAT
+            && self.span_days >= SMALL_SPAN_DAYS
             && !self.reports_bad()
             && self.probes_mismatch == 0
     }
