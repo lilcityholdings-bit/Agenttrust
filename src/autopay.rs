@@ -226,7 +226,7 @@ pub fn base_rpc_urls() -> Vec<String> {
     let mut urls: Vec<String> = config().base_rpc.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect();
     // Free public nodes. Each limits what one caller may ask for, so there are several: when
     // one starts refusing (base.org's 429s, publicnode's 403s on history), the next answers.
-    for backup in ["https://mainnet.base.org", "https://base-rpc.publicnode.com", "https://base.drpc.org"] {
+    for backup in ["https://mainnet.base.org", "https://base-rpc.publicnode.com", "https://base.drpc.org", "https://1rpc.io/base", "https://base.llamarpc.com"] {
         if !urls.iter().any(|u| u == backup) {
             urls.push(backup.to_string());
         }

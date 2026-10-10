@@ -43,23 +43,23 @@ pub struct Net {
 /// answers for a different chain id is refused, so a wrong entry can't mislabel bots.
 pub const NETS: &[Net] = &[
     Net { id: 8453, name: "base", label: "Base", rpcs: &[] },
-    Net { id: 1, name: "ethereum", label: "Ethereum", rpcs: &["https://ethereum-rpc.publicnode.com", "https://eth.llamarpc.com"] },
-    Net { id: 56, name: "bnb", label: "BNB Chain", rpcs: &["https://bsc-rpc.publicnode.com", "https://bsc-dataseed.bnbchain.org"] },
-    Net { id: 42161, name: "arbitrum", label: "Arbitrum", rpcs: &["https://arbitrum-one-rpc.publicnode.com", "https://arb1.arbitrum.io/rpc"] },
-    Net { id: 10, name: "optimism", label: "Optimism", rpcs: &["https://optimism-rpc.publicnode.com", "https://mainnet.optimism.io"] },
-    Net { id: 137, name: "polygon", label: "Polygon", rpcs: &["https://polygon-bor-rpc.publicnode.com", "https://polygon-rpc.com"] },
-    Net { id: 43114, name: "avalanche", label: "Avalanche", rpcs: &["https://avalanche-c-chain-rpc.publicnode.com", "https://api.avax.network/ext/bc/C/rpc"] },
-    Net { id: 100, name: "gnosis", label: "Gnosis", rpcs: &["https://gnosis-rpc.publicnode.com", "https://rpc.gnosischain.com"] },
-    Net { id: 42220, name: "celo", label: "Celo", rpcs: &["https://celo-rpc.publicnode.com", "https://forno.celo.org"] },
-    Net { id: 59144, name: "linea", label: "Linea", rpcs: &["https://linea-rpc.publicnode.com", "https://rpc.linea.build"] },
-    Net { id: 5000, name: "mantle", label: "Mantle", rpcs: &["https://mantle-rpc.publicnode.com", "https://rpc.mantle.xyz"] },
-    Net { id: 534352, name: "scroll", label: "Scroll", rpcs: &["https://scroll-rpc.publicnode.com", "https://rpc.scroll.io"] },
-    Net { id: 167000, name: "taiko", label: "Taiko", rpcs: &["https://taiko-rpc.publicnode.com", "https://rpc.mainnet.taiko.xyz"] },
-    Net { id: 1868, name: "soneium", label: "Soneium", rpcs: &["https://soneium-rpc.publicnode.com", "https://rpc.soneium.org"] },
-    Net { id: 2741, name: "abstract", label: "Abstract", rpcs: &["https://api.mainnet.abs.xyz"] },
-    Net { id: 143, name: "monad", label: "Monad", rpcs: &["https://rpc.monad.xyz"] },
-    Net { id: 196, name: "xlayer", label: "X Layer", rpcs: &["https://rpc.xlayer.tech"] },
-    Net { id: 1088, name: "metis", label: "Metis", rpcs: &["https://andromeda.metis.io/?owner=1088"] },
+    Net { id: 1, name: "ethereum", label: "Ethereum", rpcs: &["https://eth.drpc.org", "https://1rpc.io/eth", "https://eth.llamarpc.com", "https://ethereum-rpc.publicnode.com"] },
+    Net { id: 56, name: "bnb", label: "BNB Chain", rpcs: &["https://bsc.drpc.org", "https://1rpc.io/bnb", "https://bsc-rpc.publicnode.com", "https://bsc-dataseed.bnbchain.org"] },
+    Net { id: 42161, name: "arbitrum", label: "Arbitrum", rpcs: &["https://arb1.arbitrum.io/rpc", "https://arbitrum.drpc.org", "https://1rpc.io/arb", "https://arbitrum-one-rpc.publicnode.com"] },
+    Net { id: 10, name: "optimism", label: "Optimism", rpcs: &["https://mainnet.optimism.io", "https://optimism.drpc.org", "https://1rpc.io/op", "https://optimism-rpc.publicnode.com"] },
+    Net { id: 137, name: "polygon", label: "Polygon", rpcs: &["https://polygon.drpc.org", "https://1rpc.io/matic", "https://polygon.llamarpc.com", "https://polygon-bor-rpc.publicnode.com"] },
+    Net { id: 43114, name: "avalanche", label: "Avalanche", rpcs: &["https://api.avax.network/ext/bc/C/rpc", "https://avalanche.drpc.org", "https://1rpc.io/avax/c", "https://avalanche-c-chain-rpc.publicnode.com"] },
+    Net { id: 100, name: "gnosis", label: "Gnosis", rpcs: &["https://rpc.gnosischain.com", "https://gnosis.drpc.org", "https://1rpc.io/gnosis", "https://gnosis-rpc.publicnode.com"] },
+    Net { id: 42220, name: "celo", label: "Celo", rpcs: &["https://forno.celo.org", "https://celo.drpc.org", "https://1rpc.io/celo", "https://celo-rpc.publicnode.com"] },
+    Net { id: 59144, name: "linea", label: "Linea", rpcs: &["https://rpc.linea.build", "https://linea.drpc.org", "https://1rpc.io/linea", "https://linea-rpc.publicnode.com"] },
+    Net { id: 5000, name: "mantle", label: "Mantle", rpcs: &["https://rpc.mantle.xyz", "https://mantle.drpc.org", "https://1rpc.io/mantle", "https://mantle-rpc.publicnode.com"] },
+    Net { id: 534352, name: "scroll", label: "Scroll", rpcs: &["https://rpc.scroll.io", "https://scroll.drpc.org", "https://1rpc.io/scroll", "https://scroll-rpc.publicnode.com"] },
+    Net { id: 167000, name: "taiko", label: "Taiko", rpcs: &["https://rpc.mainnet.taiko.xyz", "https://taiko.drpc.org", "https://taiko-rpc.publicnode.com"] },
+    Net { id: 1868, name: "soneium", label: "Soneium", rpcs: &["https://rpc.soneium.org", "https://soneium.drpc.org", "https://soneium-rpc.publicnode.com"] },
+    Net { id: 2741, name: "abstract", label: "Abstract", rpcs: &["https://api.mainnet.abs.xyz", "https://abstract.drpc.org"] },
+    Net { id: 143, name: "monad", label: "Monad", rpcs: &["https://rpc.monad.xyz", "https://monad-mainnet.drpc.org"] },
+    Net { id: 196, name: "xlayer", label: "X Layer", rpcs: &["https://rpc.xlayer.tech", "https://xlayer.drpc.org"] },
+    Net { id: 1088, name: "metis", label: "Metis", rpcs: &["https://andromeda.metis.io/?owner=1088", "https://metis.drpc.org"] },
 ];
 
 pub fn net(id: u64) -> Option<&'static Net> {
@@ -1308,18 +1308,20 @@ pub fn start(dir: PathBuf, base_rpc_urls: Vec<String>) {
     }
 }
 
-/// A block's time, in ms, from a node.
-fn block_time_ms(urls: &[String], preferred: &mut usize, block: u64) -> Result<i64, String> {
+/// A block's time, in ms, from a node; `None` when the node no longer keeps that block (old
+/// blocks on pruned nodes, or a chain's history from before an upgrade).
+fn block_time_ms(urls: &[String], preferred: &mut usize, block: u64) -> Result<Option<i64>, String> {
     let b = rpc_any(urls, preferred, "eth_getBlockByNumber", Json::Array(vec![Json::str(format!("0x{block:x}")), Json::Bool(false)]))?;
-    b.get("timestamp").and_then(|v| v.as_str()).and_then(hex_u64).map(|t| t as i64 * 1000).ok_or_else(|| "block without a timestamp".into())
+    Ok(b.get("timestamp").and_then(|v| v.as_str()).and_then(hex_u64).map(|t| t as i64 * 1000))
 }
 
-/// The first block made at or after `secs`, by halving the range between 0 and `head`.
+/// The first block made at or after `secs`, by halving the range between 0 and `head`. A block
+/// the node no longer keeps is old, so it counts as before.
 fn first_block_after(urls: &[String], preferred: &mut usize, head: u64, secs: i64) -> Result<u64, String> {
     let (mut lo, mut hi) = (0u64, head);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if block_time_ms(urls, preferred, mid)? < secs * 1000 {
+        if block_time_ms(urls, preferred, mid)?.map_or(true, |t| t < secs * 1000) {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -1346,13 +1348,13 @@ fn prepare_chain(m: &'static Mutex<Index>, urls: &[String], preferred: &mut usiz
             if cursor == 0 {
                 let head = rpc_any(urls, preferred, "eth_blockNumber", Json::Array(vec![]))?.as_str().and_then(hex_u64).ok_or("bad block number")?;
                 let first = first_block_after(urls, preferred, head, FIRST_DEPLOY_SECS)?;
-                let t = block_time_ms(urls, preferred, first)?;
+                let t = block_time_ms(urls, preferred, first)?.ok_or("the node doesn't keep the starting block")?;
                 let mut idx = lock_of(m);
                 idx.cursor = first.saturating_sub(1);
                 idx.anchor = (first, t);
                 idx.dirty = true;
             } else if anchor.1 == 0 {
-                let t = block_time_ms(urls, preferred, cursor)?;
+                let t = block_time_ms(urls, preferred, cursor)?.ok_or("the node doesn't keep the starting block")?;
                 lock_of(m).anchor = (cursor, t);
             }
             Ok(())

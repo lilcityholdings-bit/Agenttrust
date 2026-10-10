@@ -827,7 +827,12 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
 fn catalog_urls() -> Vec<String> {
     match std::env::var("CATALOG_URLS") {
         Ok(v) if !v.trim().is_empty() => v.split(',').map(|u| u.trim().to_string()).filter(|u| u.starts_with("https://")).collect(),
-        _ => vec!["https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources".into()],
+        // Every free public list of x402 services named in the x402 project's own code.
+        _ => vec![
+            "https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources".into(),
+            "https://x402.org/facilitator/discovery/resources".into(),
+            "https://facilitator.payai.network/discovery/resources".into(),
+        ],
     }
 }
 

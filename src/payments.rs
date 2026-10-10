@@ -42,7 +42,7 @@ const MAX_WATCHED: usize = 60_000;
 /// Buyers remembered per seller; past this a seller's payments are still counted, not itemized.
 const MAX_PAYERS_PER_SELLER: usize = 20_000;
 /// Catalogued services kept.
-const MAX_SERVICES: usize = 50_000;
+const MAX_SERVICES: usize = 150_000;
 const PROBE_EVERY_MS: i64 = 24 * 3_600_000;
 const PROBERS: usize = 4;
 const CATALOG_EVERY: Duration = Duration::from_secs(6 * 3_600);
@@ -1724,6 +1724,7 @@ fn read_catalog(urls: &[String]) {
         if due {
             let mut total = 0;
             for base in urls {
+                let before = total;
                 let mut offset = 0;
                 // At most 500 pages of 100 per source.
                 for _ in 0..500 {
@@ -1755,6 +1756,7 @@ fn read_catalog(urls: &[String]) {
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
+                println!("keptvow: service catalog {base}: {} listings", total - before);
             }
             let mut l = lock();
             l.catalog_at_ms = now_ms();
