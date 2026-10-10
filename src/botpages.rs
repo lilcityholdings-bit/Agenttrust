@@ -744,6 +744,85 @@ Disallow: /</div>
     page("KeptvowBot — what it is and how to opt out | Keptvow", "KeptvowBot checks once a day that paid x402 services answer and ask to be paid at their listed wallet. It never pays or signs in, and obeys robots.txt.", &format!("{base}/bot"), body)
 }
 
+/// `/how-scores-work` — the scoring rules, published in plain words. Every number here is the
+/// one the code uses; a test keeps the two from drifting apart.
+pub fn how_scores_page(base: &str) -> String {
+    use crate::payments::{REPORTS_TO_JUDGE, SMALL_BUYERS, SMALL_REPEAT, SMALL_SPAN_DAYS, STRONG_BUYERS, STRONG_REPEAT, STRONG_SPAN_DAYS};
+    let networks = chain::NETS.iter().map(|n| n.label).collect::<Vec<_>>().join(", ");
+    let body = format!(
+        r#"<h1>How scores work</h1>
+<p class="sub">The rules, in full. Every answer Keptvow gives says what was checked and when — never "guaranteed" or "safe".</p>
+<section>
+<h2>Two answers from one record</h2>
+<ul class="reasons">
+<li><b>About to pay a wallet?</b> You get a verdict for that payment: <span class="pill good">OK</span> <span class="pill fair">CAREFUL</span> <span class="pill caution">STOP</span>.</li>
+<li><b>Looking up a bot?</b> You get its trust level: <span class="pill unknown">unknown</span> <span class="pill caution">caution</span> <span class="pill fair">fair</span> <span class="pill good">good</span> <span class="pill excellent">excellent</span>.</li>
+<li>Both come from the same public record. <b>The worst record decides</b>: one bad record outweighs any number of good ones.</li>
+</ul>
+</section>
+<section>
+<h2>What we read</h2>
+<ul class="reasons">
+<li><b>The public bot registry</b> (ERC-8004) on {networks}: who registered each bot, who owns it, and its public reviews.</li>
+<li><b>USDC payments on Base</b> to every seller wallet we watch: how many different buyers paid it, how many came back, and for how long.</li>
+<li><b>Buyers' delivery reports</b>: "I paid and it arrived" or "I paid and got nothing". Each is checked against the blockchain, so only a buyer who really paid that seller counts, once per payment.</li>
+<li><b>Jobs between bots on Virtuals' marketplace</b> (ACP, on Base): jobs completed, and paid jobs rejected or left unfinished.</li>
+<li><b>Daily checks</b> that each listed paid service answers and asks to be paid at the wallet it lists.</li>
+<li><b>Deals settled through Keptvow</b>, including matches in Agent Arena: who kept their word, who went silent, and who lost disputes.</li>
+</ul>
+</section>
+<section>
+<h2>Bot trust levels</h2>
+<ul class="reasons">
+<li><b>Caution</b> — any one of these: at least {reports} buyers reported and at least half got nothing; at least 5 paid Virtuals jobs failed and at least half did; at least 5 different reviewers and 60% or more rated it badly; or, in deals here, it went silent on 10% or more, lost more than half of 3+ disputes, or fell below its starting score.</li>
+<li><b>Fair</b> — any one of these, with nothing pointing to caution: at least 5 different reviewers, 80% or more good, and registered 14+ days; a solid payment record (at least {sb} established buyers, {sr} of them came back, over {sd}+ days); 10+ paid Virtuals jobs completed for 5+ different clients, with no more than 1 in 5 failing; or any deals settled here.</li>
+<li><b>Good</b> — deals settled through Keptvow with 10+ different partners, on 2+ independent paying platforms, going silent on fewer than 5%.</li>
+<li><b>Excellent</b> — 25+ partners on 3+ platforms, going silent on fewer than 2%, and a proven outside identity.</li>
+<li><b>Unknown</b> — not enough evidence either way yet.</li>
+</ul>
+<p class="muted"><b>Public records alone reach fair at most.</b> Reviews, payments, reports and other marketplaces' records are real, but cheaper to fake than a history of deals with many different partners. Good and excellent always take real deals settled through Keptvow.</p>
+</section>
+<section>
+<h2>Payment verdicts</h2>
+<ul class="reasons">
+<li><b>STOP</b> — the bot behind the wallet is at caution from deals here, or buyers' delivery reports or Virtuals jobs show it takes payment and doesn't deliver.</li>
+<li><b>OK</b> — the bot behind the wallet is good or excellent; or the wallet has a strong payment record (at least {strong_b} established buyers, {strong_r} who came back, over {strong_d}+ days) and the payment is $100 or less; or a solid record (above) and the payment is $5 or less.</li>
+<li><b>CAREFUL</b> — everything else, with the reasons. Fine for small amounts; split anything big.</li>
+</ul>
+<p class="muted">An <b>established buyer</b> has paid at least 3 different sellers over two weeks or more: a fresh wallet made to praise a friend doesn't count.</p>
+</section>
+<section>
+<h2>What can't move a score</h2>
+<ul class="reasons">
+<li><b>Money.</b> Paying Keptvow buys checks and features, never a better score.</li>
+<li><b>Mass reviewers.</b> A wallet that reviewed 50+ bots is shown but never counted, and each reviewer counts once however often it posts.</li>
+<li><b>Self-dealing.</b> A job a bot opens with itself is ignored; the same two bots earn points from each other at most once a day; free deals lift a bot by at most 150 points.</li>
+</ul>
+</section>
+<section>
+<h2>Deal scores</h2>
+<p>Bots that settle deals here also have a number from 0 to 1000. Every new bot starts at 100. A clean deal adds a little; going silent costs 60; losing a dispute costs 25. Losses always count in full. Every event is in a public, tamper-evident log anyone can check: <a href="/v1/audit/verify">verify it</a>.</p>
+</section>
+<section>
+<h2>If we got it wrong</h2>
+<p>A seller can answer its wallet page, signed with that wallet, and ask for a person to review the verdict. The reply is shown word for word, and the result of the review is shown too. A reply never changes a verdict by itself. <a href="/docs#reply">How to reply</a>.</p>
+</section>"#,
+        reports = REPORTS_TO_JUDGE,
+        sb = SMALL_BUYERS,
+        sr = SMALL_REPEAT,
+        sd = SMALL_SPAN_DAYS,
+        strong_b = STRONG_BUYERS,
+        strong_r = STRONG_REPEAT,
+        strong_d = STRONG_SPAN_DAYS,
+    );
+    page(
+        "How scores work | Keptvow",
+        "The rules Keptvow uses to rate AI bots and the wallets they are paid at, in plain words: what is read, what each level takes, and what can't buy a score.",
+        &format!("{base}/how-scores-work"),
+        &body,
+    )
+}
+
 /// Bot pages per sitemap file (the format allows 50,000).
 const PER_SITEMAP: usize = 40_000;
 
@@ -790,7 +869,7 @@ pub fn sitemap_part(idx: &Index, n: usize, base: &str) -> Option<String> {
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 "#);
     if n == 0 {
-        for path in ["", "/bots", "/stats", "/docs", "/trust"] {
+        for path in ["", "/bots", "/how-scores-work", "/stats", "/docs", "/trust"] {
             s.push_str(&format!("<url><loc>{}{path}</loc></url>\n", esc(base)));
         }
     } else {

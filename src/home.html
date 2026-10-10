@@ -73,12 +73,31 @@
   .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 750; font-size: .78rem; letter-spacing: .04em; }
   .pill.ok { background: var(--ok-bg); color: var(--ok); }
   .plans { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
-  .plan { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 18px; }
+  .plan { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 20px; display: flex; flex-direction: column; box-shadow: var(--shadow); }
   .plan.featured { border: 2px solid var(--accent); }
-  .price { font-size: 1.8rem; font-weight: 800; letter-spacing: -.01em; }
+  .plan .head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .plan .badge { font-size: .72rem; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; padding: 3px 9px; border-radius: 999px; background: var(--soft); color: var(--accent); }
+  .plan .badge.live { background: var(--ok-bg); color: var(--ok); }
+  .plan .for { color: var(--muted); font-size: .9rem; margin: 2px 0 8px; }
+  .plan ul.plain { flex: 1; }
+  .plan .btn { margin-top: 16px; text-align: center; width: 100%; }
+  .price { font-size: 1.9rem; font-weight: 800; letter-spacing: -.01em; margin-top: 6px; }
   .price small { font-size: .95rem; color: var(--muted); font-weight: 400; }
-  ul.plain { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: .93rem; }
-  ul.plain li { margin: 3px 0; }
+  ul.plain { margin: 10px 0 0; padding: 0; list-style: none; color: var(--muted); font-size: .93rem; }
+  ul.plain li { margin: 6px 0; padding-left: 24px; position: relative; }
+  ul.plain li::before { content: ""; position: absolute; left: 2px; top: .45em; width: 12px; height: 7px; border-left: 2px solid var(--ok); border-bottom: 2px solid var(--ok); transform: rotate(-45deg); }
+  .scales { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
+  .scale { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 16px 18px; }
+  .scale h3 { margin: 0 0 4px; font-size: 1rem; }
+  .scale p { margin: 0 0 10px; color: var(--muted); font-size: .92rem; }
+  .ladder { display: flex; flex-wrap: wrap; gap: 6px; }
+  .ladder span { font-size: .78rem; font-weight: 750; letter-spacing: .03em; padding: 3px 10px; border-radius: 999px; background: var(--soft); color: var(--muted); }
+  .ladder .ok { background: var(--ok-bg); color: var(--ok); }
+  .ladder .careful { background: var(--careful-bg); color: var(--careful); }
+  .ladder .stop { background: var(--stop-bg); color: var(--stop); }
+  .promises { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px; }
+  .promise { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; font-size: .9rem; color: var(--muted); }
+  .promise b { display: block; color: var(--ink); font-size: .95rem; margin-bottom: 2px; }
   .signup { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 18px; margin-top: 14px; }
   .signup .row { display: flex; gap: 8px; flex-wrap: wrap; }
   .signup input, .signup select { font: inherit; padding: 11px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
@@ -92,7 +111,7 @@
   [hidden] { display: none !important; }
   @media (max-width: 760px) {
     .stats { grid-template-columns: repeat(2, 1fr); }
-    .verdicts, .cards, .plans { grid-template-columns: 1fr; }
+    .verdicts, .cards, .plans, .scales, .promises { grid-template-columns: 1fr; }
     nav.top .hide-sm { display: none; }
     .hero { padding-top: 24px; }
   }
@@ -135,7 +154,19 @@
       <div class="verdict careful"><span class="tag">CAREFUL</span><p>Not enough evidence that is hard to fake. Fine for small amounts; split anything big.</p></div>
       <div class="verdict stop"><span class="tag">STOP</span><p>Buyers paid and got nothing, or it broke deals here. Don't send money.</p></div>
     </div>
-    <p class="muted" style="margin-top:12px"><b>Two scales, one record.</b> About to pay a wallet? You get <b>OK</b>, <b>CAREFUL</b> or <b>STOP</b>. Looking up a bot? You get its trust level: <b>unknown</b>, <b>caution</b>, <b>fair</b>, <b>good</b> or <b>excellent</b>. Both come from the same public record; public records alone reach <b>fair</b> at most, and <b>good</b> and <b>excellent</b> take real deals settled through Keptvow.</p>
+    <div class="scales">
+      <div class="scale">
+        <h3>About to pay a wallet?</h3>
+        <p>You get a verdict for this payment.</p>
+        <div class="ladder"><span class="ok">OK</span><span class="careful">CAREFUL</span><span class="stop">STOP</span></div>
+      </div>
+      <div class="scale">
+        <h3>Looking up a bot?</h3>
+        <p>You get its trust level, from its whole record.</p>
+        <div class="ladder"><span>unknown</span><span class="stop">caution</span><span class="careful">fair</span><span class="ok">good</span><span class="ok">excellent</span></div>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:12px">Two scales, one record. Public records alone reach <b>fair</b> at most; <b>good</b> and <b>excellent</b> take real deals settled through Keptvow. <a href="/how-scores-work">How scores work</a>.</p>
   </section>
 
   {{leaders}}
@@ -181,23 +212,32 @@ await pay("https://seller.example/api"); // refuses to pay a "stop" wallet</pre>
     <p class="lead">Paid plans open soon. Free checks work now, with no sign-up. Paying never buys a better score.</p>
     <div class="plans">
       <div class="plan">
-        <b>Free</b>
+        <div class="head"><b>Free</b><span class="badge live">Live now</span></div>
         <div class="price">$0</div>
+        <p class="for">For any bot, any person.</p>
         <ul class="plain"><li>1,000 checks a day</li><li>Every bot and wallet page</li><li>Claim your bot</li></ul>
+        <a class="btn ghost" href="/docs">Start free</a>
       </div>
       <div class="plan featured">
-        <b>Watch</b>
+        <div class="head"><b>Watch</b><span class="badge">Coming soon</span></div>
         <div class="price"><span id="price-watch">$99</span> <small>/ month</small></div>
+        <p class="for">For bot builders and small businesses.</p>
         <ul class="plain"><li><span id="checks-watch">100,000</span> checks a month</li><li>Alerts when a bot or wallet turns bad</li><li>Your deals count toward your bots' scores</li></ul>
+        <a class="btn" href="#waitlist" data-plan="watch">Join the waitlist</a>
       </div>
       <div class="plan">
-        <b>Platform</b>
+        <div class="head"><b>Platform</b><span class="badge">Coming soon</span></div>
         <div class="price"><span id="price-platform">$499</span> <small>/ month</small></div>
+        <p class="for">For marketplaces, wallets and payment companies.</p>
         <ul class="plain"><li><span id="checks-platform">1,000,000</span> checks a month</li><li>Scores inside your own product</li><li>Everything in Watch</li></ul>
+        <a class="btn ghost" href="#waitlist" data-plan="platform">Join the waitlist</a>
       </div>
     </div>
-    <p class="muted" style="margin-top:12px">Or pay as you go: $0.001 per check, prepaid in USDC, no monthly fee, and credit never expires (<a href="/llms.txt">how</a>).</p>
-    <p class="muted"><b>Never overcharged:</b> each seller costs at most one check a day per key, reporting what you got makes that seller's checks free, and you never pay more than the next plan up would have cost. <a href="/docs#signed">Every answer is signed</a>.</p>
+    <div class="promises">
+      <div class="promise"><b>Pay as you go</b>$0.001 a check, prepaid. No monthly fee, and credit never expires.</div>
+      <div class="promise"><b>Never overcharged</b>One charge per seller per day, and never more than the next plan up.</div>
+      <div class="promise"><b>Signed answers</b>Every verdict is signed, so anyone can prove it came from us. <a href="/docs#signed">How</a></div>
+    </div>
     <form class="signup" id="waitlist">
       <b>Join the waitlist</b>
       <p class="muted" style="margin:6px 0 0">We'll email you once, when paid plans open. Nothing else.</p>
@@ -214,7 +254,7 @@ await pay("https://seller.example/api"); // refuses to pay a "stop" wallet</pre>
   {{about}}
 
   <footer>
-    <a href="/bots">All bots</a><a href="{{arena}}">Agent Arena</a><a href="/stats">Numbers</a><a href="/docs">Docs</a><a href="/llms.txt">For AI agents</a><a href="/openapi.json">OpenAPI</a><a href="/v1/audit/verify">Public record</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a>
+    <a href="/bots">All bots</a><a href="{{arena}}">Agent Arena</a><a href="/how-scores-work">How scores work</a><a href="/stats">Numbers</a><a href="/docs">Docs</a><a href="/llms.txt">For AI agents</a><a href="/openapi.json">OpenAPI</a><a href="/v1/audit/verify">Public record</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a>
   </footer>
 </div>
 <script>
@@ -249,6 +289,13 @@ await pay("https://seller.example/api"); // refuses to pay a "stop" wallet</pre>
     });
   }).catch(function () {});
 
+  // A plan's button goes to the waitlist with that plan already chosen.
+  document.querySelectorAll("[data-plan]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      $("wplan").value = b.getAttribute("data-plan");
+      setTimeout(function () { $("wemail").focus(); }, 300);
+    });
+  });
   $("waitlist").addEventListener("submit", function (e) {
     e.preventDefault();
     var out = $("waitlist-result");

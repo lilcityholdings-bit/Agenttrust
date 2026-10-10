@@ -374,6 +374,7 @@ fn is_unmetered(method: &str, segments: &[&str]) -> bool {
             | ("GET", ["stats"])
             | ("GET", ["go"])
             | ("GET", ["bot"])
+            | ("GET", ["how-scores-work"])
             | ("GET", ["v1", "pricing"])
             | ("GET", ["billing", "done"])
             | ("POST", ["mcp"])
@@ -1448,6 +1449,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         }
         ("GET", ["go"]) => return go_to(req.q("q").unwrap_or("")),
         ("GET", ["bot"]) => return Response::html(botpages::bot_info_page(&base_url(&req))),
+        ("GET", ["how-scores-work"]) => return Response::html(botpages::how_scores_page(&base_url(&req))),
         ("GET", ["sitemaps", file]) => {
             // `N.xml` is Base (and N = 0 the site's own pages); `<chain>-N.xml` another chain.
             let Some(stem) = file.strip_suffix(".xml") else { return err(404, "no such sitemap") };
@@ -4166,6 +4168,12 @@ mod settlement_tests {
         assert!(html.contains("Join the waitlist") && !html.contains("Get your API key"));
         assert!(html.contains("1,000 checks a day") && html.contains("Two scales, one record") && html.contains(">Arena</a>"));
         assert!(!html.contains("{{"), "a placeholder was left unfilled");
+        assert!(html.matches("data-plan=").count() == 2 && html.contains(r#"href="/docs">Start free"#), "every plan has a button");
+        let mut how = req("GET", "/how-scores-work", "", "");
+        how.headers.insert("accept".into(), "text/html".into());
+        let how = route(&e, how, PROD);
+        assert_eq!(how.status, 200);
+        assert!(how.body.contains("Public records alone reach fair at most") && how.body.contains(&format!("at least {} established buyers", payments::STRONG_BUYERS)));
         assert_eq!(route(&e, req("POST", "/v1/waitlist", "", r#"{"email":"not an email"}"#), PROD).status, 400);
         let r = route(&e, req("POST", "/v1/waitlist", "", r#"{"email":"Ann@Example.com","company":"Acme","plan":"watch"}"#), PROD);
         assert_eq!(r.status, 201, "{}", r.body);
