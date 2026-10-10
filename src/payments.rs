@@ -1050,7 +1050,10 @@ fn shrink_chunk() {
 
 /// Queries answered in a row since the wallets-per-query last changed.
 static CHUNK_STREAK: AtomicUsize = AtomicUsize::new(0);
-const MAX_CHUNK: usize = 200;
+/// Base's public node answers a query naming 1,000 wallets as readily as one naming 50, so the
+/// live scan names up to 1,000: five times fewer queries a minute than at 200, which leaves more
+/// of each node's allowance for reading history.
+const MAX_CHUNK: usize = 1_000;
 
 /// Notes a query that worked. After a run of them the number of wallets per query creeps back
 /// up (by a quarter), so one bad moment doesn't leave it small for good.

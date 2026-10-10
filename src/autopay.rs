@@ -224,7 +224,9 @@ pub fn stripe_add_overage(cfg: &PayConfig, stripe_customer: &str, cents: i64) ->
 /// backup, so one node going down doesn't stop payments or registry reading.
 pub fn base_rpc_urls() -> Vec<String> {
     let mut urls: Vec<String> = config().base_rpc.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect();
-    for backup in ["https://mainnet.base.org", "https://base-rpc.publicnode.com"] {
+    // Free public nodes. Each limits what one caller may ask for, so there are several: when
+    // one starts refusing (base.org's 429s, publicnode's 403s on history), the next answers.
+    for backup in ["https://mainnet.base.org", "https://base-rpc.publicnode.com", "https://base.drpc.org"] {
         if !urls.iter().any(|u| u == backup) {
             urls.push(backup.to_string());
         }
