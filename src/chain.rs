@@ -1,9 +1,10 @@
 //! Every bot in the public registry, rated from day one.
 //!
 //! ERC-8004 gives an AI agent an on-chain id (an NFT in the Identity Registry) and lets anyone
-//! leave it a review (the Reputation Registry). Keptvow reads both on Base, so every registered
-//! bot gets a score page without signing up — the way a credit bureau covers everyone, not just
-//! its customers.
+//! leave it a review (the Reputation Registry). The registries sit at the same addresses on
+//! many blockchains; Keptvow reads both on every one in `NETS`, through free public nodes, so
+//! every registered bot gets a score page without signing up — the way a credit bureau covers
+//! everyone, not just its customers. Each blockchain has its own index, saved to its own file.
 //!
 //! Those reviews are cheap to fake (a fresh wallet costs nothing), so here they count for little:
 //! one vote per reviewing wallet, and at most enough to reach `fair`. `good` and `excellent`
@@ -22,10 +23,56 @@ use std::time::{Duration, Instant};
 use crate::json::{self, Json};
 use crate::verify;
 
+/// Base, where Keptvow started and where the payment history is read.
 pub const CHAIN_ID: u64 = 8453;
 pub const CHAIN_NAME: &str = "base";
 pub const IDENTITY: &str = verify::ERC8004_REGISTRY;
 pub const REPUTATION: &str = "0x8004baa17c55a88189ae136b182e5fda19de9b63";
+
+/// A blockchain the registry is read on.
+pub struct Net {
+    pub id: u64,
+    /// In page addresses: /bots/<name>/<number>.
+    pub name: &'static str,
+    pub label: &'static str,
+    /// Free public nodes, tried in turn. Base's come from the environment (`BASE_RPC_URL`).
+    pub rpcs: &'static [&'static str],
+}
+
+/// Every mainnet the official registry lists, that a free public node serves. A node that
+/// answers for a different chain id is refused, so a wrong entry can't mislabel bots.
+pub const NETS: &[Net] = &[
+    Net { id: 8453, name: "base", label: "Base", rpcs: &[] },
+    Net { id: 1, name: "ethereum", label: "Ethereum", rpcs: &["https://ethereum-rpc.publicnode.com", "https://eth.llamarpc.com"] },
+    Net { id: 56, name: "bnb", label: "BNB Chain", rpcs: &["https://bsc-rpc.publicnode.com", "https://bsc-dataseed.bnbchain.org"] },
+    Net { id: 42161, name: "arbitrum", label: "Arbitrum", rpcs: &["https://arbitrum-one-rpc.publicnode.com", "https://arb1.arbitrum.io/rpc"] },
+    Net { id: 10, name: "optimism", label: "Optimism", rpcs: &["https://optimism-rpc.publicnode.com", "https://mainnet.optimism.io"] },
+    Net { id: 137, name: "polygon", label: "Polygon", rpcs: &["https://polygon-bor-rpc.publicnode.com", "https://polygon-rpc.com"] },
+    Net { id: 43114, name: "avalanche", label: "Avalanche", rpcs: &["https://avalanche-c-chain-rpc.publicnode.com", "https://api.avax.network/ext/bc/C/rpc"] },
+    Net { id: 100, name: "gnosis", label: "Gnosis", rpcs: &["https://gnosis-rpc.publicnode.com", "https://rpc.gnosischain.com"] },
+    Net { id: 42220, name: "celo", label: "Celo", rpcs: &["https://celo-rpc.publicnode.com", "https://forno.celo.org"] },
+    Net { id: 59144, name: "linea", label: "Linea", rpcs: &["https://linea-rpc.publicnode.com", "https://rpc.linea.build"] },
+    Net { id: 5000, name: "mantle", label: "Mantle", rpcs: &["https://mantle-rpc.publicnode.com", "https://rpc.mantle.xyz"] },
+    Net { id: 534352, name: "scroll", label: "Scroll", rpcs: &["https://scroll-rpc.publicnode.com", "https://rpc.scroll.io"] },
+    Net { id: 167000, name: "taiko", label: "Taiko", rpcs: &["https://taiko-rpc.publicnode.com", "https://rpc.mainnet.taiko.xyz"] },
+    Net { id: 1868, name: "soneium", label: "Soneium", rpcs: &["https://soneium-rpc.publicnode.com", "https://rpc.soneium.org"] },
+    Net { id: 2741, name: "abstract", label: "Abstract", rpcs: &["https://api.mainnet.abs.xyz"] },
+    Net { id: 143, name: "monad", label: "Monad", rpcs: &["https://rpc.monad.xyz"] },
+    Net { id: 196, name: "xlayer", label: "X Layer", rpcs: &["https://rpc.xlayer.tech"] },
+    Net { id: 1088, name: "metis", label: "Metis", rpcs: &["https://andromeda.metis.io/?owner=1088"] },
+];
+
+pub fn net(id: u64) -> Option<&'static Net> {
+    NETS.iter().find(|n| n.id == id)
+}
+
+pub fn net_named(name: &str) -> Option<&'static Net> {
+    NETS.iter().find(|n| n.name.eq_ignore_ascii_case(name))
+}
+
+/// 2026-01-15, before the registry was deployed on any mainnet: where reading starts on a
+/// chain read for the first time.
+const FIRST_DEPLOY_SECS: i64 = 1_768_435_200;
 
 /// Late November 2025 on Base — before either registry was deployed there. Override with
 /// `ERC8004_START_BLOCK` to rescan from elsewhere.
@@ -92,6 +139,13 @@ pub struct Reviews {
 
 #[derive(Default)]
 pub struct Index {
+    /// Which blockchain this index reads (0 means Base, for indexes saved before there were
+    /// several).
+    pub chain_id: u64,
+    /// One block's time, and the head's, so a block number can be turned into a date on chains
+    /// whose block times vary (see `block_ms`).
+    pub anchor: (u64, i64),
+    pub head_ms: i64,
     /// Every block up to and including this one has been applied.
     pub cursor: u64,
     /// The newest block known to be safe to read.
@@ -110,6 +164,8 @@ pub struct Index {
     ranked: Option<Ranking>,
     rank_stale: bool,
     dirty: bool,
+    /// When this chain's status line was last logged.
+    last_logged: Option<Instant>,
 }
 
 /// Every bot in directory order, with what a search matches on, so a search walks a ready list
@@ -375,7 +431,16 @@ impl Index {
     }
 
     pub fn age_days(&self, a: &Agent) -> u64 {
-        self.head.saturating_sub(a.block) * BLOCK_SECONDS / 86_400
+        (self.block_ms(self.head) - self.block_ms(a.block)).max(0) as u64 / 86_400_000
+    }
+
+    pub fn net(&self) -> &'static Net {
+        net(if self.chain_id == 0 { CHAIN_ID } else { self.chain_id }).unwrap_or(&NETS[0])
+    }
+
+    /// An index for `chain_id`, starting before `block`.
+    pub fn for_chain(chain_id: u64, block: u64) -> Index {
+        Index { chain_id, cursor: block, ..Index::default() }
     }
 
     /// The trust level public reviews alone can support, and why.
@@ -457,7 +522,7 @@ impl Index {
         let r = self.reviews(a);
         let opt = |s: &str| if s.is_empty() { Json::Null } else { Json::str(s) };
         Some(Json::obj(vec![
-            ("agent_id", Json::str(format!("erc8004:{CHAIN_ID}:{id}"))),
+            ("agent_id", Json::str(format!("erc8004:{}:{id}", self.net().id))),
             ("name", Json::str(Index::display_name(id, a))),
             ("description", opt(&a.description)),
             ("self_described", Json::str("The name, description and services are written by the bot's owner and are not checked.")),
@@ -468,10 +533,10 @@ impl Index {
                 "registry",
                 Json::obj(vec![
                     ("standard", Json::str("ERC-8004")),
-                    ("chain", Json::str(CHAIN_NAME)),
-                    ("chain_id", Json::num(CHAIN_ID as f64)),
+                    ("chain", Json::str(self.net().name)),
+                    ("chain_id", Json::num(self.net().id as f64)),
                     ("agent_number", Json::num(id as f64)),
-                    ("identity", Json::str(format!("eip155:{CHAIN_ID}:{IDENTITY}:{id}"))),
+                    ("identity", Json::str(format!("eip155:{}:{IDENTITY}:{id}", self.net().id))),
                     ("owner", opt(&a.owner)),
                     ("payment_wallet", opt(&a.wallet)),
                     ("registered_days_ago", Json::num(self.age_days(a) as f64)),
@@ -497,8 +562,8 @@ impl Index {
                         .collect(),
                 ),
             ),
-            ("profile_page", Json::str(format!("/bots/{CHAIN_NAME}/{id}"))),
-            ("badge", Json::str(format!("/v1/trust/erc8004:{CHAIN_ID}:{id}/badge.svg"))),
+            ("profile_page", Json::str(format!("/bots/{}/{id}", self.net().name))),
+            ("badge", Json::str(format!("/v1/trust/erc8004:{}:{id}/badge.svg", self.net().id))),
         ]))
     }
 
@@ -622,15 +687,30 @@ impl Index {
 
     // ---- the "State of AI bots" numbers ------------------------------------------------------
 
-    /// When a Base block was made, in ms.
-    pub fn block_ms(block: u64) -> i64 {
+    /// When a Base block was made, in ms: Base makes one every two seconds, exactly.
+    pub fn base_block_ms(block: u64) -> i64 {
         const BASE_GENESIS_SECS: i64 = 1_686_789_347;
         (BASE_GENESIS_SECS + block as i64 * BLOCK_SECONDS as i64) * 1000
     }
 
-    /// The date (UTC, "YYYY-MM-DD") a Base block was made.
-    pub fn block_day(block: u64) -> String {
-        crate::metrics::day_of(Index::block_ms(block))
+    /// When a block on this index's chain was made, in ms. Exact on Base; elsewhere block
+    /// times vary, so it is read off the line between a block whose time was looked up (the
+    /// first one read) and the head as last seen — close enough for ages in days.
+    pub fn block_ms(&self, block: u64) -> i64 {
+        if self.net().id == CHAIN_ID {
+            return Index::base_block_ms(block);
+        }
+        let (b0, t0) = self.anchor;
+        if t0 == 0 || self.head_ms == 0 || self.head <= b0 {
+            return if t0 == 0 { now_ms() } else { t0 };
+        }
+        let per_block = (self.head_ms - t0) as f64 / (self.head - b0) as f64;
+        t0 + ((block as f64 - b0 as f64) * per_block) as i64
+    }
+
+    /// The date (UTC, "YYYY-MM-DD") a block on this chain was made.
+    pub fn block_day(&self, block: u64) -> String {
+        crate::metrics::day_of(self.block_ms(block))
     }
 
     /// What the whole registry looks like: growth, bursts, who owns how many bots, how many
@@ -647,7 +727,7 @@ impl Index {
         let (mut named, mut unreadable, mut no_file, mut pending, mut x402, mut with_services, mut own_wallet) = (0, 0, 0, 0, 0, 0, 0);
         let (mut reviewed, mut reviews, mut ratings, mut fair, mut caution) = (0, 0, 0, 0, 0);
         for a in self.agents.values() {
-            let day = Index::block_day(a.block);
+            let day = self.block_day(a.block);
             *by_month.entry(day[..7].to_string()).or_default() += 1;
             *by_day.entry(day).or_default() += 1;
             *owners.entry(a.owner.as_str()).or_default() += 1;
@@ -702,7 +782,7 @@ impl Index {
             .count();
         Json::obj(vec![
             ("as_of_block", Json::num(self.cursor as f64)),
-            ("as_of_day", Json::str(Index::block_day(self.cursor))),
+            ("as_of_day", Json::str(self.block_day(self.cursor))),
             ("bots", n(total)),
             ("registered_by_month", Json::Object(by_month.into_iter().map(|(k, v)| (k, Json::num(v as f64))).collect())),
             (
@@ -862,9 +942,12 @@ impl Index {
     fn header_json(&self) -> Json {
         Json::obj(vec![
             ("version", Json::num(2.0)),
-            ("chain_id", Json::num(CHAIN_ID as f64)),
+            ("chain_id", Json::num(self.net().id as f64)),
             ("cursor", Json::num(self.cursor as f64)),
             ("head", Json::num(self.head as f64)),
+            ("anchor_block", Json::num(self.anchor.0 as f64)),
+            ("anchor_ms", Json::num(self.anchor.1 as f64)),
+            ("head_ms", Json::num(self.head_ms as f64)),
         ])
     }
 
@@ -878,15 +961,21 @@ impl Index {
         Ok(())
     }
 
-    /// Reads what `write_lines` wrote, one line at a time.
+    /// Reads what `write_lines` wrote, one line at a time. The chain comes from the header.
     pub fn read_lines(input: impl std::io::BufRead) -> Option<Index> {
         let mut lines = input.lines();
         let header = json::parse(&lines.next()?.ok()?).ok()?;
-        if header.get("chain_id").and_then(|v| v.as_f()) != Some(CHAIN_ID as f64) {
-            return None;
-        }
+        let chain_id = header.get("chain_id").and_then(|v| v.as_f()).map(|c| c as u64).filter(|c| net(*c).is_some())?;
         let n = |k: &str| header.get(k).and_then(|v| v.as_f()).unwrap_or(0.0) as u64;
-        let mut idx = Index { cursor: n("cursor"), head: n("head"), addr_stale: true, ..Index::default() };
+        let mut idx = Index {
+            chain_id,
+            cursor: n("cursor"),
+            head: n("head"),
+            anchor: (n("anchor_block"), n("anchor_ms") as i64),
+            head_ms: n("head_ms") as i64,
+            addr_stale: true,
+            ..Index::default()
+        };
         for line in lines {
             let Ok(line) = line else { return None };
             if line.trim().is_empty() {
@@ -905,7 +994,7 @@ impl Index {
             return None;
         }
         let n = |k: &str| j.get(k).and_then(|v| v.as_f()).unwrap_or(0.0) as u64;
-        let mut idx = Index { cursor: n("cursor"), head: n("head"), addr_stale: true, ..Index::default() };
+        let mut idx = Index { chain_id: CHAIN_ID, cursor: n("cursor"), head: n("head"), addr_stale: true, ..Index::default() };
         if let Some(Json::Array(agents)) = j.get("agents") {
             for aj in agents {
                 let (id, a) = Index::agent_from_json(aj);
@@ -1033,14 +1122,44 @@ fn fetch_meta(uri: &str) -> Result<Meta, String> {
 
 // ---- the background readers ----------------------------------------------------------------
 
-/// The one shared index. Empty until `start` loads or builds it.
-pub fn index() -> &'static Mutex<Index> {
-    static I: OnceLock<Mutex<Index>> = OnceLock::new();
-    I.get_or_init(|| Mutex::new(Index::default()))
+/// Every chain's index, Base first. Each is empty until `start` loads or builds it.
+fn indexes() -> &'static Vec<(u64, Mutex<Index>)> {
+    static I: OnceLock<Vec<(u64, Mutex<Index>)>> = OnceLock::new();
+    I.get_or_init(|| NETS.iter().map(|n| (n.id, Mutex::new(Index { chain_id: n.id, ..Index::default() }))).collect())
 }
 
-fn lock() -> std::sync::MutexGuard<'static, Index> {
-    index().lock().unwrap_or_else(|e| e.into_inner())
+/// Base's index.
+pub fn index() -> &'static Mutex<Index> {
+    index_of(CHAIN_ID).expect("Base is always in NETS")
+}
+
+/// The index for one chain, if Keptvow reads that chain.
+pub fn index_of(chain_id: u64) -> Option<&'static Mutex<Index>> {
+    indexes().iter().find(|(id, _)| *id == chain_id).map(|(_, m)| m)
+}
+
+/// Every chain's index with its chain, Base first.
+pub fn all() -> impl Iterator<Item = (&'static Net, &'static Mutex<Index>)> {
+    indexes().iter().filter_map(|(id, m)| Some((net(*id)?, m)))
+}
+
+fn lock_of(m: &'static Mutex<Index>) -> std::sync::MutexGuard<'static, Index> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bots registered on every chain read.
+pub fn total_bots() -> usize {
+    all().map(|(_, m)| lock_of(m).agents.len()).sum()
+}
+
+/// Bots on any chain tied to a wallet (as payment wallet or owner): (chain id, bot number).
+/// An address is the same on every EVM chain, so a wallet can belong to bots on several.
+pub fn refs_by_address(address: &str) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for (n, m) in all() {
+        out.extend(lock_of(m).by_address(address).into_iter().map(|id| (n.id, id)));
+    }
+    out
 }
 
 fn rpc(url: &str, method: &str, params: Json) -> Result<Json, String> {
@@ -1066,23 +1185,29 @@ fn rpc(url: &str, method: &str, params: Json) -> Result<Json, String> {
     j.get("result").cloned().ok_or_else(|| format!("{method}: no result"))
 }
 
-fn save(path: &PathBuf) {
+fn save(m: &'static Mutex<Index>, path: &PathBuf) {
     let tmp = path.with_extension("jsonl.tmp");
     let written = {
-        let mut idx = lock();
+        let mut idx = lock_of(m);
         if !idx.dirty {
             return;
         }
         idx.dirty = false;
         let named = idx.agents.values().filter(|a| a.meta == 1).count();
         let reviewed = idx.agents.values().filter(|a| !a.reviews.is_empty()).count();
-        println!(
-            "keptvow: bot registry: {} bots ({named} with a registration file read, {reviewed} reviewed), read to block {} of {}{}",
-            idx.agents.len(),
-            idx.cursor,
-            idx.head,
-            if idx.last_error.is_empty() { String::new() } else { format!(" — last error: {}", idx.last_error) }
-        );
+        // Base every save, as before; the other chains at most every ten minutes each.
+        let quiet = idx.net().id != CHAIN_ID && idx.last_logged.map_or(false, |t| t.elapsed() < Duration::from_secs(600));
+        if !quiet {
+            idx.last_logged = Some(Instant::now());
+            println!(
+                "keptvow: bot registry{}: {} bots ({named} with a registration file read, {reviewed} reviewed), read to block {} of {}{}",
+                if idx.net().id == CHAIN_ID { String::new() } else { format!(" on {}", idx.net().label) },
+                idx.agents.len(),
+                idx.cursor,
+                idx.head,
+                if idx.last_error.is_empty() { String::new() } else { format!(" — last error: {}", idx.last_error) }
+            );
+        }
         // Streamed to disk line by line while locked: a fraction of a second, and no second
         // copy of the index in memory.
         std::fs::File::create(&tmp).and_then(|f| {
@@ -1094,22 +1219,25 @@ fn save(path: &PathBuf) {
     };
     if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, path)) {
         eprintln!("keptvow: could not save the bot registry index: {e}");
-        lock().dirty = true;
+        lock_of(m).dirty = true;
     }
 }
 
-static SAVE_PATH: OnceLock<PathBuf> = OnceLock::new();
+static SAVE_PATHS: Mutex<Vec<(u64, PathBuf)>> = Mutex::new(Vec::new());
 
-/// Saves the index now if it changed — used when the process is asked to stop.
+/// Saves every index that changed — used when the process is asked to stop.
 pub fn save_now() {
-    if let Some(p) = SAVE_PATH.get() {
-        save(p);
+    let paths = SAVE_PATHS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for (id, p) in paths {
+        if let Some(m) = index_of(id) {
+            save(m, &p);
+        }
     }
 }
 
-/// Calls the first Base node that answers, starting with the one that answered last.
+/// Calls the first node that answers, starting with the one that answered last.
 fn rpc_any(urls: &[String], preferred: &mut usize, method: &str, params: Json) -> Result<Json, String> {
-    let mut last_err = String::from("no Base node configured");
+    let mut last_err = String::from("no node configured");
     for k in 0..urls.len() {
         let i = (*preferred + k) % urls.len();
         match rpc(&urls[i], method, params.clone()) {
@@ -1123,40 +1251,129 @@ fn rpc_any(urls: &[String], preferred: &mut usize, method: &str, params: Json) -
     Err(last_err)
 }
 
-/// Loads the saved index from `dir` and starts both readers. Call once, at boot.
-pub fn start(dir: PathBuf, rpc_urls: Vec<String>) {
-    let path = dir.join("onchain.jsonl");
-    let old_path = dir.join("onchain.json");
-    let start_block = std::env::var("ERC8004_START_BLOCK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_START_BLOCK);
-    let loaded = match std::fs::File::open(&path) {
-        Ok(f) => Index::read_lines(std::io::BufReader::new(f)),
-        // Upgrading from the single-document file: read it once, then it's replaced below.
-        Err(_) => std::fs::read_to_string(&old_path).ok().and_then(|s| json::parse(&s).ok()).and_then(|j| Index::from_json(&j)),
-    };
-    let migrated = loaded.is_some() && !path.exists();
-    {
-        let mut idx = lock();
-        *idx = loaded.unwrap_or_else(|| Index::starting_at(start_block.saturating_sub(1)));
-        println!("keptvow: bot registry index: {} bots, read up to block {}", idx.agents.len(), idx.cursor);
-        idx.dirty = migrated;
-    }
-    if migrated {
-        save(&path);
-        if path.exists() {
-            let _ = std::fs::remove_file(&old_path);
+/// The chains to read: all of `NETS`, or those named in `ERC8004_CHAINS` (comma-separated
+/// names, e.g. "base,ethereum"). Base is always read.
+fn chains_wanted() -> Vec<&'static Net> {
+    let only: Option<Vec<String>> = std::env::var("ERC8004_CHAINS")
+        .ok()
+        .filter(|v| !v.trim().is_empty() && !v.trim().eq_ignore_ascii_case("all"))
+        .map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).collect());
+    NETS.iter().filter(|n| n.id == CHAIN_ID || only.as_ref().map_or(true, |o| o.iter().any(|x| x == n.name))).collect()
+}
+
+/// Loads each chain's saved index from `dir` and starts its readers. Call once, at boot.
+pub fn start(dir: PathBuf, base_rpc_urls: Vec<String>) {
+    for net in chains_wanted() {
+        let m = index_of(net.id).expect("every net has an index");
+        let base = net.id == CHAIN_ID;
+        let path = if base { dir.join("onchain.jsonl") } else { dir.join(format!("onchain-{}.jsonl", net.name)) };
+        let loaded = match std::fs::File::open(&path) {
+            Ok(f) => Index::read_lines(std::io::BufReader::new(f)).filter(|i| i.net().id == net.id),
+            // Upgrading from the single-document file: read it once, then it's replaced below.
+            Err(_) if base => std::fs::read_to_string(dir.join("onchain.json")).ok().and_then(|s| json::parse(&s).ok()).and_then(|j| Index::from_json(&j)),
+            Err(_) => None,
+        };
+        let migrated = base && loaded.is_some() && !path.exists();
+        {
+            let mut idx = lock_of(m);
+            *idx = match loaded {
+                Some(i) => i,
+                None if base => {
+                    let start_block = std::env::var("ERC8004_START_BLOCK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_START_BLOCK);
+                    Index::for_chain(CHAIN_ID, start_block.saturating_sub(1))
+                }
+                // Where to start is found by the reader, from block times (see `read_logs`).
+                None => Index::for_chain(net.id, 0),
+            };
+            if idx.chain_id == 0 {
+                idx.chain_id = net.id;
+            }
+            println!("keptvow: bot registry index on {}: {} bots, read up to block {}", net.label, idx.agents.len(), idx.cursor);
+            idx.dirty = migrated;
         }
+        if migrated {
+            save(m, &path);
+            if path.exists() {
+                let _ = std::fs::remove_file(dir.join("onchain.json"));
+            }
+        }
+        SAVE_PATHS.lock().unwrap_or_else(|e| e.into_inner()).push((net.id, path.clone()));
+        let urls: Vec<String> = if base { base_rpc_urls.clone() } else { net.rpcs.iter().map(|u| u.to_string()).collect() };
+        crate::supervise("a registry reader", move || read_logs(m, urls.clone(), path.clone()));
     }
-    let _ = SAVE_PATH.set(path.clone());
-    crate::supervise("the registry reader", move || read_logs(rpc_urls.clone(), path.clone()));
     // Most of the wait is on other people's servers (many never answer), so several readers
-    // share the queue.
+    // share the queue across every chain.
     for _ in 0..12 {
         crate::supervise("a registration file reader", read_registration_files);
     }
 }
 
-fn read_logs(urls: Vec<String>, path: PathBuf) {
+/// A block's time, in ms, from a node.
+fn block_time_ms(urls: &[String], preferred: &mut usize, block: u64) -> Result<i64, String> {
+    let b = rpc_any(urls, preferred, "eth_getBlockByNumber", Json::Array(vec![Json::str(format!("0x{block:x}")), Json::Bool(false)]))?;
+    b.get("timestamp").and_then(|v| v.as_str()).and_then(hex_u64).map(|t| t as i64 * 1000).ok_or_else(|| "block without a timestamp".into())
+}
+
+/// The first block made at or after `secs`, by halving the range between 0 and `head`.
+fn first_block_after(urls: &[String], preferred: &mut usize, head: u64, secs: i64) -> Result<u64, String> {
+    let (mut lo, mut hi) = (0u64, head);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if block_time_ms(urls, preferred, mid)? < secs * 1000 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+/// Before reading a chain other than Base: makes sure its nodes really serve that chain, and on
+/// the first run finds where to start (the registry's first mainnet deploy) and anchors block
+/// times there. Retries until it works.
+fn prepare_chain(m: &'static Mutex<Index>, urls: &[String], preferred: &mut usize) {
+    let net = lock_of(m).net();
+    loop {
+        let checked = (|| -> Result<(), String> {
+            let id = rpc_any(urls, preferred, "eth_chainId", Json::Array(vec![]))?;
+            if id.as_str().and_then(hex_u64) != Some(net.id) {
+                return Err(format!("its node says it serves chain {}, not {}", id.to_string(), net.id));
+            }
+            let (cursor, anchor) = {
+                let idx = lock_of(m);
+                (idx.cursor, idx.anchor)
+            };
+            if cursor == 0 {
+                let head = rpc_any(urls, preferred, "eth_blockNumber", Json::Array(vec![]))?.as_str().and_then(hex_u64).ok_or("bad block number")?;
+                let first = first_block_after(urls, preferred, head, FIRST_DEPLOY_SECS)?;
+                let t = block_time_ms(urls, preferred, first)?;
+                let mut idx = lock_of(m);
+                idx.cursor = first.saturating_sub(1);
+                idx.anchor = (first, t);
+                idx.dirty = true;
+            } else if anchor.1 == 0 {
+                let t = block_time_ms(urls, preferred, cursor)?;
+                lock_of(m).anchor = (cursor, t);
+            }
+            Ok(())
+        })();
+        match checked {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("keptvow: bot registry on {}: not read yet — {e}", net.label);
+                lock_of(m).last_error = e;
+                std::thread::sleep(Duration::from_secs(600));
+            }
+        }
+    }
+}
+
+fn read_logs(m: &'static Mutex<Index>, urls: Vec<String>, path: PathBuf) {
     let mut preferred = 0usize;
+    let net = lock_of(m).net();
+    if net.id != CHAIN_ID {
+        prepare_chain(m, &urls, &mut preferred);
+    }
     let tp = topics();
     let wanted = Json::Array(
         [&tp.registered, &tp.uri_updated, &tp.metadata_set, &tp.transfer, &tp.new_feedback, &tp.feedback_revoked]
@@ -1172,30 +1389,40 @@ fn read_logs(urls: Vec<String>, path: PathBuf) {
     let mut streak = 0u32;
     let mut last_save = Instant::now();
     let mut last_report: Option<Instant> = None;
+    // Errors are logged at most every ten minutes per chain, so a chain whose nodes are down
+    // can't flood the log.
+    let mut last_err_log: Option<Instant> = None;
+    let mut log_err = |e: &str| {
+        if last_err_log.map_or(true, |t| t.elapsed() > Duration::from_secs(600)) {
+            eprintln!("keptvow: bot registry on {}: {e}", net.label);
+            last_err_log = Some(Instant::now());
+        }
+    };
     loop {
         let head = match rpc_any(&urls, &mut preferred, "eth_blockNumber", Json::Array(vec![])) {
             Ok(v) => v.as_str().and_then(hex_u64).unwrap_or(0).saturating_sub(CONFIRMATIONS),
             Err(e) => {
-                eprintln!("keptvow: bot registry: {e}");
-                lock().last_error = e;
+                log_err(&e);
+                lock_of(m).last_error = e;
                 std::thread::sleep(Duration::from_secs(30));
                 continue;
             }
         };
         let cursor = {
-            let mut idx = lock();
+            let mut idx = lock_of(m);
             idx.head = idx.head.max(head);
+            idx.head_ms = now_ms();
             idx.last_ok_ms = now_ms();
             idx.cursor
         };
         if cursor >= head {
             if last_save.elapsed() > Duration::from_secs(300) {
-                save(&path);
+                save(m, &path);
                 last_save = Instant::now();
             }
             // Once caught up, and then daily: the registry-wide numbers, to the log.
             if last_report.map_or(true, |t: Instant| t.elapsed() > Duration::from_secs(86_400)) {
-                println!("keptvow: registry report: {}", lock().report().to_string());
+                println!("keptvow: registry report for {}: {}", net.label, lock_of(m).report().to_string());
                 last_report = Some(Instant::now());
             }
             std::thread::sleep(Duration::from_secs(20));
@@ -1211,7 +1438,7 @@ fn read_logs(urls: Vec<String>, path: PathBuf) {
         ]);
         match rpc_any(&urls, &mut preferred, "eth_getLogs", Json::Array(vec![filter])) {
             Ok(Json::Array(logs)) => {
-                let mut idx = lock();
+                let mut idx = lock_of(m);
                 for log in &logs {
                     idx.apply(log);
                 }
@@ -1224,21 +1451,21 @@ fn read_logs(urls: Vec<String>, path: PathBuf) {
                 }
                 span = (span * 2).min(ceiling);
             }
-            Ok(_) => lock().last_error = "eth_getLogs returned something other than a list".into(),
+            Ok(_) => lock_of(m).last_error = "eth_getLogs returned something other than a list".into(),
             Err(e) => {
                 streak = 0;
                 if span > 50 {
                     span /= 2;
                     ceiling = span;
                 } else {
-                    eprintln!("keptvow: bot registry: {e}");
-                    lock().last_error = e;
+                    log_err(&e);
+                    lock_of(m).last_error = e;
                     std::thread::sleep(Duration::from_secs(30));
                 }
             }
         }
         if last_save.elapsed() > Duration::from_secs(60) {
-            save(&path);
+            save(m, &path);
             last_save = Instant::now();
         }
         // Gentle on a shared public node while catching up.
@@ -1252,15 +1479,18 @@ fn now_ms() -> i64 {
 
 fn read_registration_files() {
     loop {
-        let batch = lock().needs_meta(10, now_ms());
-        if batch.is_empty() {
-            std::thread::sleep(Duration::from_secs(30));
-            continue;
+        let mut worked = false;
+        for (_, m) in all() {
+            let batch = lock_of(m).needs_meta(10, now_ms());
+            for (id, uri) in &batch {
+                let meta = fetch_meta(uri);
+                lock_of(m).set_meta(*id, uri, meta, now_ms());
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            worked |= !batch.is_empty();
         }
-        for (id, uri) in batch {
-            let meta = fetch_meta(&uri);
-            lock().set_meta(id, &uri, meta, now_ms());
-            std::thread::sleep(Duration::from_millis(300));
+        if !worked {
+            std::thread::sleep(Duration::from_secs(30));
         }
     }
 }
@@ -1432,6 +1662,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn other_chains_date_blocks_from_their_anchor_and_save_their_own_chain() {
+        let mut eth = Index::for_chain(1, 99);
+        // Block 100 made at t0; the head, 7,200 blocks later, a day after (12-second blocks).
+        eth.anchor = (100, 1_770_000_000_000);
+        eth.head = 7_300;
+        eth.head_ms = 1_770_000_000_000 + 86_400_000;
+        assert_eq!(eth.block_ms(3_700), 1_770_000_000_000 + 43_200_000, "halfway is half a day");
+        eth.apply(&registered(4, "0x00000000000000000000000000000000000000aa", "", 100));
+        assert_eq!(eth.age_days(&eth.agents[&4]), 1);
+        assert_eq!(eth.profile_json(4).unwrap().get("agent_id").and_then(|v| v.as_str()), Some("erc8004:1:4"));
+        let mut buf = Vec::new();
+        eth.write_lines(&mut buf).unwrap();
+        let back = Index::read_lines(std::io::Cursor::new(buf)).unwrap();
+        assert_eq!((back.net().name, back.anchor, back.head_ms), ("ethereum", eth.anchor, eth.head_ms));
+        assert_eq!(back.agents.len(), 1);
+        // Base keeps its exact clock, and every chain in the list has an index.
+        assert_eq!(Index::starting_at(0).block_ms(0), Index::base_block_ms(0));
+        assert!(NETS.iter().all(|n| index_of(n.id).is_some()));
+        assert_eq!(net_named("Ethereum").map(|n| n.id), Some(1));
+    }
+
+    #[test]
     fn wallets_that_review_almost_everything_are_not_counted() {
         let mut idx = Index::starting_at(0);
         idx.head = 1 + 30 * 86_400 / BLOCK_SECONDS;
@@ -1527,7 +1779,7 @@ pub(crate) mod tests {
         assert_eq!(num("distinct_reviewers"), 2.0);
         assert_eq!(num("reviewers_of_50_plus_bots"), 1.0);
         assert_eq!(num("bots_reviewed_mostly_by_mass_reviewers"), 60.0);
-        assert_eq!(Index::block_day(0), "2023-06-15");
+        assert_eq!(Index::starting_at(0).block_day(0), "2023-06-15");
     }
 
     #[test]

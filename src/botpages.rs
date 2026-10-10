@@ -150,9 +150,12 @@ fn syncing_note(idx: &Index) -> String {
     }
 }
 
-/// `/bots` — every bot in the registry, searchable.
-pub fn directory(idx: &Index, q: &str, newest: bool, page_no: usize, base: &str) -> String {
+/// `/bots` — every bot in the registry on one chain, searchable, with links to the other chains
+/// read (`nets`: each chain and how many bots it has).
+pub fn directory(idx: &Index, q: &str, newest: bool, page_no: usize, base: &str, nets: &[(&'static chain::Net, usize)]) -> String {
     const PER_PAGE: usize = 50;
+    let net = idx.net();
+    let on_base = net.id == chain::CHAIN_ID;
     let (total, hits) = idx.search(q, newest, page_no * PER_PAGE, PER_PAGE);
     let mut rows = String::new();
     for (id, a) in &hits {
@@ -160,7 +163,7 @@ pub fn directory(idx: &Index, q: &str, newest: bool, page_no: usize, base: &str)
         let reviewers = idx.reviews(a).reviewers;
         rows.push_str(&format!(
             r#"<a class="row" href="/bots/{chain}/{id}"><span class="nm">{name}</span><span class="meta">{reviews}</span><span class="meta age">#{id}</span><span class="pill {level}">{level}</span></a>"#,
-            chain = chain::CHAIN_NAME,
+            chain = net.name,
             name = esc(&Index::display_name(*id, a)),
             reviews = esc(&plural(reviewers, "reviewer")),
         ));
@@ -170,6 +173,9 @@ pub fn directory(idx: &Index, q: &str, newest: bool, page_no: usize, base: &str)
     }
     let qs = |p: usize| {
         let mut s = format!("?page={p}");
+        if !on_base {
+            s.push_str(&format!("&chain={}", net.name));
+        }
         if !q.is_empty() {
             s.push_str(&format!("&q={}", url_encode(q)));
         }
@@ -180,27 +186,45 @@ pub fn directory(idx: &Index, q: &str, newest: bool, page_no: usize, base: &str)
     };
     let prev = if page_no > 0 { format!(r#"<a href="/bots{}">← Previous</a>"#, esc(&qs(page_no - 1))) } else { "<span></span>".into() };
     let next = if (page_no + 1) * PER_PAGE < total { format!(r#"<a href="/bots{}">Next →</a>"#, esc(&qs(page_no + 1))) } else { "<span></span>".into() };
+    let chain_q = if on_base { String::new() } else { format!("&amp;chain={}", net.name) };
     let sort_link = if newest {
-        format!(r#"Newest first · <a href="/bots?q={}">most reviewed</a>"#, esc(&url_encode(q)))
+        format!(r#"Newest first · <a href="/bots?q={}{chain_q}">most reviewed</a>"#, esc(&url_encode(q)))
     } else {
-        format!(r#"Most reviewed · <a href="/bots?sort=new&amp;q={}">newest first</a>"#, esc(&url_encode(q)))
+        format!(r#"Most reviewed · <a href="/bots?sort=new&amp;q={}{chain_q}">newest first</a>"#, esc(&url_encode(q)))
     };
     let all = idx.agents.len();
+    let chips: String = nets
+        .iter()
+        .map(|(n, count)| {
+            let href = if n.id == chain::CHAIN_ID { "/bots".to_string() } else { format!("/bots?chain={}", n.name) };
+            if n.id == net.id {
+                format!(r#"<b>{} ({})</b>"#, esc(n.label), fmt_count(*count))
+            } else {
+                format!(r#"<a href="{}">{} ({})</a>"#, esc(&href), esc(n.label), fmt_count(*count))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let networks = if nets.len() > 1 { format!(r#"<p class="muted">Networks: {chips}</p>"#) } else { String::new() };
     let body = format!(
         r#"<h1>Every AI bot, rated</h1>
-<p class="sub">{all} bots from the public ERC-8004 registry on Base, each with a free score page. Check a bot before you pay it. Own one? Open its page and claim it free.</p>
-<div class="formats">For bots: <a href="/v1/bots?q={qe}">JSON</a><a href="/v1/bots?q={qe}&amp;format=md">Markdown</a></div>
+<p class="sub">{all} bots from the public ERC-8004 registry on {label}, each with a free score page. Check a bot before you pay it. Own one? Open its page and claim it free.</p>
+{networks}
+<div class="formats">For bots: <a href="/v1/bots?q={qe}&amp;chain={chain}">JSON</a><a href="/v1/bots?q={qe}&amp;chain={chain}&amp;format=md">Markdown</a></div>
 {syncing}
 <section>
 <form class="search" action="/bots" method="get">
+<input type="hidden" name="chain" value="{chain}">
 <input name="q" value="{q}" placeholder="Bot name, number, or 0x wallet address" aria-label="Search bots">
 <button type="submit">Search</button>
 </form>
 <p class="muted" style="margin:10px 0 0">{shown} · {sort_link}</p>
 </section>
 <section class="list">{rows}<div class="pager">{prev}{next}</div></section>
-<p class="muted">Scores from public reviews alone never go above <b>fair</b>: reviews cost almost nothing to fake. <b>Good</b> and <b>excellent</b> take real deals settled through Keptvow. <a href="/docs">How scoring works</a>.</p>"#,
+<p class="muted">Scores from public records alone (reviews, a wallet's payments, buyers' reports) never go above <b>fair</b>: they cost little to fake. <b>Good</b> and <b>excellent</b> take real deals settled through Keptvow. <a href="/docs">How scoring works</a>.</p>"#,
         all = fmt_count(all),
+        label = esc(net.label),
+        chain = net.name,
         syncing = syncing_note(idx),
         q = esc(q),
         qe = esc(&url_encode(q)),
@@ -244,8 +268,9 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
         _ => "unknown".to_string(),
     };
     let reasons_html: String = reasons.iter().map(|r| format!("<li>{}</li>", esc(r))).collect();
-    let ext = format!("{}:{id}", chain::CHAIN_ID);
-    let agent_ref = format!("erc8004:{}:{id}", chain::CHAIN_ID);
+    let net = idx.net();
+    let ext = format!("{}:{id}", net.id);
+    let agent_ref = format!("erc8004:{}:{id}", net.id);
 
     let owner_box = match claimed {
         Some((owner, _)) => format!(
@@ -270,7 +295,7 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
     } else {
         format!(r#"<p>{}</p>"#, esc(&a.description))
     };
-    let badge_md = format!("[![Keptvow]({base}/v1/trust/{agent_ref}/badge.svg)]({base}/bots/{}/{id})", chain::CHAIN_NAME);
+    let badge_md = format!("[![Keptvow]({base}/v1/trust/{agent_ref}/badge.svg)]({base}/bots/{}/{id})", net.name);
 
     let claim = if claimed.is_some() {
         String::new()
@@ -362,7 +387,7 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
 
     let body = format!(
         r#"<h1>{name}</h1>
-<p class="sub">Bot #{id} in the public ERC-8004 registry on Base · registered {age}</p>
+<p class="sub">Bot #{id} in the public ERC-8004 registry on {label} · registered {age}</p>
 <div class="formats">For bots: <a href="/bots/{chain}/{id}?format=json">JSON</a><a href="/bots/{chain}/{id}?format=md">Markdown</a><a href="/bots/{chain}/{id}?format=text">One line</a></div>
 {syncing}
 <section>
@@ -399,7 +424,8 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
 </section>
 {claim}"#,
         name = esc(&name),
-        chain = chain::CHAIN_NAME,
+        chain = net.name,
+        label = esc(net.label),
         age = if days == 0 { "today".to_string() } else { format!("{} ago", plural(days as usize, "day")) },
         syncing = syncing_note(idx),
         reviewers = r.reviewers,
@@ -418,7 +444,7 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
         owner = opt(&a.owner),
         wallet = opt(&a.wallet),
         x402 = if a.x402 { "Yes" } else { "Not stated" },
-        chain_id = chain::CHAIN_ID,
+        chain_id = net.id,
         registry = chain::IDENTITY,
         badge_md = esc(&badge_md),
         base = esc(base),
@@ -427,7 +453,8 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
         "{name} is rated {level} on Keptvow: {}. Check any AI bot before you pay it.",
         reasons.first().map(|s| s.as_str()).unwrap_or("no record yet")
     );
-    Some(page(&format!("{name} — bot #{id} trust score | Keptvow"), &summary, &format!("{base}/bots/{}/{id}", chain::CHAIN_NAME), &body))
+    let title = if net.id == chain::CHAIN_ID { format!("{name} — bot #{id} trust score | Keptvow") } else { format!("{name} — bot #{id} on {} — trust score | Keptvow", net.label) };
+    Some(page(&title, &summary, &format!("{base}/bots/{}/{id}", net.name), &body))
 }
 
 /// `/stats` — the traction numbers, in public. Built from the same JSON as `/v1/stats`.
@@ -707,13 +734,23 @@ const PER_SITEMAP: usize = 40_000;
 
 /// `/sitemap.xml` — an index of sitemap files, so search engines find every bot page however
 /// many there are.
-pub fn sitemap_index(idx: &Index, base: &str) -> String {
-    let parts = idx.agents.len().div_ceil(PER_SITEMAP).max(1);
+/// `/sitemap.xml` — the site's pages, then each chain's bot pages: Base's at `/sitemaps/N.xml`
+/// (as before), every other chain's at `/sitemaps/<chain>-N.xml`.
+pub fn sitemap_index(nets: &[(&'static chain::Net, usize)], base: &str) -> String {
     let mut s = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>
 <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 "#);
-    for n in 0..=parts {
-        s.push_str(&format!("<sitemap><loc>{}/sitemaps/{n}.xml</loc></sitemap>\n", esc(base)));
+    for (net, count) in nets {
+        let parts = count.div_ceil(PER_SITEMAP);
+        if net.id == chain::CHAIN_ID {
+            for n in 0..=parts.max(1) {
+                s.push_str(&format!("<sitemap><loc>{}/sitemaps/{n}.xml</loc></sitemap>\n", esc(base)));
+            }
+        } else {
+            for n in 1..=parts {
+                s.push_str(&format!("<sitemap><loc>{}/sitemaps/{}-{n}.xml</loc></sitemap>\n", esc(base), net.name));
+            }
+        }
     }
     s.push_str(&format!("<sitemap><loc>{}/sitemaps/wallets.xml</loc></sitemap>\n", esc(base)));
     s.push_str("</sitemapindex>\n");
@@ -747,7 +784,7 @@ pub fn sitemap_part(idx: &Index, n: usize, base: &str) -> Option<String> {
             return None;
         }
         for id in ids {
-            s.push_str(&format!("<url><loc>{}/bots/{}/{id}</loc></url>\n", esc(base), chain::CHAIN_NAME));
+            s.push_str(&format!("<url><loc>{}/bots/{}/{id}</loc></url>\n", esc(base), idx.net().name));
         }
     }
     s.push_str("</urlset>\n");
@@ -828,7 +865,7 @@ mod tests {
         assert!(!html.contains("href=\"javascript"));
         assert!(html.contains("&lt;script&gt;"));
         idx.prepare_search();
-        let dir = directory(&idx, "<script>", false, 0, "https://k.example");
+        let dir = directory(&idx, "<script>", false, 0, "https://k.example", &[]);
         assert!(!dir.contains("<script>alert") && !dir.contains("value=\"<script>"));
         assert_eq!(js_string("</script><x>"), "\"\\u003c/script\\u003e\\u003cx\\u003e\"");
     }
@@ -844,7 +881,16 @@ mod tests {
         let html = bot_page(&idx, 9, Some(("weather-bot", &profile)), "https://k.example").unwrap();
         assert!(html.contains("pill good") && html.contains("Claimed.") && !html.contains("Claim with my wallet"));
         assert!(bot_page(&idx, 10, None, "https://k.example").is_none());
-        assert!(sitemap_index(&idx, "https://k.example").contains("<loc>https://k.example/sitemaps/1.xml</loc>"));
+        let nets = [(&chain::NETS[0], idx.agents.len()), (chain::net(1).unwrap(), 50_001)];
+        let index = sitemap_index(&nets, "https://k.example");
+        assert!(index.contains("<loc>https://k.example/sitemaps/1.xml</loc>"));
+        assert!(index.contains("<loc>https://k.example/sitemaps/ethereum-2.xml</loc>") && !index.contains("ethereum-0"), "{index}");
+        // A bot on another chain gets a page under that chain's name.
+        let mut eth = Index::for_chain(1, 0);
+        eth.apply(&registered(9, "0x00000000000000000000000000000000000000aa", "", 1));
+        let page = bot_page(&eth, 9, None, "https://k.example").unwrap();
+        assert!(page.contains("registry on Ethereum") && page.contains("erc8004:1:9") && page.contains("/bots/ethereum/9"), "{page}");
+        assert!(sitemap_part(&eth, 1, "https://k.example").unwrap().contains("/bots/ethereum/9"));
         assert!(sitemap_part(&idx, 1, "https://k.example").unwrap().contains("<loc>https://k.example/bots/base/9</loc>"));
         assert!(sitemap_part(&idx, 0, "https://k.example").unwrap().contains("<loc>https://k.example/stats</loc>"));
         assert!(sitemap_part(&idx, 2, "https://k.example").is_none());

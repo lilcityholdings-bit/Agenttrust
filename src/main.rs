@@ -569,21 +569,20 @@ fn verify_registration(engine: &Mutex<Engine>, agent_id: &str, body: &Json, now:
     }
 }
 
-/// `erc8004:8453:<n>` → the registry number, for the chain Keptvow reads.
-fn registry_ref_number(agent_ref: &str) -> Option<u64> {
-    let rest = agent_ref.strip_prefix("erc8004:")?;
+/// `erc8004:<chain id>:<n>` → (chain id, registry number), for a chain Keptvow reads.
+fn registry_ref_number(agent_ref: &str) -> Option<(u64, u64)> {
+    let rest = agent_ref.get(..8).filter(|p| p.eq_ignore_ascii_case("erc8004:")).map(|_| &agent_ref[8..])?;
     let (chain_id, n) = rest.split_once(':')?;
-    if chain_id != chain::CHAIN_ID.to_string() {
-        return None;
-    }
-    n.parse().ok()
+    let chain_id: u64 = chain_id.parse().ok()?;
+    chain::index_of(chain_id)?;
+    Some((chain_id, n.parse().ok()?))
 }
 
-/// `eip155:8453:<registry>:<n>` (a normalized ERC-8004 id) → `erc8004:8453:<n>`.
+/// `eip155:<chain id>:<registry>:<n>` (a normalized ERC-8004 id) → `erc8004:<chain id>:<n>`.
 fn registry_ref(external_id: &str) -> Option<String> {
     let parts: Vec<&str> = external_id.split(':').collect();
     match parts.as_slice() {
-        ["eip155", c, reg, n] if *c == chain::CHAIN_ID.to_string() && reg.eq_ignore_ascii_case(chain::IDENTITY) => {
+        ["eip155", c, reg, n] if c.parse().ok().and_then(chain::index_of).is_some() && reg.eq_ignore_ascii_case(chain::IDENTITY) => {
             Some(format!("erc8004:{c}:{n}"))
         }
         _ => None,
@@ -594,13 +593,14 @@ fn registry_ref(external_id: &str) -> Option<String> {
 /// bot last changed hands (or changed its payment wallet) was made by whoever controlled it
 /// then, so it stops counting until the new controller claims it.
 fn registry_owner<'a>(engine: &'a Engine, agent_ref: &str) -> Option<&'a str> {
-    let n = registry_ref_number(agent_ref)?;
-    let ext = verify::normalize("erc8004", &format!("{}:{n}", chain::CHAIN_ID)).ok()?;
+    let (chain_id, n) = registry_ref_number(agent_ref)?;
+    let ext = verify::normalize("erc8004", &format!("{chain_id}:{n}")).ok()?;
     let owner = engine.verified_owner_of("erc8004", &ext)?;
-    let moved = chain::index().lock().unwrap_or_else(|e| e.into_inner()).agents.get(&n).map_or(0, |a| a.moved_block);
+    let idx = chain::index_of(chain_id)?.lock().unwrap_or_else(|e| e.into_inner());
+    let moved = idx.agents.get(&n).map_or(0, |a| a.moved_block);
     if moved > 0 {
         let claimed_at = engine.verification_time(owner, "erc8004", &ext).unwrap_or(0);
-        if claimed_at < chain::Index::block_ms(moved) {
+        if claimed_at < idx.block_ms(moved) {
             return None;
         }
     }
@@ -611,8 +611,9 @@ fn registry_owner<'a>(engine: &'a Engine, agent_ref: &str) -> Option<&'a str> {
 /// account that proved it owns the bot, with the registry data alongside; unclaimed, what the
 /// registry alone supports. `None` when the registry has no such bot.
 fn registry_profile(engine: &Engine, agent_ref: &str, now: i64) -> Option<Json> {
-    let n = registry_ref_number(agent_ref)?;
-    let onchain = chain::index().lock().unwrap_or_else(|e| e.into_inner()).profile_json(n);
+    let (chain_id, n) = registry_ref_number(agent_ref)?;
+    let net = chain::net(chain_id)?;
+    let onchain = chain::index_of(chain_id)?.lock().unwrap_or_else(|e| e.into_inner()).profile_json(n);
     let mut p = match registry_owner(engine, agent_ref) {
         Some(owner) => {
             let mut p = engine.trust_profile_json(owner, now);
@@ -638,7 +639,7 @@ fn registry_profile(engine: &Engine, agent_ref: &str, now: i64) -> Option<Json> 
     };
     if let Json::Object(m) = &mut p {
         m.entry("claimed_by".into()).or_insert(Json::Null);
-        m.insert("profile_page".into(), Json::str(format!("/bots/{}/{n}", chain::CHAIN_NAME)));
+        m.insert("profile_page".into(), Json::str(format!("/bots/{}/{n}", net.name)));
     }
     Some(p)
 }
@@ -711,9 +712,9 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
     if let Some(owner) = engine.verified_owner_of("eth", &wallet) {
         matches.push(engine.trust_profile_json(owner, now));
     }
-    let ids = chain::index().lock().unwrap_or_else(|e| e.into_inner()).by_address(&wallet);
-    for n in ids.into_iter().take(10) {
-        if let Some(p) = registry_profile(engine, &format!("erc8004:{}:{n}", chain::CHAIN_ID), now) {
+    let ids = chain::refs_by_address(&wallet);
+    for (c, n) in ids.into_iter().take(10) {
+        if let Some(p) = registry_profile(engine, &format!("erc8004:{c}:{n}"), now) {
             matches.push(p);
         }
     }
@@ -989,14 +990,13 @@ fn hex_bytes(s: &str) -> Option<Vec<u8>> {
 /// moves on by itself, so it works without any script.
 fn go_to(q: &str) -> Response {
     let q = q.trim();
-    let bot_number = q
-        .strip_prefix(&format!("erc8004:{}:", chain::CHAIN_ID))
-        .or_else(|| q.strip_prefix('#'))
-        .unwrap_or(q)
-        .parse::<u64>()
-        .ok();
+    // `erc8004:<chain id>:N` names a bot on any chain read; `#N` or a bare number, one on Base.
+    let on_chain = registry_ref_number(q).and_then(|(c, n)| Some((chain::net(c)?.name, n)));
+    let bot_number = q.strip_prefix('#').unwrap_or(q).parse::<u64>().ok();
     let target = if let Ok(w) = verify::normalize("eth", q) {
         format!("/wallets/{w}")
+    } else if let Some((chain_name, n)) = on_chain {
+        format!("/bots/{chain_name}/{n}")
     } else if let Some(n) = bot_number {
         format!("/bots/{}/{n}", chain::CHAIN_NAME)
     } else if q.is_empty() {
@@ -1060,10 +1060,15 @@ fn host_of(url: &str) -> String {
     url.split("://").nth(1).unwrap_or(url).split(['/', '?', '#']).next().unwrap_or("").to_string()
 }
 
+/// Each chain read and how many registry bots it has, Base first.
+fn chain_counts() -> Vec<(&'static chain::Net, usize)> {
+    chain::all().map(|(n, m)| (n, m.lock().unwrap_or_else(|e| e.into_inner()).agents.len())).collect()
+}
+
 /// The traction numbers anyone may see.
 fn public_stats(engine: &Engine, now: i64) -> Json {
     let (keptvow_bots, settled, _) = engine.stats();
-    let registry_bots = chain::index().lock().unwrap_or_else(|e| e.into_inner()).agents.len();
+    let registry_bots = chain::total_bots();
     let (wallets, (history_read, _), services) = {
         let l = payments::lock();
         (l.sellers.len(), l.history_progress(), l.services.len())
@@ -1308,9 +1313,11 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             if !rate_ok("search", req.client_ip(), SEARCHES_PER_HOUR, now) {
                 return err(429, "too many searches from this address this hour — try again later");
             }
-            let mut idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            let nets = chain_counts();
+            let m = req.q("chain").and_then(chain::net_named).and_then(|n| chain::index_of(n.id)).unwrap_or(chain::index());
+            let mut idx = m.lock().unwrap_or_else(|e| e.into_inner());
             idx.prepare_search();
-            return Response::html(botpages::directory(&idx, &q, req.q("sort") == Some("new"), page, &base_url(&req)));
+            return Response::html(botpages::directory(&idx, &q, req.q("sort") == Some("new"), page, &base_url(&req), &nets));
         }
         ("GET", ["v1", "bots"]) => {
             if !rate_ok("search", req.client_ip(), SEARCHES_PER_HOUR, now) {
@@ -1323,39 +1330,57 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     }
                 }
             }
-            let mut idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
-            idx.prepare_search();
             let offset = req.q("offset").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
             let limit = req.q("limit").and_then(|p| p.parse::<usize>().ok()).unwrap_or(50).clamp(1, 100);
-            let (total, hits) = idx.search(req.q("q").unwrap_or(""), req.q("sort") == Some("new"), offset, limit);
+            // One chain (`chain=ethereum`), or every chain read, Base first, as one list.
+            let only = match req.q("chain").filter(|c| !c.is_empty() && *c != "all") {
+                Some(c) => match chain::net_named(c) {
+                    Some(n) => Some(n.id),
+                    None => return err(400, "unknown chain — see /bots for the networks read"),
+                },
+                None => None,
+            };
+            let (mut total, mut skip, mut rows, mut cursors) = (0usize, offset, Vec::new(), Vec::new());
+            for (net, m) in chain::all().filter(|(n, _)| only.map_or(true, |o| o == n.id)) {
+                let mut idx = m.lock().unwrap_or_else(|e| e.into_inner());
+                idx.prepare_search();
+                let (n, hits) = idx.search(req.q("q").unwrap_or(""), req.q("sort") == Some("new"), skip, limit - rows.len().min(limit));
+                total += n;
+                skip = skip.saturating_sub(n);
+                for (id, a) in hits.iter().take(limit - rows.len()) {
+                    let r = idx.reviews(a);
+                    rows.push(Json::obj(vec![
+                        ("agent_id", Json::str(format!("erc8004:{}:{id}", net.id))),
+                        ("chain", Json::str(net.name)),
+                        ("name", Json::str(chain::Index::display_name(*id, a))),
+                        ("trust_level", Json::str(idx.assess(a).0)),
+                        ("reviewers", Json::num(r.reviewers as f64)),
+                        ("profile_page", Json::str(format!("/bots/{}/{id}", net.name))),
+                    ]));
+                }
+                cursors.push(Json::obj(vec![
+                    ("chain", Json::str(net.name)),
+                    ("bots", Json::num(idx.agents.len() as f64)),
+                    ("read_to_block", Json::num(idx.cursor as f64)),
+                    ("head_block", Json::num(idx.head as f64)),
+                ]));
+            }
             let base = base_url(&req);
+            let (read_to, head) = {
+                let b = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+                (b.cursor, b.head)
+            };
             return shaped(&req, Json::obj(vec![
                 ("total", Json::num(total as f64)),
                 ("offset", Json::num(offset as f64)),
-                (
-                    "bots",
-                    Json::Array(
-                        hits.iter()
-                            .map(|(id, a)| {
-                                let r = idx.reviews(a);
-                                Json::obj(vec![
-                                    ("agent_id", Json::str(format!("erc8004:{}:{id}", chain::CHAIN_ID))),
-                                    ("name", Json::str(chain::Index::display_name(*id, a))),
-                                    ("trust_level", Json::str(idx.assess(a).0)),
-                                    ("reviewers", Json::num(r.reviewers as f64)),
-                                    ("profile_page", Json::str(format!("/bots/{}/{id}", chain::CHAIN_NAME))),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ),
-                ("registry_read_to_block", Json::num(idx.cursor as f64)),
-                ("registry_head_block", Json::num(idx.head as f64)),
+                ("bots", Json::Array(rows)),
+                ("networks", Json::Array(cursors)),
+                ("registry_read_to_block", Json::num(read_to as f64)),
+                ("registry_head_block", Json::num(head as f64)),
             ]), |j| formats::bots_markdown(j, &base), |j| formats::bots_markdown(j, &base));
         }
         ("GET", ["sitemap.xml"]) => {
-            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
-            return Response { status: 200, content_type: "application/xml; charset=utf-8", body: botpages::sitemap_index(&idx, &base_url(&req)) };
+            return Response { status: 200, content_type: "application/xml; charset=utf-8", body: botpages::sitemap_index(&chain_counts(), &base_url(&req)) };
         }
         ("GET", ["sitemaps", "wallets.xml"]) => {
             let mut wallets: Vec<String> = payments::lock().services.values().map(|s| s.pay_to.clone()).collect();
@@ -1366,8 +1391,19 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         ("GET", ["go"]) => return go_to(req.q("q").unwrap_or("")),
         ("GET", ["bot"]) => return Response::html(botpages::bot_info_page(&base_url(&req))),
         ("GET", ["sitemaps", file]) => {
-            let Some(n) = file.strip_suffix(".xml").and_then(|n| n.parse::<usize>().ok()) else { return err(404, "no such sitemap") };
-            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            // `N.xml` is Base (and N = 0 the site's own pages); `<chain>-N.xml` another chain.
+            let Some(stem) = file.strip_suffix(".xml") else { return err(404, "no such sitemap") };
+            let (m, n) = match stem.rsplit_once('-') {
+                Some((name, n)) => match (chain::net_named(name).and_then(|c| chain::index_of(c.id)), n.parse::<usize>()) {
+                    (Some(m), Ok(n)) if n > 0 => (m, n),
+                    _ => return err(404, "no such sitemap"),
+                },
+                None => match stem.parse::<usize>() {
+                    Ok(n) => (chain::index(), n),
+                    Err(_) => return err(404, "no such sitemap"),
+                },
+            };
+            let idx = m.lock().unwrap_or_else(|e| e.into_inner());
             return match botpages::sitemap_part(&idx, n, &base_url(&req)) {
                 Some(body) => Response { status: 200, content_type: "application/xml; charset=utf-8", body },
                 None => err(404, "no such sitemap"),
@@ -1421,7 +1457,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         // A browser gets the home page; a bot or script asking for JSON gets the status below.
         ("GET", []) if req.header("accept").map(|a| a.contains("text/html")).unwrap_or(false) => {
             let (agents, _, _) = engine.stats();
-            let registry_bots = chain::index().lock().unwrap_or_else(|e| e.into_inner()).agents.len();
+            let registry_bots = chain::total_bots();
             let (wallets, services) = {
                 let l = payments::lock();
                 (l.sellers.len(), l.services.len())
@@ -1524,9 +1560,10 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         }
 
         // ---- every bot in the public on-chain registry ----------------------------------
-        ("GET", ["bots", chain_name, n]) if *chain_name == chain::CHAIN_NAME => {
+        ("GET", ["bots", chain_name, n]) if chain::net_named(chain_name).is_some_and(|c| chain::index_of(c.id).is_some()) => {
             let Ok(n) = n.parse::<u64>() else { return err(404, "no such bot") };
-            let agent_ref = format!("erc8004:{}:{n}", chain::CHAIN_ID);
+            let net = chain::net_named(chain_name).expect("checked above");
+            let agent_ref = format!("erc8004:{}:{n}", net.id);
             // Agents asking for data at a page address get the data.
             if formats::wanted(&req) != formats::Format::Html {
                 let base = base_url(&req);
@@ -1537,7 +1574,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             }
             let owner = registry_owner(&engine, &agent_ref).map(|o| o.to_string());
             let owner_profile = owner.as_deref().map(|o| engine.trust_profile_json(o, now));
-            let idx = chain::index().lock().unwrap_or_else(|e| e.into_inner());
+            let idx = chain::index_of(net.id).expect("checked above").lock().unwrap_or_else(|e| e.into_inner());
             let claimed = owner.as_deref().zip(owner_profile.as_ref());
             match botpages::bot_page(&idx, n, claimed, &base_url(&req)) {
                 Some(html) => Response::html(html),
@@ -1552,8 +1589,9 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                 },
             }
         }
-        ("GET", ["v1", "bots", chain_name, n]) if *chain_name == chain::CHAIN_NAME => {
-            match n.parse::<u64>().ok().and_then(|n| registry_profile(&engine, &format!("erc8004:{}:{n}", chain::CHAIN_ID), now)) {
+        ("GET", ["v1", "bots", chain_name, n]) if chain::net_named(chain_name).is_some() => {
+            let id = chain::net_named(chain_name).expect("checked above").id;
+            match n.parse::<u64>().ok().and_then(|n| registry_profile(&engine, &format!("erc8004:{id}:{n}"), now)) {
                 Some(p) => ok(p),
                 None => err(404, "no bot with that number in the registry (new bots appear a few minutes after they register)"),
             }
@@ -3145,7 +3183,7 @@ mod tests {
             let mut idx = chain::index().lock().unwrap();
             idx.apply(&chain::tests::registered(900_301, "0x00000000000000000000000000000000000000a1", "", 50_000_000));
         }
-        e.lock().unwrap().record_verified("seller-bot", "erc8004", &ext, "test", 1, chain::Index::block_ms(sold_at_block) - 1_000).unwrap();
+        e.lock().unwrap().record_verified("seller-bot", "erc8004", &ext, "test", 1, chain::Index::base_block_ms(sold_at_block) - 1_000).unwrap();
         let claimed = |e: &Mutex<Engine>| {
             body_json(&route(e, req("GET", "/v1/trust/erc8004:8453:900301", &[], ""), PROD))
                 .get("claimed_by")
@@ -3163,7 +3201,7 @@ mod tests {
         assert_eq!(claimed(&e), None, "a sold bot isn't the seller's any more");
         assert!(route(&e, req("GET", "/bots/base/900301", &[("Accept", "text/html")], ""), PROD).body.contains("Claim with my wallet"));
         // The new owner proves control afterwards and takes the page.
-        e.lock().unwrap().record_verified("buyer-bot", "erc8004", &ext, "test", 2, chain::Index::block_ms(sold_at_block) + 1_000).unwrap();
+        e.lock().unwrap().record_verified("buyer-bot", "erc8004", &ext, "test", 2, chain::Index::base_block_ms(sold_at_block) + 1_000).unwrap();
         assert_eq!(claimed(&e).as_deref(), Some("buyer-bot"));
     }
 
@@ -4025,6 +4063,33 @@ mod settlement_tests {
         let engine = e.lock().unwrap_or_else(|e| e.into_inner());
         let used = engine.customer(&cus).unwrap().usage.get(&billing::month_of(now)).unwrap().lookups;
         assert_eq!(used, 2, "the same bot three times today is one check; another bot is a second");
+    }
+
+    #[test]
+    fn bots_on_other_chains_have_pages_search_and_ids() {
+        let e = Mutex::new(Engine::with_admin_secret("adm"));
+        {
+            let mut eth = chain::index_of(1).unwrap().lock().unwrap();
+            eth.apply(&chain::tests::registered(77_001, "0x00000000000000000000000000000000000e7401", "", 5));
+        }
+        let mut page = req("GET", "/bots/ethereum/77001", "", "");
+        page.headers.insert("accept".into(), "text/html".into());
+        let html = route(&e, page, PROD);
+        assert_eq!(html.status, 200, "{}", html.body);
+        assert!(html.body.contains("registry on Ethereum"));
+        let data = json::parse(&route(&e, req("GET", "/v1/trust/erc8004:1:77001", "", ""), PROD).body).unwrap();
+        assert_eq!(data.get("profile_page").and_then(|v| v.as_str()), Some("/bots/ethereum/77001"), "{data:?}");
+        let mut search = req("GET", "/v1/bots", "", "");
+        search.query.insert("q".into(), "77001".into());
+        search.query.insert("chain".into(), "ethereum".into());
+        let found = json::parse(&route(&e, search, PROD).body).unwrap();
+        assert!(found.to_string().contains("erc8004:1:77001"), "{found:?}");
+        assert_eq!(route(&e, req("GET", "/sitemaps/ethereum-1.xml", "", ""), PROD).status, 200);
+        assert!(route(&e, req("GET", "/go", "", ""), PROD).status == 200);
+        let mut go = req("GET", "/go", "", "");
+        go.query.insert("q".into(), "erc8004:1:77001".into());
+        assert!(route(&e, go, PROD).body.contains("/bots/ethereum/77001"));
+        assert_eq!(route(&e, req("GET", "/bots/nowhere/1", "", ""), PROD).status, 404);
     }
 
     #[test]

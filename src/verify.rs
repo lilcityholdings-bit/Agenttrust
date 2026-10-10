@@ -524,7 +524,8 @@ impl LiveNet {
             43114 => "avalanche-c-chain-rpc.publicnode.com",
             11155111 => "ethereum-sepolia-rpc.publicnode.com",
             84532 => "base-sepolia-rpc.publicnode.com",
-            _ => return None,
+            // Every other chain whose registry Keptvow reads: its first free public node.
+            _ => return crate::chain::net(chain).and_then(|n| n.rpcs.first()).map(|u| u.to_string()),
         };
         Some(format!("https://{host}"))
     }
