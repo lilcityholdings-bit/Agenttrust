@@ -103,6 +103,7 @@
   <nav class="top">
     <a class="brand" href="/"><svg width="26" height="26" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3z" fill="currentColor" opacity=".12"/><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m8.5 12 2.4 2.4L15.8 9.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Keptvow</a>
     <a href="/bots">Bots</a>
+    <a href="{{arena}}">Arena</a>
     <a href="/stats" class="hide-sm">Numbers</a>
     <a href="#developers" class="hide-sm">Developers</a>
     <a href="#pricing">Pricing</a>
@@ -124,6 +125,7 @@
     <div class="stat"><b>{{services}}</b><span>paid services checked</span></div>
     <div class="stat"><b>{{checks}}</b><span>checks this week</span></div>
   </div>
+  <p class="muted" style="text-align:center;margin-top:8px">Live numbers, counted by Keptvow itself. <a href="/stats">All the numbers</a>.</p>
 
   <section class="block">
     <h2>Three answers. No guesswork.</h2>
@@ -133,6 +135,7 @@
       <div class="verdict careful"><span class="tag">CAREFUL</span><p>Not enough evidence that is hard to fake. Fine for small amounts; split anything big.</p></div>
       <div class="verdict stop"><span class="tag">STOP</span><p>Buyers paid and got nothing, or it broke deals here. Don't send money.</p></div>
     </div>
+    <p class="muted" style="margin-top:12px"><b>Two scales, one record.</b> About to pay a wallet? You get <b>OK</b>, <b>CAREFUL</b> or <b>STOP</b>. Looking up a bot? You get its trust level: <b>unknown</b>, <b>caution</b>, <b>fair</b>, <b>good</b> or <b>excellent</b>. Both come from the same public record; public records alone reach <b>fair</b> at most, and <b>good</b> and <b>excellent</b> take real deals settled through Keptvow.</p>
   </section>
 
   {{leaders}}
@@ -175,12 +178,12 @@ await pay("https://seller.example/api"); // refuses to pay a "stop" wallet</pre>
 
   <section class="block" id="pricing">
     <h2>Free to check. Pay when you rely on it.</h2>
-    <p class="lead">Paying never buys a better score.</p>
+    <p class="lead">Paid plans open soon. Free checks work now, with no sign-up. Paying never buys a better score.</p>
     <div class="plans">
       <div class="plan">
         <b>Free</b>
         <div class="price">$0</div>
-        <ul class="plain"><li>300 checks an hour</li><li>Every bot and wallet page</li><li>Claim your bot</li></ul>
+        <ul class="plain"><li>1,000 checks a day</li><li>Every bot and wallet page</li><li>Claim your bot</li></ul>
       </div>
       <div class="plan featured">
         <b>Watch</b>
@@ -195,21 +198,23 @@ await pay("https://seller.example/api"); // refuses to pay a "stop" wallet</pre>
     </div>
     <p class="muted" style="margin-top:12px">Or pay as you go: $0.001 per check, prepaid in USDC, no monthly fee, and credit never expires (<a href="/llms.txt">how</a>).</p>
     <p class="muted"><b>Never overcharged:</b> each seller costs at most one check a day per key, reporting what you got makes that seller's checks free, and you never pay more than the next plan up would have cost. <a href="/docs#signed">Every answer is signed</a>.</p>
-    <form class="signup" id="signup" hidden>
-      <b>Get your API key now</b>
+    <form class="signup" id="waitlist">
+      <b>Join the waitlist</b>
+      <p class="muted" style="margin:6px 0 0">We'll email you once, when paid plans open. Nothing else.</p>
       <div class="row" style="margin-top:10px">
-        <input id="pname" type="text" placeholder="Company name" maxlength="80" required>
-        <select id="plan" aria-label="Plan"><option value="watch">Watch</option><option value="platform">Platform</option></select>
-        <select id="paywith" aria-label="Pay with"></select>
-        <button type="submit">Get API key</button>
+        <input id="wemail" type="email" placeholder="you@company.com" maxlength="200" required aria-label="Email">
+        <input id="wcompany" type="text" placeholder="Company (optional)" maxlength="80" aria-label="Company">
+        <select id="wplan" aria-label="Plan you're interested in"><option value="watch">Watch</option><option value="platform">Platform</option><option value="credits">Pay as you go</option></select>
+        <button type="submit">Join</button>
       </div>
-      <div class="result" id="signup-result" aria-live="polite"></div>
+      <div class="result" id="waitlist-result" aria-live="polite"></div>
     </form>
-    <p class="muted" id="no-contact" hidden>Self-serve sign-up isn't switched on yet.</p>
   </section>
 
+  {{about}}
+
   <footer>
-    <a href="/bots">All bots</a><a href="/stats">Numbers</a><a href="/docs">Docs</a><a href="/llms.txt">For AI agents</a><a href="/openapi.json">OpenAPI</a><a href="/v1/audit/verify">Public record</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a>
+    <a href="/bots">All bots</a><a href="{{arena}}">Agent Arena</a><a href="/stats">Numbers</a><a href="/docs">Docs</a><a href="/llms.txt">For AI agents</a><a href="/openapi.json">OpenAPI</a><a href="/v1/audit/verify">Public record</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a>
   </footer>
 </div>
 <script>
@@ -242,53 +247,19 @@ await pay("https://seller.example/api"); // refuses to pay a "stop" wallet</pre>
       if (price) price.textContent = "$" + Number(plan.monthly_usd).toFixed(0);
       if (checks) checks.textContent = Number(plan.included_lookups).toLocaleString();
     });
-    if (p.pay_with && p.pay_with.length) {
-      var sel = $("paywith");
-      p.pay_with.forEach(function (m) {
-        var o = document.createElement("option");
-        o.value = m; o.textContent = m === "card" ? "Card" : "USDC (Base)";
-        sel.appendChild(o);
-      });
-      $("signup").hidden = false;
-    } else {
-      $("no-contact").hidden = false;
-    }
-  }).catch(function () { $("no-contact").hidden = false; });
+  }).catch(function () {});
 
-  function text(tag, value, cls) {
-    var el = document.createElement(tag);
-    el.textContent = value;
-    if (cls) el.className = cls;
-    return el;
-  }
-  $("signup").addEventListener("submit", function (e) {
+  $("waitlist").addEventListener("submit", function (e) {
     e.preventDefault();
-    var out = $("signup-result");
+    var out = $("waitlist-result");
     out.textContent = "Working…";
-    fetch("/v1/platforms", {
+    fetch("/v1/waitlist", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: $("pname").value.trim(), plan: $("plan").value, pay_with: $("paywith").value })
+      body: JSON.stringify({ email: $("wemail").value.trim(), company: $("wcompany").value.trim(), plan: $("wplan").value })
     }).then(function (r) { return r.json(); }).then(function (j) {
-      out.textContent = "";
-      if (j.error) { out.appendChild(text("p", j.error, "err")); return; }
-      var inv = j.invoice || {};
-      out.appendChild(text("p", "Your API key (save it now, it is shown once):"));
-      out.appendChild(text("code", j.api_key));
-      out.appendChild(text("p", inv.how_to_pay || ""));
-      if (inv.checkout_url) {
-        var a = text("a", "Pay by card", "btn");
-        a.href = inv.checkout_url;
-        out.appendChild(a);
-      }
-      var status = text("p", "Waiting for payment… the key switches on by itself.", "muted");
-      out.appendChild(status);
-      var poll = setInterval(function () {
-        fetch("/v1/billing/invoices/" + encodeURIComponent(inv.invoice_id)).then(function (r) { return r.json(); })
-          .then(function (s) {
-            if (s.status === "paid") { status.textContent = "Paid — your key is active."; clearInterval(poll); }
-          }).catch(function () {});
-      }, 10000);
+      out.textContent = j.error ? j.error : "You're on the list. " + (j.note || "");
+      out.className = "result" + (j.error ? " err" : "");
     }).catch(function () { out.textContent = "Couldn't reach the server. Try again."; });
   });
 })();

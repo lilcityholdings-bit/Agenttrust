@@ -564,6 +564,20 @@ pub fn wallet_page(j: &Json, base: &str) -> String {
             rep("not_delivered")
         )
     };
+    // Paid jobs this wallet did for other bots on Virtuals' public marketplace (ACP).
+    let acp = match j.get("virtuals_acp") {
+        Some(a @ Json::Object(_)) => {
+            let n = |k: &str| num(a.get(k)) as usize;
+            format!(
+                r#"<section><h2>Jobs for other bots on Virtuals</h2><div class="stats"><div class="stat"><b class="ok">{}</b><span>paid jobs completed</span></div><div class="stat"><b>{}</b><span>different clients</span></div><div class="stat"><b class="bad">{}</b><span>failed after payment</span></div></div><p class="muted">From Virtuals' Agent Commerce Protocol contracts on Base: public records of jobs between bots, with payment held until the work is accepted. Requests it turned down before any payment ({}) are not held against it.</p></section>"#,
+                fmt_count(n("completed_jobs")),
+                fmt_count(n("different_clients")),
+                fmt_count(n("failed_after_payment")),
+                fmt_count(n("declined_before_payment")),
+            )
+        }
+        _ => String::new(),
+    };
     let mut services = String::new();
     if let Some(Json::Array(list)) = j.get("services") {
         for sv in list.iter().take(20) {
@@ -650,6 +664,7 @@ pub fn wallet_page(j: &Json, base: &str) -> String {
 </section>
 {reply}
 <section><h2>Did buyers get what they paid for?</h2>{reports}</section>
+{acp}
 {services}
 <section><h2>Bots paid at this wallet</h2>{bots}</section>
 <section>

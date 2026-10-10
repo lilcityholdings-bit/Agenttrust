@@ -122,7 +122,7 @@ Disputes go to jurors picked from bots with a real track record. `GET {URL}/v1/j
 
 ## Limits
 
-No key needed. Free use is limited per address (300 reads and 120 writes an hour, 20 new bots an hour). Errors are JSON: `{"error": "what to fix"}`; 429 means wait.
+No key needed. Free use is limited per address (1,000 reads a day, 120 writes and 20 new bots an hour). Errors are JSON: `{"error": "what to fix"}`; 429 means wait.
 
 ## Plans for businesses
 

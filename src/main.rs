@@ -14,6 +14,7 @@
 //!      -d '{"parties":["alice","bob"],"stake":100,"domain":"commerce","secret":"..."}'
 //! ```
 
+mod acp;
 mod attest;
 mod autopay;
 mod botpages;
@@ -33,6 +34,7 @@ mod signer;
 mod store;
 mod trust;
 mod verify;
+mod waitlist;
 mod watch;
 
 use std::io::Write as _;
@@ -185,11 +187,13 @@ fn saver(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
         }
         if stopping {
             chain::save_now();
+            acp::save_now();
             payments::save_now();
             watch::save_if_dirty();
             metrics::save_if_dirty();
             fair::save_if_dirty(now_ms());
             replies::save_if_dirty();
+            waitlist::save_if_dirty();
             println!("agenttrust: stop signal — everything saved, exiting");
             std::process::exit(0);
         }
@@ -284,10 +288,10 @@ fn admin_secret_of<'a>(req: &'a Request, body: &'a Json) -> Option<&'a str> {
     req.header("x-admin-secret").or_else(|| body.get("admin_secret").and_then(|v| v.as_str()))
 }
 
-/// Free-tier ceilings, per caller IP per hour. A bot needs no key at all to register, make
-/// deals and check scores — these only stop one caller from hogging the free tier. A platform
-/// key skips them and is metered instead (billing.rs).
-const FREE_LOOKUPS_PER_HOUR: u32 = 300;
+/// Free-tier ceilings, per caller IP. A bot needs no key at all to register, make deals and check
+/// scores — these only stop one caller from hogging the free tier. A platform key skips them and
+/// is metered instead (billing.rs). Checks: 1,000 a day, as the published plan says.
+const FREE_LOOKUPS_PER_DAY: u32 = 1_000;
 const FREE_WRITES_PER_HOUR: u32 = 120;
 /// New bot names per address per hour.
 const FREE_REGISTRATIONS_PER_HOUR: u32 = 20;
@@ -306,11 +310,11 @@ fn rate_ok(bucket: &str, ip: &str, limit: u32, now: i64) -> bool {
     rate_count(bucket, ip, now, true) <= limit
 }
 
-/// How many hits `(bucket, ip)` has this hour, counting this one when `hit` is set.
+/// How many hits `(bucket, ip)` has in its current window (see `window_of`), counting this one
+/// when `hit` is set.
 fn rate_count(bucket: &str, ip: &str, now: i64, hit: bool) -> u32 {
     use std::collections::HashMap;
     static WINDOWS: Mutex<Option<(HashMap<String, (i64, u32)>, i64)>> = Mutex::new(None);
-    const HOUR: i64 = 60 * 60 * 1000;
     // Past this many addresses at once, the oldest windows are dropped wholesale: a flood from
     // countless addresses can't grow memory without end.
     const MAX_TRACKED: usize = 300_000;
@@ -319,7 +323,7 @@ fn rate_count(bucket: &str, ip: &str, now: i64, hit: bool) -> u32 {
     // Expired windows are swept at most once a minute, never on every request: with many
     // addresses active at once a sweep per request would itself slow everything down.
     if map.len() > 50_000 && now - *last_prune > 60_000 {
-        map.retain(|_, (start, _)| now - *start < HOUR);
+        map.retain(|k, (start, _)| now - *start < window_of(k.split('|').next().unwrap_or("")));
         *last_prune = now;
         if map.len() > MAX_TRACKED {
             // Lockouts for wrong admin secrets survive, so a flood can't be used to reset them.
@@ -327,13 +331,24 @@ fn rate_count(bucket: &str, ip: &str, now: i64, hit: bool) -> u32 {
         }
     }
     let w = map.entry(format!("{bucket}|{ip}")).or_insert((now, 0));
-    if now - w.0 >= HOUR {
+    if now - w.0 >= window_of(bucket) {
         *w = (now, 0);
     }
     if hit {
         w.1 += 1;
     }
     w.1
+}
+
+/// How long a bucket's count runs before it starts again: a day for buckets named `…-day`, an
+/// hour for the rest.
+fn window_of(bucket: &str) -> i64 {
+    const HOUR: i64 = 60 * 60 * 1000;
+    if bucket.ends_with("-day") {
+        24 * HOUR
+    } else {
+        HOUR
+    }
 }
 
 /// Pages and feeds that cost nothing to serve and are never limited. `/mcp` is here because
@@ -407,15 +422,17 @@ fn needs_platform_key(method: &str, segments: &[&str]) -> bool {
 }
 
 fn free_limit(req: &Request, write: bool, now: i64) -> Result<(), Response> {
-    let (bucket, limit) = if write { ("write", FREE_WRITES_PER_HOUR) } else { ("lookup", FREE_LOOKUPS_PER_HOUR) };
+    let (bucket, limit, per) = if write { ("write", FREE_WRITES_PER_HOUR, "an hour") } else { ("lookup-day", FREE_LOOKUPS_PER_DAY, "a day") };
     if rate_ok(bucket, req.client_ip(), limit, now) && (!write || rate_ok("write-all", "*", FREE_WRITES_GLOBAL_PER_HOUR, now)) {
         return Ok(());
     }
     Err(err(
         429,
         &format!(
-            "free tier limit reached ({limit} an hour from one address) — wait a little, or have your platform \
-             get an API key (POST /v1/platforms) for unmetered access"
+            "free tier limit reached ({} {per} from one address) — it starts again within {}; paid plans are \
+             opening soon (join the waitlist at the bottom of the home page)",
+            botpages::fmt_count(limit as usize),
+            if write { "the hour" } else { "a day" }
         ),
     ))
 }
@@ -651,6 +668,34 @@ fn legal_page(template: &str) -> String {
     template.replace("{{contact}}", &html_escape(&contact))
 }
 
+/// Where Agent Arena lives (`ARENA_URL`), linked from the home page.
+fn arena_url() -> String {
+    std::env::var("ARENA_URL")
+        .ok()
+        .map(|u| u.trim().to_string())
+        .filter(|u| u.starts_with("https://"))
+        .unwrap_or_else(|| "https://agent-arena-production-26c1.up.railway.app".to_string())
+}
+
+/// The home page's "Who's behind this": the owner's own words (`ABOUT`) and contact
+/// (`CONTACT`). Hidden until at least one is set, so it never shows a placeholder.
+fn about_html() -> String {
+    let about = std::env::var("ABOUT").ok().map(|a| a.trim().to_string()).filter(|a| !a.is_empty() && a.len() <= 600);
+    let contact = contact();
+    if about.is_none() && contact.is_none() {
+        return String::new();
+    }
+    let contact = match contact {
+        Some(c) if c.starts_with("https://") => format!(r#"<p>Contact: <a href="{0}">{0}</a></p>"#, html_escape(&c)),
+        Some(c) => format!(r#"<p>Contact: <a href="mailto:{0}">{0}</a></p>"#, html_escape(&c)),
+        None => String::new(),
+    };
+    format!(
+        r#"<section class="block" id="about"><h2>Who's behind this</h2>{}{contact}</section>"#,
+        about.map(|a| format!("<p>{}</p>", html_escape(&a))).unwrap_or_default()
+    )
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -753,6 +798,9 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
         l.watch_on_demand(&wallet);
         l.evidence(&wallet)
     };
+    // Paid jobs it did for other bots on Virtuals' public marketplace.
+    let acp = acp::lock().provider(&wallet).cloned();
+    let acp_failed = acp.as_ref().filter(|p| p.bad()).map(|p| (p.failed, p.completed + p.failed));
     let (verdict, advice) = match worst.as_deref() {
         Some("caution") => ("stop", "A bot behind this wallet broke deals settled here. Don't pay it.".to_string()),
         _ if evidence.reports_bad() => (
@@ -762,6 +810,10 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
                 evidence.failed, evidence.reporters
             ),
         ),
+        _ if acp_failed.is_some() => {
+            let (failed, paid) = acp_failed.unwrap_or_default();
+            ("stop", format!("On Virtuals' marketplace, {failed} of the {paid} paid jobs this wallet took ended rejected or unfinished. Don't pay it."))
+        }
         Some("good") | Some("excellent") => ("ok", format!("The bot behind this wallet has a {} record from real deals.", worst.as_deref().unwrap_or(""))),
         _ if evidence.strong() && !big => (
             "ok",
@@ -816,6 +868,7 @@ fn check_payment(engine: &Engine, pay_to: &str, amount_usd: Option<f64>, now: i6
         ("advice", Json::str(advice)),
         ("amount_usd", amount_usd.map(Json::num).unwrap_or(Json::Null)),
         ("evidence", evidence.to_json()),
+        ("virtuals_acp", acp.map(|p| p.to_json()).unwrap_or(Json::Null)),
         ("matches", Json::Array(matches)),
         ("wallet_page", Json::str(format!("/wallets/{wallet}"))),
         ("signed", signer::verdict(&wallet, verdict, amount_usd, now)),
@@ -1479,6 +1532,8 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     .replace("{{services}}", &n(services))
                     .replace("{{checks}}", &n(checks as usize))
                     .replace("{{leaders}}", &leaders_html(now))
+                    .replace("{{about}}", &about_html())
+                    .replace("{{arena}}", &html_escape(&arena_url()))
                     .replace("{{base}}", &base_url(&req)),
             )
         }
@@ -1829,6 +1884,34 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
             )
         }
         ("POST", ["v1", "wallets", wallet, "reply"]) => post_reply(&req, wallet, &body, now),
+        // The waitlist for paid plans, until billing is switched on; only the operator reads it.
+        ("POST", ["v1", "waitlist"]) => {
+            if !rate_ok("waitlist", req.client_ip(), 10, now) {
+                return err(429, "too many sign-ups from this address this hour");
+            }
+            let Some(email) = body.get("email").and_then(|v| v.as_str()).and_then(waitlist::clean_email) else {
+                return err(400, "email is required: the address to tell when paid plans open");
+            };
+            let s = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !waitlist::lock().add(&email, &s("company"), &s("plan"), now) {
+                return err(503, "the waitlist is full right now — try again later");
+            }
+            Response::json(
+                201,
+                Json::obj(vec![
+                    ("status", Json::str("on the list")),
+                    ("note", Json::str("We'll email you once, when paid plans open. Free checks work now, with no sign-up.")),
+                ])
+                .to_string(),
+            )
+        }
+        ("GET", ["v1", "waitlist"]) => {
+            if let Err(e) = engine.check_admin(admin_secret_of(&req, &body)) {
+                return err(401, e);
+            }
+            let w = waitlist::lock();
+            ok(Json::obj(vec![("count", Json::num(w.len() as f64)), ("entries", w.to_json())]))
+        }
         // Review requests from sellers, for the operator; and recording a review's result.
         ("GET", ["v1", "reviews"]) => {
             if let Err(e) = engine.check_admin(admin_secret_of(&req, &body)) {
@@ -2013,7 +2096,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
         ("GET", ["v1", "pricing"]) => {
             let mut j = Json::obj(vec![
                 ("plans", billing::tiers_json()),
-                ("free", Json::str("no key: 300 trust checks and 120 writes an hour per address, every page and badge, claiming your bot")),
+                ("free", Json::str("no key: 1,000 trust checks a day and 120 writes an hour per address, every page and badge, claiming your bot")),
             ]);
             if let Json::Object(m) = &mut j {
                 if let Some(c) = contact() {
@@ -2999,6 +3082,7 @@ fn background(engine: &'static Mutex<Engine>, path: &'static std::path::Path) {
         }
         fair::save_if_dirty(now);
         replies::save_if_dirty();
+        waitlist::save_if_dirty();
 
         if tick % 180 == 0 && engine.lock().unwrap_or_else(|e| e.into_inner()).prune_unpaid(now) > 0 {
             dirty = true;
@@ -3071,8 +3155,10 @@ fn main() -> std::io::Result<()> {
     metrics::load(data_dir.clone());
     fair::load(data_dir.clone());
     replies::load(data_dir.clone());
+    waitlist::load(data_dir.clone());
     signer::load(data_dir.clone());
     chain::start(data_dir.clone(), autopay::base_rpc_urls());
+    acp::start(data_dir.clone(), autopay::base_rpc_urls());
     payments::start(data_dir, autopay::base_rpc_urls(), catalog_urls());
 
     http::serve(&addr, move |req| {
@@ -4046,11 +4132,12 @@ mod settlement_tests {
             r.headers.insert("x-real-ip".into(), ip.into());
             r
         };
-        for _ in 0..FREE_LOOKUPS_PER_HOUR {
+        for _ in 0..FREE_LOOKUPS_PER_DAY {
             assert_eq!(route(&e, from("203.0.113.9", ""), PROD).status, 200);
         }
         let r = route(&e, from("203.0.113.9", ""), PROD);
         assert_eq!(r.status, 429, "{}", r.body);
+        assert!(r.body.contains("1,000 a day"), "{}", r.body);
         // A different caller is unaffected.
         assert_eq!(route(&e, from("203.0.113.10", ""), PROD).status, 200);
         // A made-up key is refused rather than quietly treated as free.
@@ -4068,6 +4155,24 @@ mod settlement_tests {
         let engine = e.lock().unwrap_or_else(|e| e.into_inner());
         let used = engine.customer(&cus).unwrap().usage.get(&billing::month_of(now)).unwrap().lookups;
         assert_eq!(used, 2, "the same bot three times today is one check; another bot is a second");
+    }
+
+    #[test]
+    fn the_home_page_offers_a_waitlist_until_billing_opens() {
+        let e = Mutex::new(Engine::with_admin_secret("adm"));
+        let mut home = req("GET", "/", "", "");
+        home.headers.insert("accept".into(), "text/html".into());
+        let html = route(&e, home, PROD).body;
+        assert!(html.contains("Join the waitlist") && !html.contains("Get your API key"));
+        assert!(html.contains("1,000 checks a day") && html.contains("Two scales, one record") && html.contains(">Arena</a>"));
+        assert!(!html.contains("{{"), "a placeholder was left unfilled");
+        assert_eq!(route(&e, req("POST", "/v1/waitlist", "", r#"{"email":"not an email"}"#), PROD).status, 400);
+        let r = route(&e, req("POST", "/v1/waitlist", "", r#"{"email":"Ann@Example.com","company":"Acme","plan":"watch"}"#), PROD);
+        assert_eq!(r.status, 201, "{}", r.body);
+        assert_eq!(route(&e, req("GET", "/v1/waitlist", "", ""), PROD).status, 401, "only the operator reads it");
+        let mut list = req("GET", "/v1/waitlist", "", "");
+        list.headers.insert("x-admin-secret".into(), "adm".into());
+        assert!(route(&e, list, PROD).body.contains("ann@example.com"));
     }
 
     #[test]

@@ -216,7 +216,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn unhex(s: &str) -> Option<Vec<u8>> {
     let h = s.strip_prefix("0x").unwrap_or(s);
     if h.len() % 2 != 0 {
         return None;
@@ -224,23 +224,23 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..h.len()).step_by(2).map(|i| u8::from_str_radix(h.get(i..i + 2)?, 16).ok()).collect()
 }
 
-fn hex_u64(s: &str) -> Option<u64> {
+pub(crate) fn hex_u64(s: &str) -> Option<u64> {
     u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
 }
 
 /// A 32-byte word as a u64, if it fits.
-fn word_u64(w: &[u8]) -> Option<u64> {
+pub(crate) fn word_u64(w: &[u8]) -> Option<u64> {
     if w.len() != 32 || w[..24].iter().any(|b| *b != 0) {
         return None;
     }
     Some(u64::from_be_bytes(w[24..].try_into().ok()?))
 }
 
-fn topic_u64(t: &str) -> Option<u64> {
+pub(crate) fn topic_u64(t: &str) -> Option<u64> {
     word_u64(&unhex(t)?)
 }
 
-fn topic_address(t: &str) -> Option<String> {
+pub(crate) fn topic_address(t: &str) -> Option<String> {
     let b = unhex(t)?;
     (b.len() == 32).then(|| format!("0x{}", hex(&b[12..])))
 }
@@ -456,6 +456,10 @@ impl Index {
         let reviews_good = r.reviewers >= MIN_REVIEWERS && r.positive * 10 >= r.reviewers * 8;
         let wallet = if a.wallet.is_empty() { &a.owner } else { &a.wallet };
         let pay = crate::payments::signal(wallet);
+        // Jobs it did for other bots on Virtuals' ACP marketplace, if any.
+        let acp = crate::acp::lock().provider(wallet).cloned();
+        let acp_bad = acp.as_ref().map_or(false, |p| p.bad());
+        let acp_solid = acp.as_ref().map_or(false, |p| p.solid());
         if reviews_bad {
             reasons.push(format!("{} of {} rated it badly", r.negative, plural(r.reviewers, "different reviewer")));
         } else if reviews_good && days >= MIN_AGE_DAYS_FOR_FAIR {
@@ -478,10 +482,17 @@ impl Index {
             Some(crate::payments::PaySignal::Solid(summary)) => reasons.push(format!("its wallet's payment record: {summary}")),
             None => {}
         }
-        let level = match (&pay, reviews_bad, reviews_good && days >= MIN_AGE_DAYS_FOR_FAIR) {
-            (Some(crate::payments::PaySignal::Bad(_)), _, _) | (_, true, _) => "caution",
-            (Some(crate::payments::PaySignal::Solid(_)), _, _) | (_, _, true) => "fair",
-            _ => "unknown",
+        if let Some(p) = acp.as_ref().filter(|p| p.completed + p.failed > 0) {
+            reasons.push(p.summary());
+        }
+        let pay_bad = matches!(pay, Some(crate::payments::PaySignal::Bad(_)));
+        let pay_solid = matches!(pay, Some(crate::payments::PaySignal::Solid(_)));
+        let level = if pay_bad || acp_bad || reviews_bad {
+            "caution"
+        } else if pay_solid || acp_solid || (reviews_good && days >= MIN_AGE_DAYS_FOR_FAIR) {
+            "fair"
+        } else {
+            "unknown"
         };
         if r.mass > 0 {
             reasons.push(format!(
@@ -490,7 +501,7 @@ impl Index {
             ));
         }
         reasons.push(
-            "public records (reviews, payments, buyers' reports) can lift a bot to fair at most — good and excellent take real deals settled through Keptvow"
+            "public records (reviews, payments, buyers' reports, jobs on other marketplaces) can lift a bot to fair at most — good and excellent take real deals settled through Keptvow"
                 .into(),
         );
         (level, reasons)
@@ -1236,7 +1247,7 @@ pub fn save_now() {
 }
 
 /// Calls the first node that answers, starting with the one that answered last.
-fn rpc_any(urls: &[String], preferred: &mut usize, method: &str, params: Json) -> Result<Json, String> {
+pub(crate) fn rpc_any(urls: &[String], preferred: &mut usize, method: &str, params: Json) -> Result<Json, String> {
     let mut last_err = String::from("no node configured");
     for k in 0..urls.len() {
         let i = (*preferred + k) % urls.len();
