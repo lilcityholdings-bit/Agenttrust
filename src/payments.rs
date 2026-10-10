@@ -1174,6 +1174,7 @@ static BF_RETRY_FIXED: AtomicUsize = AtomicUsize::new(0);
 fn report_progress() {
     let (line, spread) = {
         let l = lock();
+        refresh_signals(&l);
         let (read, watched) = l.history_progress();
         let strong = l.strong_sellers().len();
         STRONG_SELLERS.store(strong, Ordering::Relaxed);
@@ -1192,6 +1193,66 @@ fn report_progress() {
     println!("keptvow: history query shapes (answered/refused): {}", shapes_line());
     println!("keptvow: sellers against the bar for ok: {}", spread_line(&spread));
     *BAR_SPREAD.lock().unwrap_or_else(|e| e.into_inner()) = spread;
+}
+
+// ---- what a bot's payment wallet says about the bot -------------------------------------------
+//
+// A bot's score uses every public record there is, not only reviews: the payment record of the
+// wallet it is paid at counts too. A solid record lifts an unrated bot to "fair" (public data
+// never goes higher; good and excellent take deals settled through Keptvow), and buyers saying
+// they paid and got nothing pull it down to "caution". Kept as a small table refreshed with the
+// progress report, so scoring a bot never has to read the whole ledger.
+
+/// The payment record of a bot's wallet, as it bears on the bot's score.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaySignal {
+    /// Enough established, returning buyers to count as a solid record; the summary says so.
+    Solid(String),
+    /// Buyers who paid report getting nothing.
+    Bad(String),
+}
+
+fn signal_table() -> &'static Mutex<HashMap<String, PaySignal>> {
+    #[cfg(not(test))]
+    {
+        static T: OnceLock<Mutex<HashMap<String, PaySignal>>> = OnceLock::new();
+        T.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    // One per test thread, so tests running side by side don't see each other's wallets.
+    #[cfg(test)]
+    {
+        thread_local! {
+            static T: &'static Mutex<HashMap<String, PaySignal>> = Box::leak(Box::new(Mutex::new(HashMap::new())));
+        }
+        T.with(|t| *t)
+    }
+}
+
+/// What the payment record of `wallet` says about the bot paid there, if anything yet.
+pub fn signal(wallet: &str) -> Option<PaySignal> {
+    if wallet.is_empty() {
+        return None;
+    }
+    signal_table().lock().unwrap_or_else(|e| e.into_inner()).get(&wallet.to_ascii_lowercase()).cloned()
+}
+
+/// Recomputes the table from the ledger: sellers with enough buyers to be solid, or with
+/// delivery reports.
+fn refresh_signals(l: &Ledger) {
+    let mut fresh = HashMap::new();
+    for (w, e) in l.evidence_where(|s| s.payers.len() >= SMALL_BUYERS || !s.reports.is_empty()) {
+        if e.reports_bad() {
+            fresh.insert(w, PaySignal::Bad(format!("{} of {} buyers who reported paid its wallet and got nothing", e.failed, e.reporters)));
+        } else if e.strong_for_small() {
+            fresh.insert(w, PaySignal::Solid(e.summary()));
+        }
+    }
+    *signal_table().lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+}
+
+#[cfg(test)]
+pub fn set_signal(wallet: &str, s: PaySignal) {
+    signal_table().lock().unwrap().insert(wallet.to_ascii_lowercase(), s);
 }
 
 fn shapes_line() -> String {

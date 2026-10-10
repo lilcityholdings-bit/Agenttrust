@@ -224,13 +224,19 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
     let days = idx.age_days(a);
 
     let (level, reasons) = match claimed {
-        Some((_, p)) => (
-            p.get("trust_level").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-            match p.get("reasons") {
+        Some((_, p)) => {
+            let deals = p.get("trust_level").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let level = Index::blend(deals, chain_level);
+            let mut reasons: Vec<String> = match p.get("reasons") {
                 Some(Json::Array(rs)) => rs.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
                 _ => Vec::new(),
-            },
-        ),
+            };
+            // Public records that changed its level say why.
+            if level != deals {
+                reasons.extend(chain_reasons);
+            }
+            (level, reasons)
+        }
         None => (chain_level.to_string(), chain_reasons),
     };
     let level = match level.as_str() {
@@ -371,7 +377,7 @@ pub fn bot_page(idx: &Index, id: u64, claimed: Option<(&str, &Json)>, base: &str
 <div class="stat"><b class="ok">{positive}</b><span>rated it well</span></div>
 <div class="stat"><b class="bad">{negative}</b><span>rated it badly</span></div>
 </div>
-<p class="muted">One vote per reviewing wallet{mass}. Anyone can post a review on-chain, so these count for little until the bot settles real deals.</p>
+<p class="muted">One vote per reviewing wallet{mass}. Anyone can post a review on-chain, so reviews, like the bot's payment record, can lift it to fair at most; good and excellent take real deals.</p>
 </section>
 <section>
 <h2>About this bot</h2>

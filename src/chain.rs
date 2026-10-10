@@ -379,33 +379,45 @@ impl Index {
     }
 
     /// The trust level public reviews alone can support, and why.
+    /// A bot's level from every public record: reviews, and the payment record of the wallet
+    /// it is paid at. Public records alone reach "fair" at most; "good" and "excellent" take
+    /// deals settled through Keptvow. The worst record decides.
     pub fn assess(&self, a: &Agent) -> (&'static str, Vec<String>) {
         let r = self.reviews(a);
         let days = self.age_days(a);
         let mut reasons = Vec::new();
         let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
-        let level = if r.reviewers >= MIN_REVIEWERS && r.negative * 10 >= r.reviewers * 6 {
+        let reviews_bad = r.reviewers >= MIN_REVIEWERS && r.negative * 10 >= r.reviewers * 6;
+        let reviews_good = r.reviewers >= MIN_REVIEWERS && r.positive * 10 >= r.reviewers * 8;
+        let wallet = if a.wallet.is_empty() { &a.owner } else { &a.wallet };
+        let pay = crate::payments::signal(wallet);
+        if reviews_bad {
             reasons.push(format!("{} of {} rated it badly", r.negative, plural(r.reviewers, "different reviewer")));
-            "caution"
-        } else if r.reviewers >= MIN_REVIEWERS && r.positive * 10 >= r.reviewers * 8 && days >= MIN_AGE_DAYS_FOR_FAIR {
+        } else if reviews_good && days >= MIN_AGE_DAYS_FOR_FAIR {
             reasons.push(format!("{} of {} rated it well", r.positive, plural(r.reviewers, "different reviewer")));
-            "fair"
+        } else if r.reviewers == 0 {
+            reasons.push("nobody has reviewed it in the public bot registry yet".into());
         } else {
-            if r.reviewers == 0 {
-                reasons.push("listed in the public bot registry, but nobody has reviewed it yet".into());
-            } else {
-                reasons.push(format!(
-                    "{} so far ({} good, {} bad) — not enough to judge",
-                    plural(r.reviewers, "reviewer"),
-                    r.positive,
-                    r.negative
-                ));
-            }
-            "unknown"
-        };
-        if r.reviewers >= MIN_REVIEWERS && r.positive * 10 >= r.reviewers * 8 && days < MIN_AGE_DAYS_FOR_FAIR {
+            reasons.push(format!(
+                "{} so far ({} good, {} bad) — not enough to judge",
+                plural(r.reviewers, "reviewer"),
+                r.positive,
+                r.negative
+            ));
+        }
+        if reviews_good && days < MIN_AGE_DAYS_FOR_FAIR {
             reasons.push(format!("registered only {} ago", plural(days as usize, "day")));
         }
+        match &pay {
+            Some(crate::payments::PaySignal::Bad(why)) => reasons.push(why.clone()),
+            Some(crate::payments::PaySignal::Solid(summary)) => reasons.push(format!("its wallet's payment record: {summary}")),
+            None => {}
+        }
+        let level = match (&pay, reviews_bad, reviews_good && days >= MIN_AGE_DAYS_FOR_FAIR) {
+            (Some(crate::payments::PaySignal::Bad(_)), _, _) | (_, true, _) => "caution",
+            (Some(crate::payments::PaySignal::Solid(_)), _, _) | (_, _, true) => "fair",
+            _ => "unknown",
+        };
         if r.mass > 0 {
             reasons.push(format!(
                 "{} not counted: they each reviewed {MASS_REVIEWER_BOTS}+ bots",
@@ -413,10 +425,21 @@ impl Index {
             ));
         }
         reasons.push(
-            "public reviews cost almost nothing to post, so they count for little — good and excellent take real deals settled through Keptvow"
+            "public records (reviews, payments, buyers' reports) can lift a bot to fair at most — good and excellent take real deals settled through Keptvow"
                 .into(),
         );
         (level, reasons)
+    }
+
+    /// A claimed bot's level from its deals, with its public records taken into account: public
+    /// records saying "caution" bring it down, and they lift a bot with no deal record yet to
+    /// "fair". They never lift it higher.
+    pub fn blend(deal_level: &str, public_level: &str) -> String {
+        match (deal_level, public_level) {
+            (_, "caution") => "caution".into(),
+            ("unknown", "fair") => "fair".into(),
+            (d, _) => d.into(),
+        }
     }
 
     pub fn display_name(id: u64, a: &Agent) -> String {
@@ -1375,11 +1398,37 @@ pub(crate) mod tests {
         assert_eq!(idx.assess(&idx.agents[&7]).0, "fair", "never higher than fair from reviews");
 
         let mut bad = Index::starting_at(0);
-        bad.apply(&registered(8, "0x00000000000000000000000000000000000000aa", "", 1));
+        bad.apply(&registered(8, "0x00000000000000000000000000000000000000ab", "", 1));
         for n in 0..6 {
             bad.apply(&feedback(8, &client(n), 1, 10, 0, "starred"));
         }
         assert_eq!(bad.assess(&bad.agents[&8]).0, "caution");
+    }
+
+    #[test]
+    fn the_payment_record_of_a_bots_wallet_counts_toward_its_level() {
+        use crate::payments::{set_signal, PaySignal};
+        let mut idx = Index::starting_at(0);
+        idx.head = 1 + 30 * 86_400 / BLOCK_SECONDS;
+        idx.apply(&registered(1, "0x00000000000000000000000000000000000000c1", "", 1));
+        idx.apply(&registered(2, "0x00000000000000000000000000000000000000c2", "", 1));
+        assert_eq!(idx.assess(&idx.agents[&1]).0, "unknown");
+        set_signal("0x00000000000000000000000000000000000000C1", PaySignal::Solid("12 different buyers".into()));
+        let (level, reasons) = idx.assess(&idx.agents[&1]);
+        assert_eq!(level, "fair", "a solid payment record lifts it to fair, and no further");
+        assert!(reasons.iter().any(|r| r.contains("12 different buyers")), "{reasons:?}");
+        // Buyers reporting nothing arrived outweigh good reviews.
+        for n in 0..20 {
+            idx.apply(&feedback(2, &client(n), 1, 100, 0, "starred"));
+        }
+        assert_eq!(idx.assess(&idx.agents[&2]).0, "fair");
+        set_signal("0x00000000000000000000000000000000000000c2", PaySignal::Bad("3 of 4 buyers who reported paid its wallet and got nothing".into()));
+        assert_eq!(idx.assess(&idx.agents[&2]).0, "caution");
+        // A claimed bot: public records bring it down or lift an empty record, never higher.
+        assert_eq!(Index::blend("excellent", "caution"), "caution");
+        assert_eq!(Index::blend("unknown", "fair"), "fair");
+        assert_eq!(Index::blend("good", "fair"), "good");
+        assert_eq!(Index::blend("caution", "fair"), "caution");
     }
 
     #[test]

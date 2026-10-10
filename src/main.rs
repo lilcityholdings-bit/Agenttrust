@@ -617,6 +617,18 @@ fn registry_profile(engine: &Engine, agent_ref: &str, now: i64) -> Option<Json> 
         Some(owner) => {
             let mut p = engine.trust_profile_json(owner, now);
             if let Json::Object(m) = &mut p {
+                // Its public records (reviews, its wallet's payments) count too.
+                let public = onchain.as_ref().and_then(|o| o.get("trust_level")).and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                let deals = m.get("trust_level").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                let level = chain::Index::blend(&deals, &public);
+                if level != deals {
+                    m.insert("trust_level".into(), Json::str(level));
+                    if let Some(Json::Array(rs)) = onchain.as_ref().and_then(|o| o.get("reasons")) {
+                        if let Some(Json::Array(mine)) = m.get_mut("reasons") {
+                            mine.extend(rs.iter().cloned());
+                        }
+                    }
+                }
                 m.insert("onchain".into(), onchain.unwrap_or(Json::Null));
                 m.insert("claimed_by".into(), Json::str(owner));
             }
