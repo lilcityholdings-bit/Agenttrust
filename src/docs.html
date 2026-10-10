@@ -7,13 +7,13 @@
 <meta name="description" content="One free call tells your bot whether a seller wallet is ok, careful or stop before it pays. JSON, MCP, npm and pip.">
 <style>
   :root {
-    --bg: #f6f6f3; --panel: #ffffff; --ink: #1b1d1f; --muted: #62666b; --line: #dcdcd6;
-    --accent: #3b5bdb; --accent-ink: #ffffff; --soft: #eef1fb; --code: #f0f0ec;
+    --bg: #fbfaf7; --panel: #ffffff; --ink: #0f1d3a; --muted: #6a7285; --line: #e6e2d9;
+    --accent: #13254a; --accent-ink: #ffffff; --soft: #f3f1ec; --code: #f3f1ec;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #121416; --panel: #1b1e21; --ink: #e8e9ea; --muted: #9aa0a6; --line: #2e3237;
-      --accent: #7c9cff; --accent-ink: #0d1020; --soft: #20263a; --code: #15171a;
+      --bg: #0a1120; --panel: #0f1a2e; --ink: #e9edf5; --muted: #8f99ad; --line: #1d2940;
+      --accent: #dbe3f7; --accent-ink: #0a1120; --soft: #13203a; --code: #0b1426;
     }
   }
   * { box-sizing: border-box; }
@@ -23,8 +23,9 @@
     padding: 24px 16px 56px;
   }
   main { max-width: 680px; margin: 0 auto; }
-  a { color: var(--accent); }
-  h1 { font-size: 1.6rem; margin: 0 0 6px; }
+  a { color: var(--accent); text-underline-offset: 3px; }
+  h1, h2 { font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Noto Serif", serif; font-weight: 600; letter-spacing: -.01em; }
+  h1 { font-size: 1.9rem; line-height: 1.18; margin: 0 0 10px; }
   .sub { color: var(--muted); margin: 0 0 20px; }
   section {
     background: var(--panel); border: 1px solid var(--line); border-radius: 12px;

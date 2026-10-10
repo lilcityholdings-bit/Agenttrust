@@ -678,22 +678,30 @@ fn arena_url() -> String {
         .unwrap_or_else(|| "https://agent-arena-production-26c1.up.railway.app".to_string())
 }
 
-/// The home page's "Who's behind this": the owner's own words (`ABOUT`) and contact
-/// (`CONTACT`). Hidden until at least one is set, so it never shows a placeholder.
+/// The Little City Digital mark, a small transparent PNG kept as base64 so the binary needs no files.
+const LCD_MARK_B64: &str = include_str!("brand/little-city-digital.png.b64");
+
+/// The home page's "Who's behind this": the company mark, the owner's own words (`ABOUT`)
+/// and contact (`CONTACT`). Without `ABOUT` it says plainly who builds Keptvow.
 fn about_html() -> String {
-    let about = std::env::var("ABOUT").ok().map(|a| a.trim().to_string()).filter(|a| !a.is_empty() && a.len() <= 600);
-    let contact = contact();
-    if about.is_none() && contact.is_none() {
-        return String::new();
-    }
-    let contact = match contact {
-        Some(c) if c.starts_with("https://") => format!(r#"<p>Contact: <a href="{0}">{0}</a></p>"#, html_escape(&c)),
-        Some(c) => format!(r#"<p>Contact: <a href="mailto:{0}">{0}</a></p>"#, html_escape(&c)),
+    let about = std::env::var("ABOUT")
+        .ok()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty() && a.len() <= 600)
+        .unwrap_or_else(|| {
+            "Keptvow is built and run by Little City Digital, an independent software company. \
+             We hold no one's money and sell no scores: our only product is an honest record."
+                .to_string()
+        });
+    let contact = match contact() {
+        Some(c) if c.starts_with("https://") => format!(r#"<p class="contact">Contact: <a href="{0}">{0}</a></p>"#, html_escape(&c)),
+        Some(c) => format!(r#"<p class="contact">Contact: <a href="mailto:{0}">{0}</a></p>"#, html_escape(&c)),
         None => String::new(),
     };
     format!(
-        r#"<section class="block" id="about"><h2>Who's behind this</h2>{}{contact}</section>"#,
-        about.map(|a| format!("<p>{}</p>", html_escape(&a))).unwrap_or_default()
+        r#"<section class="block about" id="about"><img class="mark-lcd" src="data:image/png;base64,{}" alt="Little City Digital" width="64" height="62"><div><h3>Who's behind this</h3><p>{}</p>{contact}</div></section>"#,
+        LCD_MARK_B64.trim(),
+        html_escape(&about)
     )
 }
 
@@ -1533,6 +1541,7 @@ fn route(engine: &Mutex<Engine>, req: Request, cfg: Config) -> Response {
                     .replace("{{wallets}}", &n(wallets))
                     .replace("{{services}}", &n(services))
                     .replace("{{checks}}", &n(checks as usize))
+                    .replace("{{networks}}", &chain::NETS.len().to_string())
                     .replace("{{leaders}}", &leaders_html(now))
                     .replace("{{about}}", &about_html())
                     .replace("{{arena}}", &html_escape(&arena_url()))

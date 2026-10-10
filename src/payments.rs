@@ -221,7 +221,7 @@ impl Evidence {
     /// One plain sentence of what the evidence says, for advice and pages.
     pub fn summary(&self) -> String {
         if self.history_loading && self.payments == 0 {
-            return "payment history is being read — check again in a few minutes".into();
+            return "still being read — check again in a few minutes".into();
         }
         let mut parts = Vec::new();
         if self.history_incomplete {
